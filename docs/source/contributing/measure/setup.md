@@ -108,6 +108,12 @@ Set this when your power sensor does not update frequently enough:
 HASS_CALL_UPDATE_ENTITY_SERVICE=true
 ```
 
+A sensor whose device has dropped off the network keeps its last value in Home Assistant until the integration marks it unavailable, which can take minutes. To reject such readings, set the maximum age of the sensor's last report. The timestamp used is `last_reported`, which advances every time the integration writes the state even when the value did not change, so this limit has to be larger than the sensor's normal reporting interval (including any heartbeat interval configured in the device firmware).
+
+```env
+HASS_MAX_AGE_SECONDS=60
+```
+
 ## Direct power meter configuration
 
 Set only the variables needed by your selected `POWER_METER`.
@@ -129,6 +135,30 @@ TUYA_DEVICE_VERSION=3.3
 ```
 
 For Tuya measuring devices, make sure no other integration is connected to the same device while measuring. Some Tuya plugs only allow one local connection at a time.
+
+## Witness meters
+
+You can read one or more additional meters at the same instant as the primary `POWER_METER` and only accept a sample when they agree. Every sample is logged with all readings, and a sample that any witness contradicts is retried exactly like a failed reading. This catches a misread on the primary (for example a dropped decimal point on a display read by camera) with a second, independent measurement.
+
+```env
+POWER_METER=ocr
+WITNESS_METERS=shelly
+```
+
+Each witness is configured through the same variables as when it is the primary (`SHELLY_IP` and so on), so a meter type can appear once. Per witness, replacing `SHELLY` with the type in upper case:
+
+```env
+# Subtracted from the witness reading before comparing. Use it when the witness is wired
+# upstream of the primary and therefore also measures the primary meter's own consumption.
+WITNESS_SHELLY_OFFSET_W=2.45
+# A witness agrees when its corrected reading is within max(these two) of the primary.
+WITNESS_SHELLY_TOLERANCE_W=0.5
+WITNESS_SHELLY_TOLERANCE_PCT=2
+# Set to false to only log a witness that cannot be read, instead of failing the sample.
+WITNESS_SHELLY_REQUIRED=true
+```
+
+Only the primary's reading is recorded; witnesses decide whether it is trusted. Voltage, when used, also comes from the primary.
 
 ## OCR power meter
 

@@ -2,7 +2,7 @@ from collections.abc import Callable
 import time
 
 from measure.home_assistant import HomeAssistantManager
-from measure.powermeter.errors import PowerMeterError, UnsupportedFeatureError
+from measure.powermeter.errors import OutdatedMeasurementError, PowerMeterError, UnsupportedFeatureError
 from measure.powermeter.powermeter import PowerMeasurementResult, PowerMeter, PowerMeterDiagnosticSample
 
 
@@ -14,12 +14,16 @@ class HassPowerMeter(PowerMeter):
         *,
         entity_id: str | None = None,
         voltage_entity_id: str | None = None,
+        max_age_seconds: float | None = None,
         wait: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._call_update_entity = call_update_entity
         self._entity_id = entity_id
         self._voltage_entity_id = voltage_entity_id
+        self._max_age_seconds = max_age_seconds
         self._wait = wait
+        self._clock = clock
         self.client = home_assistant
 
     def get_power(self, include_voltage: bool = False) -> PowerMeasurementResult:
@@ -35,7 +39,19 @@ class HassPowerMeter(PowerMeter):
         state = self.client.get_state(entity_id=self._entity_id)
         if state.state == "unavailable":
             raise PowerMeterError(f"Power sensor {self._entity_id} unavailable")
-        last_updated = state.last_updated.timestamp() if state.last_updated is not None else time.time()
+        # last_reported advances on every write by the integration, even when the value
+        # did not change; last_updated only on a change. A sensor whose device went away
+        # keeps its last value until the integration marks it unavailable, and only the
+        # reported timestamp reveals that nothing has arrived since.
+        reported = state.last_reported or state.last_updated
+        last_updated = reported.timestamp() if reported is not None else self._clock()
+        if self._max_age_seconds is not None:
+            age = self._clock() - last_updated
+            if age > self._max_age_seconds:
+                raise OutdatedMeasurementError(
+                    f"Power sensor {self._entity_id} last reported {age:.0f}s ago, "
+                    f"more than the allowed {self._max_age_seconds:.0f}s",
+                )
         power_value = float(state.state)
 
         # Availability of the voltage entity is checked by the read below; avoid the
@@ -76,5 +92,5 @@ class HassPowerMeter(PowerMeter):
         return PowerMeterDiagnosticSample(
             power=float(state.state),
             raw_value=state.state,
-            reported_at=reported.timestamp() if reported is not None else time.time(),
+            reported_at=reported.timestamp() if reported is not None else self._clock(),
         )

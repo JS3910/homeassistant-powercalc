@@ -21,6 +21,8 @@ class HassPowerMeterSpec(_PowerMeterSpec):
     entity_id: str = Field(pattern=POWER_ENTITY_PATTERN)
     voltage_entity_id: str | None = Field(default=None, pattern=VOLTAGE_ENTITY_PATTERN)
     call_update_entity: bool = False
+    max_age_seconds: float | None = Field(default=None, gt=0)
+    """Reject a reading whose ``last_reported`` is older than this; ``None`` disables the check."""
 
     @field_validator("voltage_entity_id", mode="before")
     @classmethod
@@ -73,8 +75,48 @@ class OwonOwh98xxPowerMeterSpec(_PowerMeterSpec):
     channel: OwonOwh98xxChannelType
 
 
-PowerMeterSpec = Annotated[
+SinglePowerMeterSpec = Annotated[
     DummyPowerMeterSpec
+    | HassPowerMeterSpec
+    | KasaPowerMeterSpec
+    | ManualPowerMeterSpec
+    | MyStromPowerMeterSpec
+    | OcrPowerMeterSpec
+    | ShellyPowerMeterSpec
+    | TasmotaPowerMeterSpec
+    | TuyaPowerMeterSpec
+    | OwonOwh98xxPowerMeterSpec,
+    Field(discriminator="type"),
+]
+"""Every meter that reads one physical device. Composites are built from these."""
+
+
+class WitnessSpec(_PowerMeterSpec):
+    """A secondary meter read together with the primary; it must agree or the sample is retried.
+
+    ``offset_w`` is subtracted from the witness reading first, for a witness wired
+    upstream of the primary that therefore also measures the primary's own draw.
+    Agreement means the corrected reading is within ``max(tolerance_w, tolerance_pct)``
+    of the primary. A ``required`` witness that fails to read fails the sample; an
+    optional one is logged and skipped.
+    """
+
+    meter: SinglePowerMeterSpec
+    offset_w: float = 0.0
+    tolerance_w: float = Field(default=0.5, ge=0)
+    tolerance_pct: float = Field(default=2.0, ge=0)
+    required: bool = True
+
+
+class CompositePowerMeterSpec(_PowerMeterSpec):
+    type: Literal[PowerMeterType.COMPOSITE] = PowerMeterType.COMPOSITE
+    primary: SinglePowerMeterSpec
+    witnesses: list[WitnessSpec] = Field(min_length=1)
+
+
+PowerMeterSpec = Annotated[
+    CompositePowerMeterSpec
+    | DummyPowerMeterSpec
     | HassPowerMeterSpec
     | KasaPowerMeterSpec
     | ManualPowerMeterSpec

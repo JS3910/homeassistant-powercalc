@@ -35,6 +35,7 @@ from measure.execution import (
     RunInteraction,
 )
 from measure.home_assistant import HomeAssistantManager
+from measure.powermeter.composite import CompositePowerMeter, Witness
 from measure.powermeter.dummy import DummyPowerMeter
 from measure.powermeter.errors import PowerMeterError
 from measure.powermeter.hass import HassPowerMeter
@@ -44,6 +45,7 @@ from measure.powermeter.ocr import OcrPowerMeter
 from measure.powermeter.powermeter import PowerMeter
 from measure.powermeter.shelly import ShellyPowerMeter
 from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
     DummyPowerMeterSpec,
     HassPowerMeterSpec,
     KasaPowerMeterSpec,
@@ -137,6 +139,22 @@ class MeasurementAssembler:
     def build_power_meter(self, spec: PowerMeterSpec) -> PowerMeter:  # noqa: C901
         """Build the configured meter for execution or preflight diagnostics."""
 
+        if isinstance(spec, CompositePowerMeterSpec):
+            return CompositePowerMeter(
+                self.build_power_meter(spec.primary),
+                [
+                    Witness(
+                        name=str(witness.meter.type),
+                        meter=self.build_power_meter(witness.meter),
+                        offset_w=witness.offset_w,
+                        tolerance_w=witness.tolerance_w,
+                        tolerance_pct=witness.tolerance_pct,
+                        required=witness.required,
+                    )
+                    for witness in spec.witnesses
+                ],
+                primary_name=str(spec.primary.type),
+            )
         if isinstance(spec, DummyPowerMeterSpec):
             return DummyPowerMeter()
         if isinstance(spec, HassPowerMeterSpec):
@@ -146,6 +164,7 @@ class MeasurementAssembler:
                 spec.call_update_entity,
                 entity_id=spec.entity_id,
                 voltage_entity_id=spec.voltage_entity_id,
+                max_age_seconds=spec.max_age_seconds,
                 wait=self._interaction.wait,
             )
         if isinstance(spec, KasaPowerMeterSpec):

@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class PowerMeterType(StrEnum):
+    COMPOSITE = "composite"
     DUMMY = "dummy"
     HASS = "hass"
     KASA = "kasa"
