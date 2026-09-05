@@ -1,4 +1,5 @@
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 from measure.assembler import MeasurementAssembler
@@ -12,10 +13,12 @@ from measure.execution import RunInteraction
 from measure.home_assistant import HomeAssistantManager
 from measure.powermeter.composite import CompositePowerMeter, Witness
 from measure.powermeter.dummy import DummyPowerMeter
+from measure.powermeter.errors import PowerMeterError
 from measure.powermeter.spec import (
     CompositePowerMeterSpec,
     DummyPowerMeterSpec,
     HassPowerMeterSpec,
+    OcrPowerMeterSpec,
     ShellyPowerMeterSpec,
     TuyaPowerMeterSpec,
     WitnessSpec,
@@ -229,6 +232,28 @@ def test_assembler_builds_composite_meter_with_witnesses() -> None:
         ),
     )
     shelly.assert_called_once_with("192.0.2.30", 5, username="admin", password="device-password")  # noqa: S106
+
+
+def test_assembler_builds_the_ocr_meter_through_its_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = OcrPowerMeterSpec(source="http://camera.local/", preview_port=None)
+    request = AverageMeasurementRequest(duration=10, power_meter=spec)
+    built = MagicMock()
+    ocr_package = ModuleType("measure.powermeter.ocr")
+    ocr_package.build_ocr_power_meter = built  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "measure.powermeter.ocr", ocr_package)
+
+    prepared = _assembler().assemble(request)
+
+    built.assert_called_once_with(spec)
+    assert prepared.runner.measure_util.power_meter is built.return_value  # type: ignore[attr-defined]
+
+
+def test_assembler_explains_the_missing_ocr_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = AverageMeasurementRequest(duration=10, power_meter=OcrPowerMeterSpec())
+    monkeypatch.setitem(sys.modules, "measure.powermeter.ocr", None)  # makes the import raise ImportError
+
+    with pytest.raises(PowerMeterError, match="needs the 'ocr' extra: uv sync --extra cli --extra ocr"):
+        _assembler().assemble(request)
 
 
 def test_composite_spec_needs_a_witness_and_cannot_nest() -> None:

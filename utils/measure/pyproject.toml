@@ -30,10 +30,11 @@ cli = [
     "tuyapower>=0.2",
 ]
 ocr = [
+    # rapidocr depends on the full opencv-python build (not -headless), so that is the
+    # cv2 we get; listing the headless variant too would install two packages into cv2.
     "numpy>=2.4",
-    "opencv-python-headless>=4.7",
-    "pillow>=12.0",
-    "pytesseract>=0.3",
+    "onnxruntime>=1.29",
+    "rapidocr>=3.9",
 ]
 dev = [
     "httpx2>=0.1",

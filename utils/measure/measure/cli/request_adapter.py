@@ -166,7 +166,15 @@ def _single_power_meter_spec(  # noqa: C901
     if selected == PowerMeterType.MYSTROM:
         return MyStromPowerMeterSpec(device_ip=environment.mystrom_device_ip)
     if selected == PowerMeterType.OCR:
-        return OcrPowerMeterSpec()
+        return OcrPowerMeterSpec(
+            source=environment.ocr_source,
+            layout=environment.ocr_layout,
+            preview_host=environment.ocr_preview_host,
+            preview_port=environment.ocr_preview_port,
+            window_seconds=environment.ocr_window_seconds,
+            stale_after_seconds=environment.ocr_stale_after_seconds,
+            crosscheck_tolerance_pct=environment.ocr_crosscheck_tolerance_pct,
+        )
     if selected == PowerMeterType.SHELLY:
         return ShellyPowerMeterSpec(
             device_ip=environment.shelly_ip,

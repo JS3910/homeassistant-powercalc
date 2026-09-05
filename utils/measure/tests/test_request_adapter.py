@@ -77,6 +77,30 @@ def test_shelly_password_stays_in_cli_config(mock_config_factory: MockConfigFact
     assert "device-password" not in request.model_dump_json()
 
 
+def test_ocr_power_meter_spec_comes_from_the_environment(mock_config_factory: MockConfigFactory) -> None:
+    environment = mock_config_factory()
+    environment.selected_power_meter = PowerMeterType.OCR
+    environment.ocr_source = "http://camera.local:8080/"
+    environment.ocr_layout = "pr10"
+    environment.ocr_preview_host = "0.0.0.0"  # noqa: S104
+    environment.ocr_preview_port = None
+    environment.ocr_window_seconds = 2.0
+    environment.ocr_stale_after_seconds = 8.0
+    environment.ocr_crosscheck_tolerance_pct = 4.5
+
+    request = request_from_answers(MeasureType.AVERAGE, {QUESTION_DURATION: 60}, environment)
+
+    assert request.power_meter == OcrPowerMeterSpec(
+        source="http://camera.local:8080/",
+        layout="pr10",
+        preview_host="0.0.0.0",  # noqa: S104
+        preview_port=None,
+        window_seconds=2.0,
+        stale_after_seconds=8.0,
+        crosscheck_tolerance_pct=4.5,
+    )
+
+
 def test_witness_meters_wrap_the_primary_in_a_composite(mock_config_factory: MockConfigFactory) -> None:
     environment = mock_config_factory()
     environment.selected_power_meter = PowerMeterType.OCR
