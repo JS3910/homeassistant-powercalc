@@ -287,6 +287,7 @@ class MeasurementExecution:
                     num_lights=request.multiple_light_count if isinstance(request, LightMeasurementRequest) else None,
                     dummy_load=request.dummy_load is not None,
                     dummy_load_resistance=self._dummy_load_resistance(),
+                    power_meter=request.power_meter,
                 )
             return result
         finally:

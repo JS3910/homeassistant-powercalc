@@ -16,7 +16,7 @@ import type {
   MeasurementRequest,
   PowerMeterSpec,
 } from "../types";
-import { hasVoltageReading, meterFor } from "../power-meter";
+import { hasVoltageReading, supportsDummyLoad } from "../power-meter";
 import type { MeterContext } from "../power-meter";
 import {
   buildMeasurementRequest,
@@ -404,7 +404,7 @@ export class SetupView extends LitElement {
   }
 
   private renderDummyLoadSection(stored?: DummyLoadSpec | null) {
-    if (!meterFor(this.meter.type).supportsDummyLoad) return nothing;
+    if (!supportsDummyLoad(this.meter)) return nothing;
     return renderDummyLoad({
       calibration: this.dummyLoadCalibration,
       stored,
@@ -913,7 +913,7 @@ export class SetupView extends LitElement {
     request.model_id = previous?.model_id || defaults.model_id;
     request.product_name = previous?.product_name || defaults.product_name;
     request.session_name ||= previous?.session_name || defaults.session_name || definition.label;
-    request.dummy_load = meterFor(this.meter.type).supportsDummyLoad
+    request.dummy_load = supportsDummyLoad(this.meter)
       ? dummyLoadSpec(form, this.dummyLoadCalibration)
       : undefined;
     const mismatch = this.dummyController ? undefined : this.narrowedEntityMismatch(definition, form);

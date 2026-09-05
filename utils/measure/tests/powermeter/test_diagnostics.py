@@ -8,7 +8,13 @@ from measure.home_assistant import HomeAssistantManager
 from measure.powermeter.diagnostics import DiagnosticStatus, PowerMeterDiagnostics
 from measure.powermeter.hass import HassPowerMeter
 from measure.powermeter.powermeter import PowerMeasurementResult, PowerMeter, PowerMeterDiagnosticSample
-from measure.powermeter.spec import DummyPowerMeterSpec, HassPowerMeterSpec, ShellyPowerMeterSpec
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    DummyPowerMeterSpec,
+    HassPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    WitnessSpec,
+)
 import pytest
 
 
@@ -251,6 +257,43 @@ def test_direct_meter_reports_cadence_as_not_applicable() -> None:
     assert result.precision_decimals is None
     assert result.update_interval_status is DiagnosticStatus.UNSUPPORTED
     assert result.max_report_interval_seconds is None
+    assert meter.calls == 1
+
+
+def test_composite_with_a_hass_primary_gets_cadence_checked_like_hass_alone() -> None:
+    """The composite spec itself is not a ``HassPowerMeterSpec``; the fix under test
+    unwraps to its primary so a Hass-backed composite still runs the polling loop rather
+    than falling into the direct-meter single-shot path meant for polled devices."""
+    diagnostics, meter, _ = diagnose(
+        lambda call: PowerMeterDiagnosticSample(power=1.2, raw_value="1.2", reported_at=float(call)),
+        duration=2,
+    )
+    spec = CompositePowerMeterSpec(
+        primary=HassPowerMeterSpec(entity_id="sensor.power"),
+        witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.0.2.1"))],
+    )
+
+    result = diagnostics.evaluate(spec)
+
+    assert result.precision_status is DiagnosticStatus.GOOD
+    assert result.update_interval_status is not DiagnosticStatus.UNSUPPORTED
+    assert meter.calls > 1
+
+
+def test_composite_with_a_polled_primary_is_reported_as_not_applicable() -> None:
+    clock = FakeClock()
+    meter = SampledPowerMeter(
+        lambda _: PowerMeterDiagnosticSample(power=4.2, raw_value="4.2", reported_at=clock.current),
+    )
+    diagnostics = PowerMeterDiagnostics(lambda _: meter, monotonic=clock.monotonic, wait=clock.wait)
+    spec = CompositePowerMeterSpec(
+        primary=ShellyPowerMeterSpec(device_ip="192.0.2.1"),
+        witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.0.2.2"))],
+    )
+
+    result = diagnostics.evaluate(spec)
+
+    assert result.update_interval_status is DiagnosticStatus.UNSUPPORTED
     assert meter.calls == 1
 
 

@@ -10,7 +10,7 @@ import time
 from pydantic import BaseModel, ConfigDict, Field
 
 from measure.powermeter.powermeter import PowerMeter, PowerMeterDiagnosticSample
-from measure.powermeter.spec import DummyPowerMeterSpec, HassPowerMeterSpec, PowerMeterSpec
+from measure.powermeter.spec import CompositePowerMeterSpec, DummyPowerMeterSpec, HassPowerMeterSpec, PowerMeterSpec
 
 
 class DiagnosticStatus(StrEnum):
@@ -107,7 +107,10 @@ class PowerMeterDiagnostics:
             meter = build_power_meter(spec)
             supports_voltage = meter.has_voltage_support()
             samples.append(_ObservedSample(meter.diagnostic_sample(), self._monotonic() - started))
-            if not isinstance(spec, HassPowerMeterSpec):
+            # A composite's own reporting cadence follows its primary meter's: the polled
+            # meters it wraps have no HA update interval to fall behind on either way.
+            cadence_spec = spec.primary if isinstance(spec, CompositePowerMeterSpec) else spec
+            if not isinstance(cadence_spec, HassPowerMeterSpec):
                 return _summarize_direct(
                     samples[0],
                     supports_voltage=supports_voltage,

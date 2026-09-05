@@ -1,8 +1,18 @@
 import { LitElement, css, html, nothing, svg, type PropertyValues } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { createRef, ref } from "lit/directives/ref.js";
-import type { AppSettings, AppSettingsUpdate, Capabilities, ContributionAuthDeviceStatus, ContributionAuthState, ContributionDeviceFlow, EntityDescriptor, MeasureParameterName, PowerMeterDiagnostic, PowerMeterType, SettingsSection, ShellyDiscoveryDevice } from "../types";
+import type { AppSettings, AppSettingsUpdate, Capabilities, ContributionAuthDeviceStatus, ContributionAuthState, ContributionDeviceFlow, EntityDescriptor, MeasureParameterName, PowerMeterDiagnostic, PowerMeterType, SettingsSection, ShellyDiscoveryDevice, WitnessMeterSettings, WitnessSettings } from "../types";
 import { DEFAULT_SHELLY_USERNAME, POWER_METER_LIST, meterFor, settingsFromForm } from "../power-meter";
+
+/** A meter type a witness can use. Every meter the app itself supports is valid here too —
+ * a witness reads the same way a primary would, just to cross-check it rather than replace it.
+ * `manual` is excluded app-wide (see `_SINGLE_METER_SPEC_BUILDERS` in `ha_app/api.py`) since it
+ * blocks on a console prompt the background worker has no console to answer. */
+const WITNESS_METER_TYPES: PowerMeterType[] = POWER_METER_LIST.map((meter) => meter.type).filter((type) => type !== "dummy");
+
+function newWitness(): WitnessSettings {
+  return { meter: { type: "shelly" }, offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2.0, required: true };
+}
 import { formRaw, formText, formTextOrNull } from "../form";
 import { emit } from "../events";
 import { sharedStyles } from "../styles";
@@ -141,6 +151,14 @@ export class SettingsView extends LitElement {
   @state()
   private kasaIp?: string;
 
+  /** Local editable copy of the configured witnesses; kept in state (not read from `settings`
+   * directly at render time) for the same reason `meter`/`shellyIp`/etc. are — so typing in a
+   * row survives an app-shell re-render while the form is still open. */
+  @state()
+  private witnesses: WitnessSettings[] = [];
+
+  private witnessesInitialized = false;
+
   private readonly form = createRef<HTMLFormElement>();
 
   @state()
@@ -168,6 +186,11 @@ export class SettingsView extends LitElement {
     .developer-option { margin-bottom: 1rem; padding: 0.85rem; border: 1px solid var(--signal); border-radius: 10px; background: color-mix(in srgb, var(--signal) 8%, transparent); }
     .developer-option strong { color: var(--ink); }
     .quality-requirements { margin: -0.15rem 0 0; padding: 0.7rem 0.8rem; border-left: 3px solid var(--signal); background: color-mix(in srgb, var(--signal) 8%, transparent); color: var(--muted); font-size: 0.76rem; line-height: 1.45; }
+    .witnesses { padding-top: 0.85rem; border-top: 1px solid var(--line); }
+    .witnesses h4 { margin: 0 0 0.35rem; color: var(--ink); font-size: 0.9rem; }
+    .witness-row { display: grid; gap: 0.65rem; padding: 0.75rem 0.8rem; margin-bottom: 0.75rem; border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--field) 60%, transparent); }
+    .witness-row-header { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; }
+    .witness-row-header strong { color: var(--ink); font-size: 0.82rem; }
     .test-row { display: grid; gap: 0.75rem; }
     .test-row > button { justify-self: start; }
     .test-row button { min-height: 40px; }
@@ -212,6 +235,12 @@ export class SettingsView extends LitElement {
       this.measureDeviceValue = this.settings?.default_measure_device ?? "";
       this.hassPowerEntity = this.settings?.default_power_entity_id ?? "";
       this.contributorGithubValue = undefined;
+      // Only seed from settings once real settings arrive: after that, this.witnesses is the
+      // source of truth so an in-progress edit (a row half-filled in) survives a re-fetch.
+      if (!this.witnessesInitialized && this.settings) {
+        this.witnesses = (this.settings.witnesses ?? []).map((witness) => structuredClone(witness));
+        this.witnessesInitialized = true;
+      }
     }
     // Honour a requested section (e.g. opened from the GitHub contribution shortcut) once,
     // while still letting the user switch sections afterwards.
@@ -286,6 +315,16 @@ export class SettingsView extends LitElement {
                 ${this.renderMeterFields(powerMeter)}
                 ${descriptor.qualityNote ? html`<p class="quality-requirements">${descriptor.qualityNote}</p>` : nothing}
                 ${descriptor.validatable ? this.renderTestRow() : nothing}
+              </div>
+              <div class="section-fields witnesses">
+                <h4>Witness meters</h4>
+                <p class="muted">
+                  Optional secondary meters read alongside the primary. Each reading is checked against the
+                  primary's within its tolerance before being accepted, which catches a misread or a meter
+                  that has drifted or stopped updating.
+                </p>
+                ${this.witnesses.map((witness, index) => this.renderWitnessRow(witness, index))}
+                <button type="button" @click=${this.addWitness}>Add witness</button>
               </div>
             </section>
 
@@ -389,9 +428,74 @@ export class SettingsView extends LitElement {
       hass: () => this.renderHassFields(),
       shelly: () => this.renderShellyFields(),
       kasa: () => this.renderKasaFields(),
+      mystrom: () => this.renderAddressField("mystrom_ip", "myStrom IP address", this.settings?.mystrom_ip),
+      tasmota: () => this.renderAddressField("tasmota_ip", "Tasmota IP address", this.settings?.tasmota_ip),
+      tuya: () => this.renderTuyaFields(),
+      owh98xx: () => this.renderOwonFields(),
+      ocr: () => this.renderOcrFields(),
       dummy: () => nothing,
     };
     return fields[type]();
+  }
+
+  private renderAddressField(name: string, label: string, value: string | null | undefined) {
+    return html`
+      <label>
+        <span>${label}</span>
+        <input name=${name} .value=${value ?? ""} required autocomplete="off" placeholder="192.168.1.50" @input=${this.powerMeterSettingsChanged} />
+      </label>`;
+  }
+
+  private renderTuyaFields() {
+    return html`
+      <div class="grid">
+        <label>
+          <span>Tuya device ID</span>
+          <input name="tuya_device_id" .value=${this.settings?.tuya_device_id ?? ""} required autocomplete="off" @input=${this.powerMeterSettingsChanged} />
+        </label>
+        <label>
+          <span>Tuya device IP address</span>
+          <input name="tuya_device_ip" .value=${this.settings?.tuya_device_ip ?? ""} required autocomplete="off" placeholder="192.168.1.50" @input=${this.powerMeterSettingsChanged} />
+        </label>
+      </div>
+      <label>
+        <span>Tuya protocol version</span>
+        <input name="tuya_version" .value=${this.settings?.tuya_version ?? "3.3"} autocomplete="off" @input=${this.powerMeterSettingsChanged} />
+        <small class="field-hint">Most devices from 2021 onward use 3.3 or 3.4; check the device's local key discovery output if readings fail.</small>
+      </label>`;
+  }
+
+  private renderOwonFields() {
+    return html`
+      <div class="grid">
+        <label>
+          <span>Serial port</span>
+          <input name="owon_port" .value=${this.settings?.owon_port ?? ""} required autocomplete="off" placeholder="/dev/ttyUSB0" @input=${this.powerMeterSettingsChanged} />
+        </label>
+        <label>
+          <span>Baud rate</span>
+          <input name="owon_baudrate" type="number" min="1" .value=${String(this.settings?.owon_baudrate ?? 9600)} required @input=${this.powerMeterSettingsChanged} />
+        </label>
+      </div>
+      ${optionSelect("owon_channel", "Channel", [{ value: "1", label: "1" }, { value: "2", label: "2" }], {
+        selected: this.settings?.owon_channel ?? "1",
+        required: true,
+        onChange: this.powerMeterSettingsChanged,
+      })}`;
+  }
+
+  private renderOcrFields() {
+    return html`
+      <label>
+        <span>Camera source</span>
+        <input name="ocr_source" .value=${this.settings?.ocr_source ?? "0"} autocomplete="off" placeholder="http://camera.local:8080/ or 0 for a USB camera" @input=${this.powerMeterSettingsChanged} />
+        <small class="field-hint">An MJPEG stream URL, or a numeric camera index for a USB webcam.</small>
+      </label>
+      <label>
+        <span>Display layout</span>
+        <input name="ocr_layout" .value=${this.settings?.ocr_layout ?? "pr10"} autocomplete="off" />
+        <small class="field-hint">Names a display layout in measure/powermeter/ocr/layout.py describing where each reading appears on screen.</small>
+      </label>`;
   }
 
   private renderHassFields() {
@@ -614,6 +718,133 @@ export class SettingsView extends LitElement {
     return device.supported ? identity : `${identity} — ${device.reason ?? "Not supported"}`;
   }
 
+  private renderWitnessRow(witness: WitnessSettings, index: number) {
+    return html`
+      <div class="witness-row">
+        <div class="witness-row-header">
+          <strong>Witness ${index + 1}</strong>
+          <button type="button" class="danger" @click=${() => this.removeWitness(index)}>Remove</button>
+        </div>
+        ${optionSelect(
+          `witness_${index}_type`,
+          "Type",
+          WITNESS_METER_TYPES.map((type) => ({ value: type, label: meterFor(type).label })),
+          {
+            selected: witness.meter.type,
+            required: true,
+            onChange: (event: Event) => this.witnessTypeChanged(index, event),
+          },
+        )}
+        ${this.renderWitnessMeterFields(witness.meter, index)}
+        <div class="grid">
+          <label>
+            <span>Offset (W)</span>
+            <input type="number" step="0.01" .value=${String(witness.offset_w)} @input=${(event: Event) => this.witnessFieldChanged(index, "offset_w", (event.currentTarget as HTMLInputElement).value)} />
+            <small class="field-hint">Subtracted from this witness's own reading before comparing it to the primary — use it to net out a known offset such as an inline meter's own consumption.</small>
+          </label>
+          <label>
+            <span>Tolerance (W)</span>
+            <input type="number" step="0.01" min="0" .value=${String(witness.tolerance_w)} @input=${(event: Event) => this.witnessFieldChanged(index, "tolerance_w", (event.currentTarget as HTMLInputElement).value)} />
+          </label>
+          <label>
+            <span>Tolerance (%)</span>
+            <input type="number" step="0.1" min="0" .value=${String(witness.tolerance_pct)} @input=${(event: Event) => this.witnessFieldChanged(index, "tolerance_pct", (event.currentTarget as HTMLInputElement).value)} />
+            <small class="field-hint">Whichever of the two tolerances is larger, for the current reading, is the one applied.</small>
+          </label>
+        </div>
+        <label class="check">
+          <input type="checkbox" .checked=${witness.required} @change=${(event: Event) => this.witnessRequiredChanged(index, event)} />
+          <span>Required — abort the reading (and retry) if this witness disagrees, rather than only warning</span>
+        </label>
+      </div>`;
+  }
+
+  /** The address/entity fields for one witness's meter, using the same layout each meter type
+   * uses as a primary but bound to this witness's own draft state instead of `this.settings`. */
+  private renderWitnessMeterFields(meter: WitnessMeterSettings, index: number) {
+    const set = (field: keyof WitnessMeterSettings) => (event: Event) =>
+      this.witnessMeterFieldChanged(index, field, (event.currentTarget as HTMLInputElement).value);
+    switch (meter.type) {
+      case "hass":
+        return html`
+          <label>
+            <span>Power sensor entity ID</span>
+            <input .value=${meter.entity_id ?? ""} required autocomplete="off" placeholder="sensor.plug_power" @input=${set("entity_id")} />
+          </label>`;
+      case "shelly":
+        return html`
+          <label>
+            <span>Shelly IP address</span>
+            <input .value=${meter.device_ip ?? ""} required autocomplete="off" placeholder="192.168.1.51" @input=${set("device_ip")} />
+          </label>`;
+      case "kasa":
+      case "mystrom":
+      case "tasmota":
+        return html`
+          <label>
+            <span>IP address</span>
+            <input .value=${meter.device_ip ?? ""} required autocomplete="off" placeholder="192.168.1.51" @input=${set("device_ip")} />
+          </label>`;
+      case "tuya":
+        return html`
+          <div class="grid">
+            <label><span>Tuya device ID</span><input .value=${meter.device_id ?? ""} required autocomplete="off" @input=${set("device_id")} /></label>
+            <label><span>Tuya device IP</span><input .value=${meter.device_ip ?? ""} required autocomplete="off" @input=${set("device_ip")} /></label>
+          </div>`;
+      case "owh98xx":
+        return html`
+          <div class="grid">
+            <label><span>Serial port</span><input .value=${meter.port ?? ""} required autocomplete="off" placeholder="/dev/ttyUSB1" @input=${set("port")} /></label>
+            <label><span>Baud rate</span><input type="number" min="1" .value=${String(meter.baudrate ?? 9600)} required @input=${set("baudrate")} /></label>
+          </div>`;
+      case "ocr":
+        return html`
+          <label>
+            <span>Camera source</span>
+            <input .value=${meter.source ?? "0"} autocomplete="off" placeholder="http://camera.local:8080/" @input=${set("source")} />
+          </label>`;
+      default:
+        return nothing;
+    }
+  }
+
+  private addWitness(): void {
+    this.witnesses = [...this.witnesses, newWitness()];
+    this.powerMeterSettingsChanged();
+  }
+
+  private removeWitness(index: number): void {
+    this.witnesses = this.witnesses.filter((_, i) => i !== index);
+    this.powerMeterSettingsChanged();
+  }
+
+  private witnessTypeChanged(index: number, event: Event): void {
+    const type = (event.currentTarget as HTMLInputElement).value as PowerMeterType;
+    this.updateWitness(index, (witness) => ({ ...witness, meter: { type } }));
+  }
+
+  private witnessMeterFieldChanged(index: number, field: keyof WitnessMeterSettings, value: string): void {
+    const numeric = field === "baudrate" || field === "preview_port" || field === "max_age_seconds";
+    this.updateWitness(index, (witness) => ({
+      ...witness,
+      meter: { ...witness.meter, [field]: numeric ? Number(value) : value },
+    }));
+  }
+
+  private witnessFieldChanged(index: number, field: "offset_w" | "tolerance_w" | "tolerance_pct", value: string): void {
+    this.updateWitness(index, (witness) => ({ ...witness, [field]: Number(value) }));
+  }
+
+  private witnessRequiredChanged(index: number, event: Event): void {
+    const required = (event.currentTarget as HTMLInputElement).checked;
+    this.updateWitness(index, (witness) => ({ ...witness, required }));
+  }
+
+  private updateWitness(index: number, update: (witness: WitnessSettings) => WitnessSettings): void {
+    this.witnesses = this.witnesses.map((witness, i) => (i === index ? update(witness) : witness));
+    this.powerMeterSettingsChanged();
+  }
+
   private collect(): AppSettingsUpdate | null {
     const element = this.form.value;
     if (!element) return null;
@@ -632,6 +863,7 @@ export class SettingsView extends LitElement {
       shelly_password_configured: this.settings?.shelly_password_configured ?? false,
       shelly_password: meter.power_meter === "shelly" ? shellyPassword || null : null,
       clear_shelly_password: data.get("clear_shelly_password") === "on",
+      witnesses: this.witnesses,
       fast_test_mode: data.get("fast_test_mode") === "on",
       measurement_defaults: {
         sleep_time: this.number(data, "sleep_time"),

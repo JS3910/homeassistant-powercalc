@@ -35,7 +35,18 @@ from measure.ha_app.storage import SessionStorage
 from measure.home_assistant import HomeAssistantEntityData, HomeAssistantManager
 from measure.powermeter.diagnostics import PowerMeterDiagnostics
 from measure.powermeter.powermeter import PowerMeter, PowerMeterDiagnosticSample
-from measure.powermeter.spec import HassPowerMeterSpec, KasaPowerMeterSpec
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    HassPowerMeterSpec,
+    KasaPowerMeterSpec,
+    MyStromPowerMeterSpec,
+    OcrPowerMeterSpec,
+    OwonOwh98xxPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    TasmotaPowerMeterSpec,
+    TuyaPowerMeterSpec,
+    WitnessSpec,
+)
 from measure.request import MeasurementRequest
 from measure.runner.runner import RunnerResult
 from measure.tuning import MeasurementParameters
@@ -616,6 +627,35 @@ def test_dummy_load_calibration_is_returned_only_for_the_configured_meter(tmp_pa
     assert test_client.get("/api/dummy-load/calibration").json() is None
 
 
+def test_dummy_load_calibration_fingerprint_follows_a_composite_primarys_voltage(tmp_path: Path) -> None:
+    """The related-voltage lookup must reach through a composite wrapper to its Hass
+    primary, since that is what changes the fingerprint, not the witnesses."""
+    test_client = client(tmp_path)
+    settings = {
+        "default_power_entity_id": "sensor.test_power",
+        "power_meter": "hass",
+        "witnesses": [{"meter": {"type": "shelly", "device_ip": "192.0.2.50"}}],
+    }
+    assert test_client.put("/api/settings", json=settings).status_code == 200
+    calibration = DummyLoadCalibration(
+        description="40 W incandescent bulb",
+        resistance=1322.5,
+        calibrated_at="2026-07-16T12:00:00Z",
+        power_meter_fingerprint=power_meter_fingerprint(
+            CompositePowerMeterSpec(
+                primary=HassPowerMeterSpec(entity_id="sensor.test_power", voltage_entity_id="sensor.test_voltage"),
+                witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.0.2.50"))],
+            ),
+        ),
+    )
+    test_client.app.state.context.storage.save_dummy_load_calibration(calibration)
+
+    response = test_client.get("/api/dummy-load/calibration")
+
+    assert response.status_code == 200
+    assert response.json()["resistance"] == pytest.approx(1322.5)
+
+
 def test_dummy_load_preflight_requires_voltage_and_includes_calibration_time(tmp_path: Path) -> None:
     test_client = client(tmp_path)
     request = payload() | {
@@ -687,6 +727,110 @@ def test_kasa_settings_round_trip_into_a_power_meter_spec(tmp_path: Path) -> Non
     assert stored.status_code == 200
     assert test_client.get("/api/settings").json()["kasa_ip"] == "192.0.2.30"
     settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == KasaPowerMeterSpec(device_ip="192.0.2.30")
+
+
+def test_new_single_meter_types_round_trip_into_power_meter_specs(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    mystrom = test_client.put("/api/settings", json={"power_meter": "mystrom", "mystrom_ip": "192.0.2.40"})
+    assert mystrom.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == MyStromPowerMeterSpec(device_ip="192.0.2.40")
+
+    tasmota = test_client.put("/api/settings", json={"power_meter": "tasmota", "tasmota_ip": "192.0.2.41"})
+    assert tasmota.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == TasmotaPowerMeterSpec(device_ip="192.0.2.41")
+
+    tuya = test_client.put(
+        "/api/settings",
+        json={"power_meter": "tuya", "tuya_device_id": "abc123", "tuya_device_ip": "192.0.2.42", "tuya_version": "3.4"},
+    )
+    assert tuya.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == TuyaPowerMeterSpec(device_id="abc123", device_ip="192.0.2.42", version="3.4")
+
+    owon = test_client.put(
+        "/api/settings",
+        json={"power_meter": "owh98xx", "owon_port": "/dev/ttyUSB0", "owon_baudrate": 9600, "owon_channel": "1"},
+    )
+    assert owon.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == OwonOwh98xxPowerMeterSpec(port="/dev/ttyUSB0", baudrate=9600, channel="1")
+
+    ocr = test_client.put("/api/settings", json={"power_meter": "ocr", "ocr_source": "http://camera/stream"})
+    assert ocr.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == OcrPowerMeterSpec(source="http://camera/stream")
+
+
+def test_new_single_meter_types_report_missing_address_errors(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    for meter_type, message in [
+        ("mystrom", "Enter the myStrom IP address first"),
+        ("tasmota", "Enter the Tasmota IP address first"),
+        ("tuya", "Enter the Tuya device ID and IP address first"),
+        ("owh98xx", "Configure the Owon serial port, baud rate, and channel first"),
+    ]:
+        response = test_client.post("/api/settings/test-power-meter", json={"power_meter": meter_type})
+        assert response.json()["success"] is False, meter_type
+        assert response.json()["message"] == message, meter_type
+
+
+def test_witnesses_wrap_the_primary_into_a_composite_spec(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    updated = test_client.put(
+        "/api/settings",
+        json={
+            "power_meter": "hass",
+            "default_power_entity_id": "sensor.test_power",
+            "witnesses": [
+                {
+                    "meter": {"type": "shelly", "device_ip": "192.0.2.50"},
+                    "offset_w": 2.5,
+                    "tolerance_w": 0.5,
+                    "tolerance_pct": 3.0,
+                    "required": True,
+                },
+                {
+                    "meter": {"type": "shelly", "device_ip": "192.0.2.51"},
+                    "required": False,
+                },
+            ],
+        },
+    )
+    assert updated.status_code == 200
+    assert len(updated.json()["witnesses"]) == 2
+
+    settings = test_client.app.state.context.storage.load_settings()
+    spec = _power_meter_spec(settings)
+    assert spec == CompositePowerMeterSpec(
+        primary=HassPowerMeterSpec(entity_id="sensor.test_power"),
+        witnesses=[
+            WitnessSpec(
+                meter=ShellyPowerMeterSpec(device_ip="192.0.2.50"),
+                offset_w=2.5,
+                tolerance_w=0.5,
+                tolerance_pct=3.0,
+                required=True,
+            ),
+            WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.0.2.51"), required=False),
+        ],
+    )
+
+
+def test_no_witnesses_returns_the_bare_primary_spec_unchanged(tmp_path: Path) -> None:
+    """A settings.json saved before witness support existed has no ``witnesses`` key,
+    which validates as an empty list; behavior must stay exactly what it was before."""
+    test_client = client(tmp_path)
+
+    test_client.put("/api/settings", json={"power_meter": "kasa", "kasa_ip": "192.0.2.30"})
+    settings = test_client.app.state.context.storage.load_settings()
+
+    assert settings.witnesses == []
     assert _power_meter_spec(settings) == KasaPowerMeterSpec(device_ip="192.0.2.30")
 
 
@@ -1462,6 +1606,25 @@ def test_settings_default_and_update(tmp_path: Path) -> None:
         "shelly_username": "admin",
         "shelly_password_configured": False,
         "kasa_ip": None,
+        "hass_max_age_seconds": None,
+        "mystrom_ip": None,
+        "tasmota_ip": None,
+        "tuya_device_id": None,
+        "tuya_device_ip": None,
+        "tuya_version": "3.3",
+        "owon_port": None,
+        "owon_baudrate": None,
+        "owon_timeout": 5.0,
+        "owon_channel": None,
+        "ocr_source": "0",
+        "ocr_layout": "pr10",
+        "ocr_preview_host": "127.0.0.1",
+        "ocr_preview_port": 8765,
+        "ocr_window_seconds": 1.5,
+        "ocr_stale_after_seconds": 5.0,
+        "ocr_crosscheck_tolerance_pct": 3.0,
+        "ocr_min_current_for_crosscheck": 0.02,
+        "witnesses": [],
         "fast_test_mode": False,
         "measurement_defaults": {
             "sleep_time": 2.0,
