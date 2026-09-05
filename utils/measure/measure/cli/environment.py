@@ -422,6 +422,37 @@ class CliEnvironment:
         return _config_value("MYSTROM_DEVICE_IP", converter=str)
 
     @property
+    def ocr_source(self) -> str:
+        """Camera index, stream URL or video file for the OCR power meter."""
+        return _config_value("OCR_SOURCE", default="0", converter=str)
+
+    @property
+    def ocr_layout(self) -> str:
+        return _config_value("OCR_LAYOUT", default="pr10", converter=str)
+
+    @property
+    def ocr_preview_host(self) -> str:
+        return _config_value("OCR_PREVIEW_HOST", default="127.0.0.1", converter=str)
+
+    @property
+    def ocr_preview_port(self) -> int | None:
+        """Port of the browser preview; 0 disables it."""
+        port = _config_value("OCR_PREVIEW_PORT", default=8765, converter=int)
+        return port if port > 0 else None
+
+    @property
+    def ocr_window_seconds(self) -> float:
+        return _config_value("OCR_WINDOW_SECONDS", default=1.5, converter=float)
+
+    @property
+    def ocr_stale_after_seconds(self) -> float:
+        return _config_value("OCR_STALE_AFTER_SECONDS", default=5.0, converter=float)
+
+    @property
+    def ocr_crosscheck_tolerance_pct(self) -> float:
+        return _config_value("OCR_CROSSCHECK_TOLERANCE_PCT", default=3.0, converter=float)
+
+    @property
     def csv_add_datetime_column(self) -> bool:
         return _config_value(
             "CSV_ADD_DATETIME_COLUMN",

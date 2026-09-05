@@ -35,8 +35,12 @@ RUN uv sync --locked --no-build --extra app --no-install-project
 
 FROM python-runtime AS cli-dependencies
 
-RUN apt-get update && apt-get install -y libgl1 tesseract-ocr && rm -rf /var/lib/apt/lists/* \
-    && uv sync --locked --no-build --extra cli --extra ocr --no-install-project
+# libgl1 and libglib2.0-0 are runtime libraries of the opencv-python wheel that rapidocr
+# depends on. The OCR extra needs no OCR system package: the models run on ONNX Runtime.
+# rapidocr's dependency chain includes antlr4-python3-runtime, published as sdist only,
+# so this stage cannot use --no-build.
+RUN apt-get update && apt-get install -y libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/* \
+    && uv sync --locked --extra cli --extra ocr --no-install-project
 
 FROM ha-app-dependencies AS ha-app
 

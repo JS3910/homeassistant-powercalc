@@ -162,25 +162,58 @@ Only the primary's reading is recorded; witnesses decide whether it is trusted. 
 
 ## OCR power meter
 
-With `POWER_METER=ocr`, the tool reads power values from a camera pointed at the display of a power meter. This requires the native Python setup.
+With `POWER_METER=ocr`, the tool reads a physical power meter by pointing a camera at its display. This is useful for a bench meter that has no network interface. Nothing else needs to run: the camera is read inside the measure tool itself.
 
-1. Install [tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html) for your OS.
-2. Install the optional OCR dependencies:
+Install the optional OCR dependencies once. They are pure Python wheels (the text recognition models run on ONNX Runtime), so there is no system package to install:
 
-    ```bash
-    cd utils/measure
-    uv sync --extra cli --extra ocr
-    ```
+```bash
+cd utils/measure
+uv sync --extra cli --extra ocr
+```
 
-3. Start the OCR stream, passing the location of the tesseract executable:
+Then point the tool at the camera:
 
-    ```bash
-    uv run --extra ocr python measure/ocr/main.py -t '/opt/homebrew/bin/tesseract'
-    ```
+```env
+POWER_METER=ocr
+# A local camera index ("0" is the first USB camera), a stream URL (for example the MJPEG
+# stream of an ESPHome camera) or a path to a video file.
+OCR_SOURCE=http://camera.local:8080/
+```
 
-4. Set `POWER_METER=ocr` in your `.env` and run the measure tool as usual in a second terminal.
+The tool finds the display by itself. Whenever it starts, or when readings keep failing or the picture changes a lot (someone moved the meter or the camera), it detects all the text in the frame, levels the picture by the angle of that text and matches the rows to the meter's fields. The display therefore does not have to be aligned with the camera; it can be tilted or even upside down. After that, every frame is read within the located regions only, about 2 frames per second on a typical laptop.
 
-The OCR method is tested with the Zhurui PR10 power meter. Other meters with a clearly readable display may also work.
+Each frame is validated before it counts. Power, voltage, current and power factor are all read, and a frame is rejected when any of them does not parse or when power does not agree with voltage × current × power factor within `OCR_CROSSCHECK_TOLERANCE_PCT` (default 3%). A misread digit or a dropped decimal point breaks that relation by far more, so misreads are rejected instead of recorded. Below 0.02 A the cross-check is skipped, because the meter shows 0.000 A there. A reading is the median of the frames accepted within `OCR_WINDOW_SECONDS` (default 1.5 s), which smooths the flicker of the last digit. When nothing has been accepted for `OCR_STALE_AFTER_SECONDS` (default 5 s), the sample fails and is retried like any other failed reading, so a covered or moved display cannot silently freeze the run on the last value. A camera or stream that stops delivering frames is reported in the same way, with the reason, and is reopened automatically.
+
+### Live preview
+
+While measuring, the tool serves a page showing what the camera sees and what is being read: the levelled frame with the located regions drawn on it (green when the frame was accepted, red when it was rejected and why), the parsed values, the frame rate and the counters. Picture and values are always from the same frame, and the page says so when it loses the connection to the tool or no frame has been processed for a while. The address is printed when the meter starts, `http://127.0.0.1:8765/` by default.
+
+```env
+OCR_PREVIEW_HOST=127.0.0.1
+# Set to 0 to disable the preview
+OCR_PREVIEW_PORT=8765
+```
+
+Set `OCR_PREVIEW_HOST=0.0.0.0` to open the preview from another machine, for example when the tool runs on a headless box next to the meter.
+
+### Recommended setup: OCR with a witness
+
+Pair the camera with a network meter on the same circuit as a [witness](#witness-meters), so that every sample is confirmed by an independent measurement:
+
+```env
+POWER_METER=ocr
+OCR_SOURCE=http://camera.local:8080/
+WITNESS_METERS=shelly
+SHELLY_IP=x.x.x.x
+# The witness sits upstream of the display meter and also measures the meter's own consumption
+WITNESS_SHELLY_OFFSET_W=2.45
+```
+
+Measure the offset once with nothing plugged into the display meter: it is what the witness reads then.
+
+### Supported displays
+
+The layout of the display is described by `OCR_LAYOUT`. The only layout so far is `pr10`, the Zhurui PR10 power recorder, whose real-time page shows power, voltage, current and power factor together. Another meter can be added with a `DisplayLayout` in `measure/powermeter/ocr/layout.py` describing how its rows read; the camera, detection, validation and preview code are shared.
 
 ## Predefining wizard answers
 

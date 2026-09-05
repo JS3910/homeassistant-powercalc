@@ -41,7 +41,6 @@ from measure.powermeter.errors import PowerMeterError
 from measure.powermeter.hass import HassPowerMeter
 from measure.powermeter.manual import ManualPowerMeter
 from measure.powermeter.mystrom import MyStromPowerMeter
-from measure.powermeter.ocr import OcrPowerMeter
 from measure.powermeter.powermeter import PowerMeter
 from measure.powermeter.shelly import ShellyPowerMeter
 from measure.powermeter.spec import (
@@ -176,7 +175,14 @@ class MeasurementAssembler:
         if isinstance(spec, MyStromPowerMeterSpec):
             return MyStromPowerMeter(spec.device_ip)
         if isinstance(spec, OcrPowerMeterSpec):
-            return OcrPowerMeter()
+            try:
+                from measure.powermeter.ocr import build_ocr_power_meter
+            except ImportError as error:
+                raise PowerMeterError(
+                    "The OCR power meter needs the 'ocr' extra: uv sync --extra cli --extra ocr",
+                ) from error
+
+            return build_ocr_power_meter(spec)
         if isinstance(spec, ShellyPowerMeterSpec):
             return ShellyPowerMeter(
                 spec.device_ip,

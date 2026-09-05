@@ -45,7 +45,22 @@ class MyStromPowerMeterSpec(_PowerMeterSpec):
 
 
 class OcrPowerMeterSpec(_PowerMeterSpec):
+    """Read a physical meter's display through a camera.
+
+    ``source`` is a local camera index (``"0"``), a stream URL (an MJPEG stream from an
+    ESPHome camera, for example) or a video file path. ``preview_port`` ``None`` disables
+    the embedded browser preview.
+    """
+
     type: Literal[PowerMeterType.OCR] = PowerMeterType.OCR
+    source: str = "0"
+    layout: str = "pr10"
+    preview_host: str = "127.0.0.1"
+    preview_port: int | None = Field(default=8765, ge=1, le=65535)
+    window_seconds: float = Field(default=1.5, gt=0)
+    stale_after_seconds: float = Field(default=5.0, gt=0)
+    crosscheck_tolerance_pct: float = Field(default=3.0, ge=0)
+    min_current_for_crosscheck: float = Field(default=0.02, ge=0)
 
 
 class ShellyPowerMeterSpec(_PowerMeterSpec):

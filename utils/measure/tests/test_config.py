@@ -131,6 +131,44 @@ def test_cli_environment_hass_max_age(monkeypatch: pytest.MonkeyPatch) -> None:
     assert CliEnvironment().hass_max_age_seconds is None
 
 
+def test_cli_environment_ocr_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "OCR_SOURCE",
+        "OCR_LAYOUT",
+        "OCR_PREVIEW_HOST",
+        "OCR_PREVIEW_PORT",
+        "OCR_WINDOW_SECONDS",
+        "OCR_STALE_AFTER_SECONDS",
+        "OCR_CROSSCHECK_TOLERANCE_PCT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    config = CliEnvironment()
+    assert config.ocr_source == "0"
+    assert config.ocr_layout == "pr10"
+    assert config.ocr_preview_host == "127.0.0.1"
+    assert config.ocr_preview_port == 8765
+    assert config.ocr_window_seconds == 1.5
+    assert config.ocr_stale_after_seconds == 5.0
+    assert config.ocr_crosscheck_tolerance_pct == 3.0
+
+
+def test_cli_environment_ocr_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OCR_SOURCE", "http://camera.local:8080/")
+    monkeypatch.setenv("OCR_LAYOUT", "pr10")
+    monkeypatch.setenv("OCR_PREVIEW_HOST", "192.0.2.5")
+    monkeypatch.setenv("OCR_PREVIEW_PORT", "0")
+    monkeypatch.setenv("OCR_WINDOW_SECONDS", "2")
+    monkeypatch.setenv("OCR_STALE_AFTER_SECONDS", "8")
+    monkeypatch.setenv("OCR_CROSSCHECK_TOLERANCE_PCT", "4.5")
+    config = CliEnvironment()
+    assert config.ocr_source == "http://camera.local:8080/"
+    assert config.ocr_preview_host == "192.0.2.5"
+    assert config.ocr_preview_port is None  # 0 disables the preview
+    assert config.ocr_window_seconds == 2.0
+    assert config.ocr_stale_after_seconds == 8.0
+    assert config.ocr_crosscheck_tolerance_pct == 4.5
+
+
 def test_cli_environment_warns_when_clamping(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
