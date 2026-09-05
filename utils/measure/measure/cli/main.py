@@ -20,7 +20,7 @@ from measure.cli.dummy_load import (
     dummy_load_enabled_question,
     dummy_load_questions,
 )
-from measure.cli.environment import CliEnvironment
+from measure.cli.environment import CliEnvironment, uses_power_meter
 from measure.cli.interaction import ConsoleInteraction
 from measure.cli.measurements import measurement_questions
 from measure.cli.request_adapter import request_from_answers
@@ -111,10 +111,10 @@ class Measure:
                 home_assistant=self._home_assistant,
                 dummy_load_calibration_store=self._dummy_load_calibration_store,
                 tuya_device_key=(
-                    self.config.tuya_device_key if self.config.selected_power_meter == PowerMeterType.TUYA else None
+                    self.config.tuya_device_key if uses_power_meter(self.config, PowerMeterType.TUYA) else None
                 ),
                 shelly_password=(
-                    self.config.shelly_password if self.config.selected_power_meter == PowerMeterType.SHELLY else None
+                    self.config.shelly_password if uses_power_meter(self.config, PowerMeterType.SHELLY) else None
                 ),
             ).assemble(request)
             model_id = request.model_id or (
@@ -257,7 +257,7 @@ class Measure:
 
     def _uses_home_assistant(self) -> bool:
         return (
-            self.config.selected_power_meter == PowerMeterType.HASS
+            uses_power_meter(self.config, PowerMeterType.HASS)
             or (
                 self.measure_type == MeasureType.LIGHT
                 and self.config.selected_light_controller == LightControllerType.HASS

@@ -1,11 +1,21 @@
+from unittest.mock import MagicMock
+
 from measure.cli.request_adapter import request_from_answers
 from measure.const import QUESTION_MEASURE_DEVICE, MeasureType
 from measure.controller.light.const import LightControllerType, LutMode
 from measure.controller.light.spec import HueLightControllerSpec
 from measure.powermeter.const import QUESTION_POWERMETER_ENTITY_ID, PowerMeterType
-from measure.powermeter.spec import HassPowerMeterSpec, ShellyPowerMeterSpec, TuyaPowerMeterSpec
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    HassPowerMeterSpec,
+    OcrPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    TuyaPowerMeterSpec,
+    WitnessSpec,
+)
 from measure.request import ResumePolicy
 from measure.runner.const import QUESTION_DURATION, QUESTION_MODE
+import pytest
 
 from tests.conftest import MockConfigFactory
 
@@ -65,6 +75,67 @@ def test_shelly_password_stays_in_cli_config(mock_config_factory: MockConfigFact
         timeout=10,
     )
     assert "device-password" not in request.model_dump_json()
+
+
+def test_witness_meters_wrap_the_primary_in_a_composite(mock_config_factory: MockConfigFactory) -> None:
+    environment = mock_config_factory()
+    environment.selected_power_meter = PowerMeterType.OCR
+    environment.witness_meters = [PowerMeterType.SHELLY, PowerMeterType.HASS]
+    environment.shelly_ip = "192.0.2.30"
+    environment.shelly_username = "admin"
+    environment.shelly_timeout = 5
+    environment.hass_call_update_entity_service = False
+    environment.hass_max_age_seconds = 30.0
+    environment.witness_offset_w = MagicMock(side_effect=lambda t: 2.45 if t == PowerMeterType.SHELLY else 0.0)
+    environment.witness_tolerance_w = MagicMock(return_value=0.5)
+    environment.witness_tolerance_pct = MagicMock(return_value=2.0)
+    environment.witness_required = MagicMock(side_effect=lambda t: t == PowerMeterType.SHELLY)
+    answers = {QUESTION_DURATION: 60, QUESTION_POWERMETER_ENTITY_ID: "sensor.power"}
+
+    request = request_from_answers(MeasureType.AVERAGE, answers, environment)
+
+    assert request.power_meter == CompositePowerMeterSpec(
+        primary=OcrPowerMeterSpec(),
+        witnesses=[
+            WitnessSpec(
+                meter=ShellyPowerMeterSpec(device_ip="192.0.2.30", username="admin", timeout=5),
+                offset_w=2.45,
+                tolerance_w=0.5,
+                tolerance_pct=2.0,
+                required=True,
+            ),
+            WitnessSpec(
+                meter=HassPowerMeterSpec(entity_id="sensor.power", max_age_seconds=30.0),
+                offset_w=0.0,
+                tolerance_w=0.5,
+                tolerance_pct=2.0,
+                required=False,
+            ),
+        ],
+    )
+
+
+def test_hass_max_age_reaches_the_spec(mock_config_factory: MockConfigFactory) -> None:
+    environment = mock_config_factory()
+    environment.selected_power_meter = PowerMeterType.HASS
+    environment.hass_call_update_entity_service = False
+    environment.hass_max_age_seconds = 120.0
+
+    request = request_from_answers(
+        MeasureType.AVERAGE,
+        {QUESTION_DURATION: 60, QUESTION_POWERMETER_ENTITY_ID: "sensor.power"},
+        environment,
+    )
+
+    assert request.power_meter == HassPowerMeterSpec(entity_id="sensor.power", max_age_seconds=120.0)
+
+
+def test_composite_is_not_a_selectable_primary(mock_config_factory: MockConfigFactory) -> None:
+    environment = mock_config_factory()
+    environment.selected_power_meter = PowerMeterType.COMPOSITE
+
+    with pytest.raises(ValueError, match="POWER_METER=composite is not a meter"):
+        request_from_answers(MeasureType.AVERAGE, {QUESTION_DURATION: 60}, environment)
 
 
 def test_cli_resume_setting_becomes_request_policy(mock_config_factory: MockConfigFactory) -> None:

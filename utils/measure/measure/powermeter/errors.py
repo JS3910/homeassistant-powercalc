@@ -16,3 +16,7 @@ class ApiConnectionError(PowerMeterError):
 
 class UnsupportedFeatureError(PowerMeterError):
     pass
+
+
+class WitnessDisagreementError(PowerMeterError):
+    """A witness meter read a value too far from the primary's for the sample to be trusted."""

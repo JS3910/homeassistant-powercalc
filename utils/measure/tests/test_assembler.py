@@ -10,7 +10,16 @@ from measure.controller.light.spec import (
 )
 from measure.execution import RunInteraction
 from measure.home_assistant import HomeAssistantManager
-from measure.powermeter.spec import DummyPowerMeterSpec, HassPowerMeterSpec, ShellyPowerMeterSpec, TuyaPowerMeterSpec
+from measure.powermeter.composite import CompositePowerMeter, Witness
+from measure.powermeter.dummy import DummyPowerMeter
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    DummyPowerMeterSpec,
+    HassPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    TuyaPowerMeterSpec,
+    WitnessSpec,
+)
 from measure.request import (
     AverageMeasurementRequest,
     DummyLoadReuseRequest,
@@ -103,6 +112,7 @@ def test_assembler_applies_typed_home_assistant_configuration_at_construction() 
             entity_id="sensor.power",
             voltage_entity_id="sensor.voltage",
             call_update_entity=True,
+            max_age_seconds=30,
         ),
         controller=HassLightControllerSpec(entity_id="light.test", transition_time=2),
     )
@@ -120,6 +130,7 @@ def test_assembler_applies_typed_home_assistant_configuration_at_construction() 
         True,
         entity_id="sensor.power",
         voltage_entity_id="sensor.voltage",
+        max_age_seconds=30,
         wait=ANY,
     )
     light_controller.assert_called_once_with(
@@ -182,6 +193,53 @@ def test_assembler_reads_shelly_password_from_secret_dependency() -> None:
         username="measurement",
         password="device-password",  # noqa: S106
     )
+
+
+def test_assembler_builds_composite_meter_with_witnesses() -> None:
+    request = AverageMeasurementRequest(
+        duration=10,
+        power_meter=CompositePowerMeterSpec(
+            primary=DummyPowerMeterSpec(),
+            witnesses=[
+                WitnessSpec(
+                    meter=ShellyPowerMeterSpec(device_ip="192.0.2.30"),
+                    offset_w=2.45,
+                    tolerance_w=0.3,
+                    tolerance_pct=1.5,
+                    required=False,
+                ),
+            ],
+        ),
+    )
+
+    with patch("measure.assembler.ShellyPowerMeter") as shelly:
+        prepared = _assembler(shelly_password="device-password").assemble(request)  # noqa: S106
+
+    meter = prepared.runner.measure_util.power_meter  # type: ignore[attr-defined]
+    assert isinstance(meter, CompositePowerMeter)
+    assert isinstance(meter.primary, DummyPowerMeter)
+    assert meter.witnesses == (
+        Witness(
+            name="shelly",
+            meter=shelly.return_value,
+            offset_w=2.45,
+            tolerance_w=0.3,
+            tolerance_pct=1.5,
+            required=False,
+        ),
+    )
+    shelly.assert_called_once_with("192.0.2.30", 5, username="admin", password="device-password")  # noqa: S106
+
+
+def test_composite_spec_needs_a_witness_and_cannot_nest() -> None:
+    with pytest.raises(ValidationError):
+        CompositePowerMeterSpec(primary=DummyPowerMeterSpec(), witnesses=[])
+
+    nested = {"type": "composite", "primary": {"type": "dummy"}, "witnesses": [{"meter": {"type": "dummy"}}]}
+    with pytest.raises(ValidationError):
+        CompositePowerMeterSpec.model_validate({"type": "composite", "primary": nested, "witnesses": []})
+    with pytest.raises(ValidationError):
+        WitnessSpec.model_validate({"meter": nested})
 
 
 def test_assembler_rejects_a_controller_for_the_wrong_measurement_type() -> None:

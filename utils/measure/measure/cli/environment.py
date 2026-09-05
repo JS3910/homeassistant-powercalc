@@ -180,6 +180,43 @@ class CliEnvironment:
         return _enum_value("POWER_METER", PowerMeterType, PowerMeterType.HASS)
 
     @property
+    def witness_meters(self) -> list[PowerMeterType]:
+        """Meters read alongside the primary that must agree with it, from ``WITNESS_METERS``.
+
+        A comma-separated list of meter types, each configured through the same variables
+        as when it is the primary (``SHELLY_IP`` and so on), so each type can appear once.
+        """
+        raw = _config_value("WITNESS_METERS", default="", converter=str)
+        witnesses: list[PowerMeterType] = []
+        for item in (part.strip() for part in raw.split(",")):
+            if not item:
+                continue
+            try:
+                meter_type = PowerMeterType(item)
+            except ValueError as error:
+                raise ValueError(f"WITNESS_METERS: unknown power meter type {item!r}") from error
+            if meter_type in {PowerMeterType.COMPOSITE, PowerMeterType.MANUAL}:
+                raise ValueError(f"WITNESS_METERS: {item} cannot be used as a witness")
+            if meter_type == self.selected_power_meter:
+                raise ValueError(f"WITNESS_METERS: {item} is already the primary meter (POWER_METER)")
+            if meter_type in witnesses:
+                raise ValueError(f"WITNESS_METERS: {item} is listed twice")
+            witnesses.append(meter_type)
+        return witnesses
+
+    def witness_offset_w(self, meter_type: PowerMeterType) -> float:
+        return _config_value(f"WITNESS_{meter_type.name}_OFFSET_W", default=0.0, converter=float)
+
+    def witness_tolerance_w(self, meter_type: PowerMeterType) -> float:
+        return _config_value(f"WITNESS_{meter_type.name}_TOLERANCE_W", default=0.5, converter=float)
+
+    def witness_tolerance_pct(self, meter_type: PowerMeterType) -> float:
+        return _config_value(f"WITNESS_{meter_type.name}_TOLERANCE_PCT", default=2.0, converter=float)
+
+    def witness_required(self, meter_type: PowerMeterType) -> bool:
+        return _config_value(f"WITNESS_{meter_type.name}_REQUIRED", default=True, converter=bool)
+
+    @property
     def log_level(self) -> str:
         return _config_value("LOG_LEVEL", default=logging.getLevelName(logging.INFO), converter=str)
 
@@ -356,6 +393,15 @@ class CliEnvironment:
         )
 
     @property
+    def hass_max_age_seconds(self) -> float | None:
+        """Reject Home Assistant power readings whose last report is older than this; unset disables."""
+        try:
+            value = _config_value("HASS_MAX_AGE_SECONDS", converter=float)
+        except UndefinedValueError:
+            return None
+        return value if value > 0 else None
+
+    @property
     def light_transition_time(self) -> int:
         return _config_value(
             "LIGHT_TRANSITION_TIME",
@@ -399,3 +445,8 @@ class CliEnvironment:
     def get_conf_value(key: str) -> str | None:
         """Get configuration value from environment variable"""
         return cast(str | None, config(key, default=None))
+
+
+def uses_power_meter(environment: CliEnvironment, meter_type: PowerMeterType) -> bool:
+    """Whether a meter type is the primary meter or one of the witnesses."""
+    return environment.selected_power_meter == meter_type or meter_type in environment.witness_meters

@@ -2,7 +2,7 @@ from collections.abc import Callable
 
 from inquirer.questions import Question
 
-from measure.cli.environment import CliEnvironment
+from measure.cli.environment import CliEnvironment, uses_power_meter
 from measure.cli.questions import (
     average_questions,
     charging_questions,
@@ -94,6 +94,6 @@ def measurement_questions(
         questions = CLI_QUESTION_BUILDERS[measure_type](environment, entity_catalog)
     except KeyError as error:
         raise ValueError(f"No CLI question builder registered for {measure_type}") from error
-    if environment.selected_power_meter == PowerMeterType.HASS:
+    if uses_power_meter(environment, PowerMeterType.HASS):
         questions.extend(hass_power_meter_questions(_require_entity_catalog(entity_catalog)))
     return questions
