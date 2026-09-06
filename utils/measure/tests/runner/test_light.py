@@ -80,6 +80,34 @@ def test_settle_polls_for_a_plateau_when_tolerance_is_set() -> None:
         window_seconds=1.5,
         poll_interval=0.3,
     )
+    assert runner.last_settle_seconds == 1.2
+    assert runner.last_settle_hit_cap is False
+
+
+def test_settle_records_none_for_settle_fields_when_tolerance_is_zero() -> None:
+    measure_util_mock = MagicMock(MeasureUtil)
+    config = replace(_parameters(), sleep_time=3, settle_tolerance_pct=0)
+    runner = LightRunner(measure_util_mock, config, DummyLightController())
+    runner._wait = MagicMock()  # noqa: SLF001
+    runner.last_settle_seconds = 999.0  # left over from a previous variation
+    runner.last_settle_hit_cap = True
+
+    runner._settle()  # noqa: SLF001
+
+    assert runner.last_settle_seconds is None
+    assert runner.last_settle_hit_cap is None
+
+
+def test_settle_flags_hitting_the_cap_when_the_plateau_wait_never_settled() -> None:
+    measure_util_mock = MagicMock(MeasureUtil)
+    measure_util_mock.wait_for_plateau.return_value = 9.97  # never went flat, gave up near the 10s cap
+    config = replace(_parameters(), sleep_time=10, settle_tolerance_pct=2.0)
+    runner = LightRunner(measure_util_mock, config, DummyLightController())
+    runner._wait = MagicMock()  # noqa: SLF001
+
+    runner._settle()  # noqa: SLF001
+
+    assert runner.last_settle_hit_cap is True
 
 
 @dataclass
@@ -423,6 +451,10 @@ def test_run_mode_records_one_raw_sample_per_variation_from_the_composite_meters
     assert lines[1]["variation"] == {"bri": 2}
     assert lines[1]["witnesses"][0]["error"] == "stale"
     assert lines[1]["witnesses"][0]["power"] is None
+    # settle detection wasn't enabled for this run (_zero_sleep_parameters leaves
+    # settle_tolerance_pct at its default 0), so both points record no settle data.
+    assert lines[0]["settle_seconds"] is None
+    assert lines[0]["settle_hit_cap"] is None
 
 
 def test_change_light_state_is_retried_after_a_dropped_connection(tmp_path: Path) -> None:

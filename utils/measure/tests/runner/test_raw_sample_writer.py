@@ -82,6 +82,52 @@ def test_write_appends_multiple_lines_across_calls(tmp_path: Path) -> None:
     assert json.loads(lines[1])["witnesses"][0]["error"] == "timeout"
 
 
+def test_write_records_settle_seconds_and_whether_it_hit_the_cap(tmp_path: Path) -> None:
+    path = tmp_path / "brightness.raw.jsonl"
+    writer = RawSampleWriter(str(path))
+    reading = CompositeReading(primary=PowerMeasurementResult(power=1.0, updated=1.0), witnesses=())
+
+    writer.write(
+        mode=LutMode.BRIGHTNESS, variation=Variation(1), reading=reading, settle_seconds=0.8, settle_hit_cap=False
+    )
+    writer.write(
+        mode=LutMode.BRIGHTNESS, variation=Variation(2), reading=reading, settle_seconds=3.0, settle_hit_cap=True
+    )
+    writer.close()
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert rows[0]["settle_seconds"] == 0.8
+    assert rows[0]["settle_hit_cap"] is False
+    assert rows[1]["settle_seconds"] == 3.0
+    assert rows[1]["settle_hit_cap"] is True
+
+
+def test_write_records_settle_data_even_with_no_composite_reading(tmp_path: Path) -> None:
+    """Settle detection works with any power meter, not just composite ones."""
+    path = tmp_path / "brightness.raw.jsonl"
+    writer = RawSampleWriter(str(path))
+
+    writer.write(
+        mode=LutMode.BRIGHTNESS, variation=Variation(1), reading=None, settle_seconds=1.2, settle_hit_cap=False
+    )
+    writer.close()
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["settle_seconds"] == 1.2
+    assert "primary" not in rows[0]
+
+
+def test_write_is_still_a_noop_with_neither_reading_nor_settle_data(tmp_path: Path) -> None:
+    path = tmp_path / "brightness.raw.jsonl"
+    writer = RawSampleWriter(str(path))
+
+    writer.write(mode=LutMode.BRIGHTNESS, variation=Variation(1), reading=None)
+    writer.close()
+
+    assert path.read_text() == ""
+
+
 def test_close_does_not_raise_when_called_twice(tmp_path: Path) -> None:
     path = tmp_path / "brightness.raw.jsonl"
     writer = RawSampleWriter(str(path))

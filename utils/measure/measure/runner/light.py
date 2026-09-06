@@ -76,6 +76,11 @@ class LightRunner(MeasurementRunner[LightMeasurementRequest]):
         self.gzip = True
         self.interaction = interaction or ImmediateInteraction()
         self._resume = resume
+        # Only meaningful when settle_tolerance_pct > 0 -- None otherwise, since a fixed
+        # wait has no "did it hit the cap" question to answer. Read by run_mode() right
+        # after wait() to attach to that variation's raw sample.
+        self.last_settle_seconds: float | None = None
+        self.last_settle_hit_cap: bool | None = None
 
     def _wait(self, seconds: float) -> None:
         self.interaction.wait(seconds)
@@ -249,6 +254,8 @@ class LightRunner(MeasurementRunner[LightMeasurementRequest]):
                             mode=mode,
                             variation=variation,
                             reading=self._last_composite_reading(),
+                            settle_seconds=self.last_settle_seconds,
+                            settle_hit_cap=self.last_settle_hit_cap,
                         )
                         voltages.extend(measurement_result.voltages)
                         remaining_variations.remove(variation)
@@ -337,6 +344,8 @@ class LightRunner(MeasurementRunner[LightMeasurementRequest]):
         reporting interval, or a light whose driver genuinely never settles.
         """
         if self.config.settle_tolerance_pct <= 0:
+            self.last_settle_seconds = None
+            self.last_settle_hit_cap = None
             self._wait(self.config.sleep_time)
             return
         elapsed = self.measure_util.wait_for_plateau(
@@ -345,6 +354,10 @@ class LightRunner(MeasurementRunner[LightMeasurementRequest]):
             window_seconds=self.config.settle_window_seconds,
             poll_interval=self.config.settle_poll_interval_seconds,
         )
+        self.last_settle_seconds = elapsed
+        # A small epsilon since wait_for_plateau's own loop can return a hair under the
+        # cap (it stops polling once elapsed >= max_wait, not exactly at it).
+        self.last_settle_hit_cap = elapsed >= self.config.sleep_time - 0.05
         _LOGGER.debug("Settle wait finished after %.1fs (cap %.1fs)", elapsed, self.config.sleep_time)
 
     def _change_light_with_retry(self, mode: LutMode, variation: Variation) -> None:
