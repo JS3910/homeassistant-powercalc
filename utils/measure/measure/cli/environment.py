@@ -10,7 +10,7 @@ from measure.controller.charging.const import ChargingControllerType
 from measure.controller.fan.const import FanControllerType
 from measure.controller.light.const import DEFAULT_LIGHT_TRANSITION_TIME, LightControllerType
 from measure.controller.media.const import MediaControllerType
-from measure.powermeter.const import OwonOwh98xxChannelType, PowerMeterType
+from measure.powermeter.const import OwonOwh98xxChannelType, PowerMeterType, WitnessPosition
 from measure.tuning import MeasurementParameters
 
 _LOGGER = logging.getLogger("measure")
@@ -203,6 +203,9 @@ class CliEnvironment:
                 raise ValueError(f"WITNESS_METERS: {item} is listed twice")
             witnesses.append(meter_type)
         return witnesses
+
+    def witness_position(self, meter_type: PowerMeterType) -> WitnessPosition:
+        return _enum_value(f"WITNESS_{meter_type.name}_POSITION", WitnessPosition, WitnessPosition.NONE)
 
     def witness_offset_w(self, meter_type: PowerMeterType) -> float:
         return _config_value(f"WITNESS_{meter_type.name}_OFFSET_W", default=0.0, converter=float)

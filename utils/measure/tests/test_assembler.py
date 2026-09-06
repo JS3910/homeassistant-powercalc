@@ -12,7 +12,7 @@ from measure.controller.light.spec import (
 from measure.execution import RunInteraction
 from measure.home_assistant import HomeAssistantManager
 from measure.powermeter.composite import CompositePowerMeter, Witness
-from measure.powermeter.const import OwonOwh98xxChannelType
+from measure.powermeter.const import OwonOwh98xxChannelType, WitnessPosition
 from measure.powermeter.dummy import DummyPowerMeter
 from measure.powermeter.errors import PowerMeterError
 from measure.powermeter.spec import (
@@ -201,6 +201,11 @@ def test_assembler_reads_shelly_password_from_secret_dependency() -> None:
 
 
 def test_assembler_builds_composite_meter_with_witnesses() -> None:
+    """Also confirms position + magnitude reach the engine as a signed offset: an
+    AFTER_PRIMARY spec (offset_w a positive magnitude) must arrive at `Witness` as the
+    negative `signed_offset_w`, since that's what `CompositePowerMeter` actually uses for
+    both the agreement comparison and, for AFTER_PRIMARY, correcting the primary."""
+
     request = AverageMeasurementRequest(
         duration=10,
         power_meter=CompositePowerMeterSpec(
@@ -208,6 +213,7 @@ def test_assembler_builds_composite_meter_with_witnesses() -> None:
             witnesses=[
                 WitnessSpec(
                     meter=ShellyPowerMeterSpec(device_ip="192.0.2.30"),
+                    position=WitnessPosition.AFTER_PRIMARY,
                     offset_w=2.45,
                     tolerance_w=0.3,
                     tolerance_pct=1.5,
@@ -227,7 +233,8 @@ def test_assembler_builds_composite_meter_with_witnesses() -> None:
         Witness(
             name="shelly",
             meter=shelly.return_value,
-            offset_w=2.45,
+            position=WitnessPosition.AFTER_PRIMARY,
+            offset_w=-2.45,
             tolerance_w=0.3,
             tolerance_pct=1.5,
             required=False,

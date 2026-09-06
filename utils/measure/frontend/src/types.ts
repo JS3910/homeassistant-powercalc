@@ -227,10 +227,16 @@ export type SingleMeterSpec =
       min_current_for_crosscheck?: number;
     };
 
+/** Where a witness sits relative to the primary in the wiring, if at all — mirrors
+ * `measure.powermeter.const.WitnessPosition`. Decides whether `offset_w` also corrects
+ * the primary's recorded reading (`after_primary` only) or just the agreement check. */
+export type WitnessPosition = "none" | "before_primary" | "after_primary";
+
 /** A secondary meter read together with the primary; it must agree or the sample is retried.
  * Mirrors `measure.powermeter.spec.WitnessSpec` field-for-field. */
 export interface WitnessSpec {
   meter: SingleMeterSpec;
+  position?: WitnessPosition;
   offset_w?: number;
   tolerance_w?: number;
   tolerance_pct?: number;
@@ -462,6 +468,7 @@ export interface WitnessMeterSettings {
 
 export interface WitnessSettings {
   meter: WitnessMeterSettings;
+  position: WitnessPosition;
   offset_w: number;
   tolerance_w: number;
   tolerance_pct: number;

@@ -134,6 +134,7 @@ def _power_meter_spec(environment: CliEnvironment, answers: dict[str, Any]) -> P
         witnesses=[
             WitnessSpec(
                 meter=_single_power_meter_spec(meter_type, environment, answers),
+                position=environment.witness_position(meter_type),
                 offset_w=environment.witness_offset_w(meter_type),
                 tolerance_w=environment.witness_tolerance_w(meter_type),
                 tolerance_pct=environment.witness_tolerance_pct(meter_type),

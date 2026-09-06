@@ -318,6 +318,7 @@ export function singleMeterSpecFromWitnessDraft(draft: WitnessMeterSettings): Si
 export function witnessSpecFromSettings(witness: WitnessSettings): WitnessSpec {
   return {
     meter: singleMeterSpecFromWitnessDraft(witness.meter),
+    position: witness.position,
     offset_w: witness.offset_w,
     tolerance_w: witness.tolerance_w,
     tolerance_pct: witness.tolerance_pct,

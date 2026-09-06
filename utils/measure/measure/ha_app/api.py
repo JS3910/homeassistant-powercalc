@@ -1061,6 +1061,7 @@ def _power_meter_spec(settings: AppPreferences) -> PowerMeterSpec:
         witnesses=[
             WitnessSpec(
                 meter=_single_meter_spec(witness.meter),
+                position=witness.position,
                 offset_w=witness.offset_w,
                 tolerance_w=witness.tolerance_w,
                 tolerance_pct=witness.tolerance_pct,

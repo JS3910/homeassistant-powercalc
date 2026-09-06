@@ -1,7 +1,7 @@
 import { LitElement, css, html, nothing, svg, type PropertyValues } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { createRef, ref } from "lit/directives/ref.js";
-import type { AppSettings, AppSettingsUpdate, Capabilities, ContributionAuthDeviceStatus, ContributionAuthState, ContributionDeviceFlow, EntityDescriptor, MeasureParameterName, PowerMeterDiagnostic, PowerMeterType, SettingsSection, ShellyDiscoveryDevice, WitnessMeterSettings, WitnessSettings } from "../types";
+import type { AppSettings, AppSettingsUpdate, Capabilities, ContributionAuthDeviceStatus, ContributionAuthState, ContributionDeviceFlow, EntityDescriptor, MeasureParameterName, PowerMeterDiagnostic, PowerMeterType, SettingsSection, ShellyDiscoveryDevice, WitnessMeterSettings, WitnessPosition, WitnessSettings } from "../types";
 import { DEFAULT_SHELLY_USERNAME, POWER_METER_LIST, meterFor, settingsFromForm } from "../power-meter";
 
 /** A meter type a witness can use. Every meter the app itself supports is valid here too —
@@ -11,8 +11,28 @@ import { DEFAULT_SHELLY_USERNAME, POWER_METER_LIST, meterFor, settingsFromForm }
 const WITNESS_METER_TYPES: PowerMeterType[] = POWER_METER_LIST.map((meter) => meter.type).filter((type) => type !== "dummy");
 
 function newWitness(): WitnessSettings {
-  return { meter: { type: "shelly" }, offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2.0, required: true };
+  return { meter: { type: "shelly" }, position: "none", offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2.0, required: true };
 }
+
+/** Options for the witness-position picker, in wiring order (grid → primary → device). Order
+ * matches how Johan described them: "does not affect primary", "after primary", "before primary". */
+const WITNESS_POSITION_OPTIONS: { value: WitnessPosition; label: string; hint: string }[] = [
+  {
+    value: "none",
+    label: "Doesn't affect the primary",
+    hint: "Not electrically in line with the primary at all (e.g. a current clamp on the same wire). The compensation below, if any, is just this witness's own fixed calibration bias and never touches the primary's recorded reading — it can be negative if the witness reads low rather than high.",
+  },
+  {
+    value: "after_primary",
+    label: "Between the primary and the device",
+    hint: "Closer to the device than the primary is. The primary also sees this witness's own self-consumption as if it were part of the device's draw, so the compensation below is subtracted from the primary's recorded reading too, not just used for the agreement check.",
+  },
+  {
+    value: "before_primary",
+    label: "Between the grid and the primary",
+    hint: "Farther from the device than the primary is. The primary already reads the device correctly by itself; the compensation below only corrects this witness so it can agree with the primary, and never changes what gets recorded.",
+  },
+];
 import { formRaw, formText, formTextOrNull } from "../form";
 import { emit } from "../events";
 import { sharedStyles } from "../styles";
@@ -191,6 +211,12 @@ export class SettingsView extends LitElement {
     .witness-row { display: grid; gap: 0.65rem; padding: 0.75rem 0.8rem; margin-bottom: 0.75rem; border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--field) 60%, transparent); }
     .witness-row-header { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; }
     .witness-row-header strong { color: var(--ink); font-size: 0.82rem; }
+    .witness-position { display: grid; gap: 0.5rem; padding: 0.6rem 0.7rem; margin: 0; border: 1px solid var(--line); border-radius: 8px; }
+    .witness-position legend { padding: 0 0.3rem; color: var(--muted); font-size: 0.76rem; font-weight: 650; }
+    .witness-position-option { display: flex; gap: 0.55rem; align-items: flex-start; cursor: pointer; }
+    .witness-position-option input { margin-top: 0.2rem; flex: none; }
+    .witness-position-option strong { display: block; font-size: 0.82rem; }
+    .witness-position-option .field-hint { margin-top: 0.1rem; }
     .test-row { display: grid; gap: 0.75rem; }
     .test-row > button { justify-self: start; }
     .test-row button { min-height: 40px; }
@@ -736,11 +762,39 @@ export class SettingsView extends LitElement {
           },
         )}
         ${this.renderWitnessMeterFields(witness.meter, index)}
+        <fieldset class="witness-position">
+          <legend>Where this witness sits</legend>
+          ${WITNESS_POSITION_OPTIONS.map(
+            (option) => html`
+              <label class="witness-position-option">
+                <input
+                  type="radio"
+                  name="witness_${index}_position"
+                  value=${option.value}
+                  .checked=${witness.position === option.value}
+                  @change=${(event: Event) => this.witnessPositionChanged(index, event)}
+                />
+                <span>
+                  <strong>${option.label}</strong>
+                  <small class="field-hint">${option.hint}</small>
+                </span>
+              </label>
+            `,
+          )}
+        </fieldset>
         <div class="grid">
           <label>
-            <span>Offset (W)</span>
-            <input type="number" step="0.01" .value=${String(witness.offset_w)} @input=${(event: Event) => this.witnessFieldChanged(index, "offset_w", (event.currentTarget as HTMLInputElement).value)} />
-            <small class="field-hint">Subtracted from this witness's own reading before comparing it to the primary. Leave at 0 unless this witness's own consumption (or wiring position) actually adds load the primary doesn't see — not every meter type does; e.g. a current clamp adds none. If it does, you can measure it on the spot by stacking the meters and reading the difference before starting.</small>
+            <span>Compensation (W)</span>
+            <input
+              type="number"
+              step="0.01"
+              min=${witness.position === "none" ? nothing : "0"}
+              .value=${String(witness.offset_w)}
+              @input=${(event: Event) => this.witnessFieldChanged(index, "offset_w", (event.currentTarget as HTMLInputElement).value)}
+            />
+            <small class="field-hint">${witness.position === "none"
+              ? "How much this witness reads high (positive) or low (negative) versus the truth, if you know it. Leave at 0 if it's not miscalibrated."
+              : "Always a magnitude (never negative) — how much power the meter closer to the device draws for itself. See the hint above for whether this also corrects the primary's recorded reading."}</small>
           </label>
           <label>
             <span>Tolerance (W)</span>
@@ -834,6 +888,18 @@ export class SettingsView extends LitElement {
 
   private witnessFieldChanged(index: number, field: "offset_w" | "tolerance_w" | "tolerance_pct", value: string): void {
     this.updateWitness(index, (witness) => ({ ...witness, [field]: Number(value) }));
+  }
+
+  /** Changing position can make the current offset sign invalid (only "doesn't affect
+   * the primary" allows negative) — clamp it to a magnitude rather than leave a value the
+   * backend will reject on submit. */
+  private witnessPositionChanged(index: number, event: Event): void {
+    const position = (event.currentTarget as HTMLInputElement).value as WitnessPosition;
+    this.updateWitness(index, (witness) => ({
+      ...witness,
+      position,
+      offset_w: position === "none" ? witness.offset_w : Math.abs(witness.offset_w),
+    }));
   }
 
   private witnessRequiredChanged(index: number, event: Event): void {

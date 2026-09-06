@@ -3,6 +3,7 @@ import threading
 import time
 
 from measure.powermeter.composite import CompositePowerMeter, Witness
+from measure.powermeter.const import WitnessPosition
 from measure.powermeter.errors import ApiConnectionError, WitnessDisagreementError
 from measure.powermeter.powermeter import PowerMeasurementResult, PowerMeter, PowerMeterDiagnosticSample
 import pytest
@@ -58,6 +59,69 @@ def test_returns_primary_reading_unchanged_when_witness_agrees() -> None:
     assert reading.agrees
     assert reading.corrected == pytest.approx(4.95)
     assert reading.deviation == pytest.approx(0.01)
+
+
+def test_after_primary_witness_corrects_the_recorded_primary_reading() -> None:
+    """The primary is also seeing the witness's own self-consumption, so it must be subtracted.
+
+    Reproduces the real bug found 2026-09-06: Shelly (primary, upstream) reads the light
+    plus the PR10 witness's own ~2.4 W draw; PR10 (downstream) reads the light alone. The
+    negative ``offset_w`` an ``AFTER_PRIMARY`` witness takes (a positive magnitude, sign
+    applied by whoever builds this, matching ``WitnessSpec.signed_offset_w``) must come off
+    the *recorded* value, not just the agreement comparison.
+    """
+
+    primary = FakeMeter(2.8)
+    witness = FakeMeter(0.35)
+    ocr_witness = Witness(name="ocr", meter=witness, position=WitnessPosition.AFTER_PRIMARY, offset_w=-2.45)
+    meter = _composite(primary, ocr_witness)
+
+    result = meter.get_power()
+
+    assert result.power == pytest.approx(2.8 - 2.45)
+
+
+def test_before_primary_witness_never_corrects_the_recorded_primary_reading() -> None:
+    """The primary already reads the device correctly; only the witness needed correcting."""
+
+    primary = FakeMeter(4.94)
+    witness = FakeMeter(7.40)
+    shelly_witness = Witness(name="shelly", meter=witness, position=WitnessPosition.BEFORE_PRIMARY, offset_w=2.45)
+    meter = _composite(primary, shelly_witness)
+
+    result = meter.get_power()
+
+    assert result.power == pytest.approx(4.94)
+
+
+def test_none_position_witness_never_corrects_the_primary_even_with_a_negative_offset() -> None:
+    """A NONE witness's offset is its own calibration bias and must never reach the primary,
+    regardless of sign — this is the case a naive "negative offset corrects the primary"
+    rule would get wrong."""
+
+    primary = FakeMeter(4.94)
+    witness = FakeMeter(4.50)
+    meter = _composite(primary, Witness(name="clamp", meter=witness, position=WitnessPosition.NONE, offset_w=-0.44))
+
+    result = meter.get_power()
+
+    assert result.power == pytest.approx(4.94)
+
+
+def test_multiple_after_primary_witnesses_stack_their_corrections() -> None:
+    # Each witness's corrected reading (power - offset_w) must itself agree with the raw
+    # primary (10.0) to avoid a WitnessDisagreementError, independent of the correction
+    # this test is actually checking: 9.0 - (-1.0) = 10.0, and 8.5 - (-1.5) = 10.0.
+    primary = FakeMeter(10.0)
+    meter = _composite(
+        primary,
+        Witness(name="a", meter=FakeMeter(9.0), position=WitnessPosition.AFTER_PRIMARY, offset_w=-1.0),
+        Witness(name="b", meter=FakeMeter(8.5), position=WitnessPosition.AFTER_PRIMARY, offset_w=-1.5),
+    )
+
+    result = meter.get_power()
+
+    assert result.power == pytest.approx(10.0 - 1.0 - 1.5)
 
 
 def test_absolute_tolerance_applies_at_low_power() -> None:

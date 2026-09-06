@@ -145,7 +145,8 @@ class MeasurementAssembler:
                     Witness(
                         name=str(witness.meter.type),
                         meter=self.build_power_meter(witness.meter),
-                        offset_w=witness.offset_w,
+                        position=witness.position,
+                        offset_w=witness.signed_offset_w,
                         tolerance_w=witness.tolerance_w,
                         tolerance_pct=witness.tolerance_pct,
                         required=witness.required,

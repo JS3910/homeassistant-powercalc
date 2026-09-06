@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import logging
 
+from measure.powermeter.const import WitnessPosition
 from measure.powermeter.errors import PowerMeterError, WitnessDisagreementError
 from measure.powermeter.powermeter import PowerMeasurementResult, PowerMeter, PowerMeterDiagnosticSample
 
@@ -15,15 +16,20 @@ _LOGGER = logging.getLogger("measure")
 class Witness:
     """A secondary meter that must agree with the primary for a sample to count.
 
-    ``offset_w`` is subtracted from the witness reading before comparing, for a
-    witness that sits upstream of the primary and therefore also sees the primary's
-    own consumption. A reading agrees when it is within ``max(tolerance_w,
+    ``offset_w`` is subtracted from the witness reading before comparing it to the
+    primary. A reading agrees when it is within ``max(tolerance_w,
     tolerance_pct % of the primary)`` after correction. With ``required`` false a
     witness that fails to read is logged and skipped instead of failing the sample.
+
+    ``position`` decides whether ``offset_w`` *also* corrects the primary's recorded
+    reading, not just the comparison — see ``WitnessPosition`` and ``spec.WitnessSpec``.
+    Only ``AFTER_PRIMARY`` does; the caller building this is responsible for having
+    already applied the sign convention that implies (``offset_w`` negative there).
     """
 
     name: str
     meter: PowerMeter
+    position: WitnessPosition = WitnessPosition.NONE
     offset_w: float = 0.0
     tolerance_w: float = 0.5
     tolerance_pct: float = 2.0
@@ -117,7 +123,20 @@ class CompositePowerMeter(PowerMeter):
                 f"{self._primary_name} read {primary.power:.3f} W but "
                 + "; ".join(self._describe_witness(r) for r in disagreeing),
             )
-        return primary
+
+        # Only an AFTER_PRIMARY witness (between the primary and the device) means the
+        # primary is also seeing the witness's own self-consumption as if it were part
+        # of the device's draw — the only case that needs correcting here. NONE and
+        # BEFORE_PRIMARY never touch the primary, regardless of offset_w's sign: NONE's
+        # offset is the witness's own calibration bias (irrelevant to the primary), and
+        # BEFORE_PRIMARY's is already fully accounted for by correcting the witness
+        # above, not the primary. Deliberately not inferred from offset_w's sign alone —
+        # a NONE witness may legitimately have a negative offset that must never reach
+        # here.
+        correction = sum(
+            witness.offset_w for witness in self._witnesses if witness.position == WitnessPosition.AFTER_PRIMARY
+        )
+        return primary._replace(power=primary.power + correction) if correction else primary
 
     def has_voltage_support(self) -> bool:
         return self._primary.has_voltage_support()

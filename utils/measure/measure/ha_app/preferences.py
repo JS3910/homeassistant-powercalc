@@ -3,7 +3,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from measure.const import PARAMETER_LIMITS
-from measure.powermeter.const import OwonOwh98xxChannelType, PowerMeterType
+from measure.powermeter.const import OwonOwh98xxChannelType, PowerMeterType, WitnessPosition
 from measure.powermeter.spec import POWER_ENTITY_PATTERN, VOLTAGE_ENTITY_PATTERN
 from measure.tuning import MeasurementParameters
 
@@ -61,6 +61,7 @@ class WitnessSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     meter: WitnessMeterSettings
+    position: WitnessPosition = WitnessPosition.NONE
     offset_w: float = 0.0
     tolerance_w: float = Field(default=0.5, ge=0)
     tolerance_pct: float = Field(default=2.0, ge=0)
