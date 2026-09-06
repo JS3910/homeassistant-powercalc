@@ -31,7 +31,15 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 FROM python-runtime AS ha-app-dependencies
 
-RUN uv sync --locked --no-build --extra app --no-install-project
+# The app UI offers every meter type the CLI does except Manual (which needs a console),
+# so this image needs the same runtime dependencies as the CLI's OCR and serial/cloud
+# meters, not just the plain `app` extra. libgl1 and libglib2.0-0 are runtime libraries
+# of the opencv-python wheel that rapidocr depends on; the OCR extra needs no OCR system
+# package itself, since the models run on ONNX Runtime. rapidocr's dependency chain
+# includes antlr4-python3-runtime, published as sdist only, so this stage cannot use
+# --no-build (unlike a plain app-only dependency layer would be able to).
+RUN apt-get update && apt-get install -y libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/* \
+    && uv sync --locked --extra app --extra ocr --no-install-project
 
 FROM python-runtime AS cli-dependencies
 
@@ -50,7 +58,7 @@ ARG POWERCALC_GITHUB_CLIENT_ID
 # local credentials, measurement output, tests, and frontend tooling stay out.
 COPY README.md .VERSION ./
 COPY measure/ ./measure/
-RUN uv sync --locked --extra app
+RUN uv sync --locked --extra app --extra ocr
 
 # Serve the compiled frontend from the Home Assistant app image.
 COPY --from=frontend-build /frontend/dist /app/measure/static

@@ -1087,7 +1087,9 @@ dependencies = [
 [package.optional-dependencies]
 app = [
     { name = "fastapi" },
+    { name = "pyserial" },
     { name = "python-kasa" },
+    { name = "tuyapower" },
     { name = "uvicorn" },
 ]
 cli = [
@@ -1130,6 +1132,7 @@ requires-dist = [
     { name = "onnxruntime", marker = "extra == 'ocr'", specifier = ">=1.29" },
     { name = "pycryptodome", marker = "extra == 'cli'", specifier = ">=3.20" },
     { name = "pydantic", specifier = ">=2.13" },
+    { name = "pyserial", marker = "extra == 'app'", specifier = ">=3.5" },
     { name = "pyserial", marker = "extra == 'cli'", specifier = ">=3.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.3" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.0" },
@@ -1139,6 +1142,7 @@ requires-dist = [
     { name = "rapidocr", marker = "extra == 'ocr'", specifier = ">=3.9" },
     { name = "requests", specifier = ">=2.28" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.2" },
+    { name = "tuyapower", marker = "extra == 'app'", specifier = ">=0.2" },
     { name = "tuyapower", marker = "extra == 'cli'", specifier = ">=0.2" },
     { name = "uvicorn", marker = "extra == 'app'", specifier = ">=0.35" },
 ]
