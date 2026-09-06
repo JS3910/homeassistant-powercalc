@@ -2,7 +2,13 @@ from collections.abc import Mapping, Sequence
 import math
 from typing import Any
 
-from measure.controller.light.const import HASS_HS_COMPATIBLE_COLOR_MODES, MAX_MIRED, MIN_MIRED, LutMode
+from measure.controller.light.const import (
+    HASS_BRIGHTNESS_COMPATIBLE_COLOR_MODES,
+    HASS_HS_COMPATIBLE_COLOR_MODES,
+    MAX_MIRED,
+    MIN_MIRED,
+    LutMode,
+)
 from measure.controller.light.controller import LightInfo
 
 
@@ -40,9 +46,21 @@ def light_info_from_attributes(attributes: Mapping[str, Any]) -> LightInfo:
 
 
 def supported_light_modes(attributes: Mapping[str, Any]) -> list[LutMode]:
+    """Translate a light's ``supported_color_modes`` into the LUT modes it can be profiled in.
+
+    Per the Home Assistant light entity model (developers.home-assistant.io/docs/core/entity/light,
+    confirmed current as of Core 2026.8), ``ColorMode.BRIGHTNESS`` is a dimmable-*only* mode: it
+    "must be the only supported mode if supported by the light". Every other non-onoff mode
+    (``color_temp``, ``hs``, ``rgb``, ``rgbw``, ``rgbww``, ``white``, ``xy``) already implies
+    brightness control on top of its own feature — a light reporting ``["color_temp", "hs"]`` is
+    just as brightness-adjustable as one reporting only ``["brightness"]``, it simply never lists
+    the literal ``"brightness"`` string because a more specific mode already covers it. Gating on
+    that literal string previously hid the Brightness measurement option for any light with color
+    or color-temperature support.
+    """
     values = set(attributes.get("supported_color_modes", []))
     modes: list[LutMode] = []
-    if LutMode.BRIGHTNESS in values:
+    if values & HASS_BRIGHTNESS_COMPATIBLE_COLOR_MODES:
         modes.append(LutMode.BRIGHTNESS)
     if LutMode.COLOR_TEMP in values:
         modes.append(LutMode.COLOR_TEMP)
