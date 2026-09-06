@@ -58,9 +58,11 @@ class FakeLightController:
 
 
 class FakePowerMeter:
-    def __init__(self, powers: Iterable[float]) -> None:
+    def __init__(self, powers: Iterable[float], *, fail_close: bool = False) -> None:
         self._powers = iter(powers)
         self.calls = 0
+        self.closed = False
+        self.fail_close = fail_close
 
     def get_power(self, include_voltage: bool = False) -> PowerMeasurementResult:
         del include_voltage
@@ -69,6 +71,11 @@ class FakePowerMeter:
 
     def has_voltage_support(self) -> bool:
         return False
+
+    def close(self) -> None:
+        self.closed = True
+        if self.fail_close:
+            raise RuntimeError("stuck")
 
 
 class FakeAssembler:
@@ -142,6 +149,24 @@ def test_active_probe_checks_rgb_primaries_and_caches_an_exact_request() -> None
     hues = [change[2]["hue"] for change in controller.changes if change[0] == LutMode.HS and change[2]["bri"] == 1]
     assert hues == [1, 21849, 43697]
     assert controller.changes[-1] == (LutMode.BRIGHTNESS, False, {})
+    assert controller.closed
+    assert meter.closed
+
+
+def test_active_probe_closes_the_power_meter_even_when_it_fails_to_close() -> None:
+    """The active-light preflight check builds its own throwaway power meter (separate
+    from the one the real measurement later builds); leaving it open leaks whatever
+    resources it holds -- for OCR and composite meters, a bound preview-server port and
+    a background capture thread -- so the very next attempt fails to bind that port."""
+    controller = FakeLightController()
+    meter = FakePowerMeter([1.2, 0.9, 1.1], fail_close=True)
+    assembler = FakeAssembler(controller, meter)
+    probe = LightLoadProbe(lambda: assembler, wait=lambda _: None, now=lambda: 10)
+
+    result = probe.evaluate(request())
+
+    assert result.checked_variations == 3
+    assert meter.closed
     assert controller.closed
 
 

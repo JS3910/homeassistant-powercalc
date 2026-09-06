@@ -51,6 +51,38 @@ def test_execution_consumes_prepared_measurement_without_reassembling_fields(tmp
     assert result.model_json_data == {}
 
 
+def test_execution_closes_the_power_meter_after_cleanup(tmp_path: Path) -> None:
+    """A runner's power meter may hold real resources -- OCR's capture thread and
+    preview-server port, in particular -- that must be released after every run, not
+    just runner.cleanup()'s own request-specific teardown (turning off a light, etc.)."""
+    request = AverageMeasurementRequest(power_meter=DummyPowerMeterSpec(), duration=1)
+    runner = MagicMock(spec=MeasurementRunner)
+    runner.run.return_value = RunnerResult(model_json_data={})
+    runner.writes_export_files.return_value = False
+    manager = MagicMock()
+    runner.measure_util = manager.measure_util
+    prepared = PreparedMeasurement(request=request, runner=runner)
+
+    MeasurementExecution(measurement=prepared, output_directory=tmp_path / "unused").run()
+
+    runner.cleanup.assert_called_once_with()
+    manager.measure_util.power_meter.close.assert_called_once_with()
+
+
+def test_execution_closing_the_power_meter_does_not_mask_the_result_when_it_fails(tmp_path: Path) -> None:
+    request = AverageMeasurementRequest(power_meter=DummyPowerMeterSpec(), duration=1)
+    runner = MagicMock(spec=MeasurementRunner)
+    runner.run.return_value = RunnerResult(model_json_data={})
+    runner.writes_export_files.return_value = False
+    runner.measure_util = MagicMock()
+    runner.measure_util.power_meter.close.side_effect = OSError("Address already in use")
+    prepared = PreparedMeasurement(request=request, runner=runner)
+
+    result = MeasurementExecution(measurement=prepared, output_directory=tmp_path / "unused").run()
+
+    assert result.model_json_data == {}
+
+
 @pytest.mark.parametrize("measure_version", ["v0.1.0:app", "v0.1.0:cli"])
 def test_execution_writes_model_from_prepared_measurement(
     tmp_path: Path,

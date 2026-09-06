@@ -11,6 +11,7 @@ from measure.controller.light.controller import LightController
 from measure.execution import ImmediateInteraction
 from measure.home_assistant import HomeAssistantManager
 from measure.powermeter.errors import ZeroReadingError
+from measure.powermeter.powermeter import PowerMeter
 from measure.request import LightMeasurementRequest
 from measure.runner.light_plan import Variation, build_light_plan, low_load_probe_variations
 from measure.runner.light_setup import set_light_to_maximum_brightness
@@ -81,6 +82,7 @@ class LightLoadProbe:
     def _probe(self, request: LightMeasurementRequest) -> LightLoadProbeResult:
         assembler = self._build_assembler()
         controller: LightController | None = None
+        meter: PowerMeter | None = None
         light_driven = False
         try:
             controller = assembler.build_light_controller(request.controller)
@@ -135,6 +137,11 @@ class LightLoadProbe:
         except Exception as error:
             raise LightLoadProbeError(f"Could not complete the active light check: {error}") from error
         finally:
+            if meter is not None:
+                try:
+                    meter.close()
+                except Exception as error:  # noqa: BLE001 - cleanup must not mask the probe result
+                    _LOGGER.warning("Could not close the power meter after the active preflight check: %s", error)
             if controller is not None:
                 if light_driven:
                     try:

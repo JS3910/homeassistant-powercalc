@@ -22,6 +22,17 @@ class PowerMeter(ABC):
             reported_at=reading.updated,
         )
 
+    def close(self) -> None:  # noqa: B027 - optional lifecycle hook
+        """Release any background thread, socket, or connection this meter is holding.
+
+        Most adapters are stateless HTTP/HA calls with nothing to release, hence the
+        no-op default. OCR and any composite wrapping it are the exception: they own a
+        capture thread and an embedded preview HTTP server bound to a real port, which
+        must be freed before the same spec can be built again -- otherwise the next
+        attempt (a retry, or the app's own active-light preflight check followed by the
+        real run) fails with "Address already in use" instead of a fresh preview.
+        """
+
 
 class PowerMeasurementResult(NamedTuple):
     power: float

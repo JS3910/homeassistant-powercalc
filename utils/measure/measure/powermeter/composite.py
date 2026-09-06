@@ -127,6 +127,11 @@ class CompositePowerMeter(PowerMeter):
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+        for meter in (self._primary, *(witness.meter for witness in self._witnesses)):
+            try:
+                meter.close()
+            except Exception as error:  # noqa: BLE001 - every meter must get its chance to release resources
+                _LOGGER.warning("Could not close %s: %s", meter, error)
 
     def _describe(self, reading: CompositeReading) -> str:
         parts = [f"{self._primary_name}={reading.primary.power:.3f} W"]

@@ -15,6 +15,8 @@ class FakeMeter(PowerMeter):
         self.error = error
         self.calls: list[bool] = []
         self.voltage_support = voltage is not None
+        self.closed = False
+        self.close_error: Exception | None = None
 
     def get_power(self, include_voltage: bool = False) -> PowerMeasurementResult:
         self.calls.append(include_voltage)
@@ -25,6 +27,11 @@ class FakeMeter(PowerMeter):
 
     def has_voltage_support(self) -> bool:
         return self.voltage_support
+
+    def close(self) -> None:
+        self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 def _composite(primary: PowerMeter, *witnesses: Witness) -> CompositePowerMeter:
@@ -145,3 +152,32 @@ def test_capabilities_and_diagnostics_delegate_to_primary() -> None:
     assert len(meter.witnesses) == 1
     assert meter.diagnostic_sample() == PowerMeterDiagnosticSample(power=3.0, raw_value="3.0", reported_at=123.0)
     meter.close()
+
+
+def test_close_releases_the_primary_and_every_witness() -> None:
+    """A composite is the only meter to hold multiple sub-meters, each of which may own
+    real resources (the OCR meter's capture thread and preview server, in particular) --
+    closing the composite must not leave any of them behind."""
+    primary = FakeMeter(3.0)
+    witness_a = FakeMeter(3.0)
+    witness_b = FakeMeter(3.0)
+    meter = _composite(primary, Witness(name="a", meter=witness_a), Witness(name="b", meter=witness_b))
+
+    meter.close()
+
+    assert primary.closed
+    assert witness_a.closed
+    assert witness_b.closed
+
+
+def test_close_still_closes_every_meter_when_one_fails_to_close(caplog: pytest.LogCaptureFixture) -> None:
+    primary = FakeMeter(3.0)
+    primary.close_error = RuntimeError("stuck")
+    witness = FakeMeter(3.0)
+    meter = _composite(primary, Witness(name="w", meter=witness))
+
+    with caplog.at_level(logging.WARNING):
+        meter.close()
+
+    assert witness.closed
+    assert "stuck" in caplog.text
