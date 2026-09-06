@@ -240,6 +240,13 @@ describe("setup view", () => {
     expect(element.shadowRoot.querySelectorAll('input[name="modes"]')).toHaveLength(1);
     expect(element.shadowRoot.querySelector('input[name="model_id"]')).toBeNull();
     expect((element.shadowRoot.querySelector('input[name="multiple_light_count"]') as HTMLInputElement).value).toBe("2");
+    // Regression: a NUMBER field with no explicit `step` rendered none at all, which
+    // every browser defaults to "1" -- silently rejecting a genuinely fractional value
+    // like a rated power of "4.9" W (confirmed 2026-09-06). An inherently integer field
+    // like a light count must still say so explicitly rather than picking up that same
+    // default by accident.
+    expect(element.shadowRoot.querySelector('input[name="multiple_light_count"]')?.getAttribute("step")).toBe("1");
+    expect(element.shadowRoot.querySelector('input[name="rated_power_w"]')?.getAttribute("step")).toBe("0.1");
 
     const submitted = new Promise<MeasurementRequest>((resolve) => {
       element.addEventListener("preflight", (event) => resolve((event as CustomEvent<MeasurementRequest>).detail));

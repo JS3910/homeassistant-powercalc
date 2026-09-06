@@ -576,6 +576,7 @@ export class SetupView extends LitElement {
       name=${field.name}
       min=${field.minimum ?? nothing}
       max=${field.maximum ?? nothing}
+      step=${field.control === "number" ? field.step ?? nothing : nothing}
       .value=${value}
       ?required=${field.required}
       autocomplete="off"

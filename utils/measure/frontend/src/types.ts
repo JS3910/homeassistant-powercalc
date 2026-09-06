@@ -133,6 +133,10 @@ export interface FormField {
   default?: PrimitiveValue;
   minimum?: number | null;
   maximum?: number | null;
+  /** HTML `step` for a NUMBER control. Missing/null renders no `step` attribute, which
+   * every browser defaults to `1` -- fine for an inherently integer field, wrong for
+   * anything that can genuinely take a decimal. */
+  step?: string | null;
   /** Whether several entities can be selected for this field at once. */
   multiple?: boolean;
   /** Label to use while several entities are selected. */

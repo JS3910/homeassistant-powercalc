@@ -58,6 +58,14 @@ class FormFieldDefinition:
     default: str | int | bool | None = None
     minimum: int | float | None = None
     maximum: int | float | None = None
+    #: HTML `step` for a NUMBER control. `None` renders no `step` attribute, which every
+    #: browser treats as the number-input default of `1` -- fine for an inherently integer
+    #: field (a count of lights, a duration in seconds), wrong for anything that can
+    #: genuinely take a decimal (confirmed 2026-09-06: a fractional watt value was
+    #: rejected outright). Set explicitly per field rather than defaulting to "any" here,
+    #: so a field that really is integer-only keeps native step validation instead of
+    #: silently accepting fractions.
+    step: str | None = None
     #: Whether several entities can be selected for this field at once.
     multiple: bool = False
     #: Label to use while several entities are selected.
@@ -315,6 +323,7 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
                 default=1,
                 minimum=1,
                 maximum=100,
+                step="1",
                 derived_from="light_entity_id",
                 hint="Total number of identical physical lights; measured power is divided by this value.",
             ),
@@ -324,6 +333,7 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
                 control=FieldControl.NUMBER,
                 required=False,
                 minimum=0,
+                step="0.1",
                 hint=(
                     "Optional. Used only to bound an OCR power meter's readings against "
                     "gross misreads (e.g. a missed decimal point) that its own internal "
@@ -500,6 +510,7 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
                 default=60,
                 minimum=1,
                 maximum=86_400,
+                step="1",
             ),
         ),
         supports_profile=False,

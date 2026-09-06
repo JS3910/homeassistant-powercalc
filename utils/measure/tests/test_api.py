@@ -934,6 +934,18 @@ def test_measure_definitions_and_average_request(tmp_path: Path) -> None:
         ("vacuum_robot", "Vacuum robot", "vacuum"),
         ("lawn_mower_robot", "Lawn mower robot", "lawn_mower"),
     ]
+    # Regression: a NUMBER field with no explicit step used to render no `step` attribute
+    # at all, which every browser defaults to 1 -- rejecting a genuinely fractional value
+    # like "4.9 W" of rated power outright. Every NUMBER field here must say explicitly
+    # whether it wants integer-only ("1") or fractional ("0.1", "any", ...) input.
+    light = next(item for item in definitions.json() if item["measure_type"] == MeasureType.LIGHT)
+    light_fields = {field["name"]: field for field in light["fields"]}
+    assert light_fields["rated_power_w"]["step"] == "0.1"
+    assert light_fields["multiple_light_count"]["step"] == "1"
+    average = next(item for item in definitions.json() if item["measure_type"] == MeasureType.AVERAGE)
+    average_fields = {field["name"]: field for field in average["fields"]}
+    assert average_fields["duration"]["step"] == "1"
+
     recorder = next(item for item in definitions.json() if item["measure_type"] == MeasureType.RECORDER)
     recorder_fields = {field["name"]: field for field in recorder["fields"]}
     assert recorder_fields["recorder_purpose"]["options"][0]["value"] == "playbook"
