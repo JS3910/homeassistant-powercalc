@@ -214,7 +214,8 @@ export class SettingsView extends LitElement {
     .witness-position { display: grid; gap: 0.5rem; padding: 0.6rem 0.7rem; margin: 0; border: 1px solid var(--line); border-radius: 8px; }
     .witness-position legend { padding: 0 0.3rem; color: var(--muted); font-size: 0.76rem; font-weight: 650; }
     .witness-position-option { display: flex; gap: 0.55rem; align-items: flex-start; cursor: pointer; }
-    .witness-position-option input { margin-top: 0.2rem; flex: none; }
+    .witness-position-option input { margin-top: 0.2rem; flex: none; width: auto; min-height: auto; accent-color: var(--signal); }
+    .witness-position-option > span { flex: 1; min-width: 0; }
     .witness-position-option strong { display: block; font-size: 0.82rem; }
     .witness-position-option .field-hint { margin-top: 0.1rem; }
     .test-row { display: grid; gap: 0.75rem; }
