@@ -488,8 +488,8 @@ export class SettingsView extends LitElement {
     return html`
       <label>
         <span>Camera source</span>
-        <input name="ocr_source" .value=${this.settings?.ocr_source ?? "0"} autocomplete="off" placeholder="http://camera.local:8080/ or 0 for a USB camera" @input=${this.powerMeterSettingsChanged} />
-        <small class="field-hint">An MJPEG stream URL, or a numeric camera index for a USB webcam.</small>
+        <input name="ocr_source" .value=${this.settings?.ocr_source ?? "0"} autocomplete="off" placeholder="http://camera.local:8080/" @input=${this.powerMeterSettingsChanged} />
+        <small class="field-hint">An MJPEG stream URL, such as an ESPHome camera's stream endpoint.</small>
       </label>
       <label>
         <span>Display layout</span>
@@ -740,7 +740,7 @@ export class SettingsView extends LitElement {
           <label>
             <span>Offset (W)</span>
             <input type="number" step="0.01" .value=${String(witness.offset_w)} @input=${(event: Event) => this.witnessFieldChanged(index, "offset_w", (event.currentTarget as HTMLInputElement).value)} />
-            <small class="field-hint">Subtracted from this witness's own reading before comparing it to the primary — use it to net out a known offset such as an inline meter's own consumption.</small>
+            <small class="field-hint">Subtracted from this witness's own reading before comparing it to the primary. Leave at 0 unless this witness's own consumption (or wiring position) actually adds load the primary doesn't see — not every meter type does; e.g. a current clamp adds none. If it does, you can measure it on the spot by stacking the meters and reading the difference before starting.</small>
           </label>
           <label>
             <span>Tolerance (W)</span>
@@ -802,6 +802,7 @@ export class SettingsView extends LitElement {
           <label>
             <span>Camera source</span>
             <input .value=${meter.source ?? "0"} autocomplete="off" placeholder="http://camera.local:8080/" @input=${set("source")} />
+            <small class="field-hint">An MJPEG stream URL, such as an ESPHome camera's stream endpoint.</small>
           </label>`;
       default:
         return nothing;
