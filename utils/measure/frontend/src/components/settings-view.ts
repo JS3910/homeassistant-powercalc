@@ -660,12 +660,12 @@ export class SettingsView extends LitElement {
         <label>
           <span>Shelly username</span>
           <input name="shelly_username" .value=${this.shellyUsername ?? this.settings?.shelly_username ?? DEFAULT_SHELLY_USERNAME} required autocomplete="username" maxlength="50" @input=${this.shellyUsernameChanged} />
-          <small class="field-hint">Gen1 devices may use a custom username. Gen2 and newer always use admin.</small>
+          <small class="field-hint">Only used if the device's own "Restrict login" is on. Gen1 devices may use a custom username; Gen2 and newer always use admin regardless of this field.</small>
         </label>
         <label>
           <span>Shelly password</span>
           <input name="shelly_password" type="password" .value=${this.shellyPassword} autocomplete="new-password" maxlength="255" placeholder=${this.settings?.shelly_password_configured ? "Saved password (leave blank to keep)" : "Optional"} @input=${this.shellyPasswordChanged} />
-          <small class="field-hint">Stored privately in the app and never returned by the API.</small>
+          <small class="field-hint">Leave blank unless the device's own "Restrict login" is on. Stored privately in the app and never returned by the API.</small>
         </label>
       </div>
       ${this.renderClearShellyPassword()}`;

@@ -1016,17 +1016,87 @@ def test_preflight_rejects_unavailable_entity(tmp_path: Path) -> None:
 
 
 def test_preflight_rejects_cli_only_power_meter_adapter(tmp_path: Path) -> None:
+    # Manual blocks on a console prompt the app has no console to answer -- the one power
+    # meter type genuinely excluded from the app, checked in ha_app/api.py's own builder
+    # dispatch as well as here. Every other single-meter type below is app-supported.
     response = client(tmp_path).post(
         "/api/preflight",
         json={
             "measure_type": "average",
-            "power_meter": {"type": "tasmota", "device_ip": "192.0.2.1"},
+            "power_meter": {"type": "manual"},
             "duration": 60,
         },
     )
 
     assert response.status_code == 422
-    assert response.json()["message"] == "Tasmota power meters are not supported by the Home Assistant app"
+    assert response.json()["message"] == "Manual power meters are not supported by the Home Assistant app"
+
+
+def _stub_diagnostics(test_client: TestClient) -> None:
+    """Swap in a diagnostics stub that reads successfully without touching the network,
+    so a preflight response depends only on the adapter-support check under test."""
+    context = test_client.app.state.context
+    meter = MagicMock(spec=PowerMeter)
+    meter.has_voltage_support.return_value = None
+    meter.diagnostic_sample.return_value = PowerMeterDiagnosticSample(power=4.2, raw_value="4.2", reported_at=100)
+    context.power_meter_diagnostics = PowerMeterDiagnostics(MagicMock(return_value=meter), duration=0)
+
+
+@pytest.mark.parametrize(
+    "power_meter",
+    [
+        {"type": "tasmota", "device_ip": "192.0.2.1"},
+        {"type": "mystrom", "device_ip": "192.0.2.1"},
+        {"type": "tuya", "device_id": "abc123", "device_ip": "192.0.2.1"},
+        {"type": "owh98xx", "port": "/dev/ttyUSB0", "baudrate": 9600, "channel": "1"},
+        {"type": "ocr", "source": "http://camera.local:8080/", "layout": "pr10"},
+    ],
+)
+def test_preflight_accepts_every_single_meter_type_the_app_ui_offers(
+    tmp_path: Path,
+    power_meter: dict[str, object],
+) -> None:
+    """Regression guard: each of these was added to the settings UI (witness/composite work)
+    but preflight's adapter allowlist was never updated to match, so every one of them
+    failed at measurement start with a misleading 'not supported' error despite being
+    fully configurable and buildable."""
+    test_client = client(tmp_path)
+    _stub_diagnostics(test_client)
+
+    response = test_client.post(
+        "/api/preflight",
+        json={"measure_type": "average", "power_meter": power_meter, "duration": 60},
+    )
+
+    assert response.status_code == 200, response.json()
+
+
+def test_preflight_accepts_a_composite_power_meter_via_the_api(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+    _stub_diagnostics(test_client)
+
+    response = test_client.post(
+        "/api/preflight",
+        json={
+            "measure_type": "average",
+            "power_meter": {
+                "type": "composite",
+                "primary": {"type": "shelly", "device_ip": "192.0.2.1"},
+                "witnesses": [
+                    {
+                        "meter": {"type": "tasmota", "device_ip": "192.0.2.2"},
+                        "offset_w": 0.0,
+                        "tolerance_w": 0.5,
+                        "tolerance_pct": 2.0,
+                        "required": True,
+                    },
+                ],
+            },
+            "duration": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.json()
 
 
 def test_preflight_rejects_cli_only_controller_adapter(tmp_path: Path) -> None:

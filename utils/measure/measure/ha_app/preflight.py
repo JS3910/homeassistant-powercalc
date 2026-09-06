@@ -21,11 +21,17 @@ from measure.controller.media.spec import HassMediaControllerSpec
 from measure.home_assistant_entities import DeviceClass, EntityDomain
 from measure.powermeter.diagnostics import DiagnosticStatus, PowerMeterDiagnostic
 from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
     DummyPowerMeterSpec,
     HassPowerMeterSpec,
     KasaPowerMeterSpec,
+    MyStromPowerMeterSpec,
+    OcrPowerMeterSpec,
+    OwonOwh98xxPowerMeterSpec,
     PowerMeterSpec,
     ShellyPowerMeterSpec,
+    TasmotaPowerMeterSpec,
+    TuyaPowerMeterSpec,
 )
 from measure.request import (
     ChargingMeasurementRequest,
@@ -38,6 +44,21 @@ from measure.request import (
     SpeakerMeasurementRequest,
 )
 from measure.runner.light_plan import build_light_plan, estimate_light_time_left
+
+#: Every meter type the Home Assistant app's runtime can actually build and read from
+#: (mirrors `SinglePowerMeterSpec` in `powermeter/spec.py` -- kept as an isinstance-able
+#: tuple here since that's a typing.Annotated union, not a runtime-checkable class). A
+#: `CompositePowerMeterSpec` is unwrapped to its primary before checking against this.
+_SUPPORTED_SINGLE_METER_TYPES = (
+    HassPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    KasaPowerMeterSpec,
+    MyStromPowerMeterSpec,
+    TasmotaPowerMeterSpec,
+    TuyaPowerMeterSpec,
+    OwonOwh98xxPowerMeterSpec,
+    OcrPowerMeterSpec,
+)
 
 
 class PreflightError(Exception):
@@ -245,9 +266,11 @@ class MeasurementPreflight:
         if isinstance(power_meter, DummyPowerMeterSpec):
             if not self._developer_mode:
                 raise PreflightError("Dummy power meters require developer mode in the Home Assistant app")
-        elif not isinstance(power_meter, HassPowerMeterSpec | ShellyPowerMeterSpec | KasaPowerMeterSpec):
-            label = power_meter.type.value.replace("_", " ").title()
-            raise PreflightError(f"{label} power meters are not supported by the Home Assistant app")
+        else:
+            primary = power_meter.primary if isinstance(power_meter, CompositePowerMeterSpec) else power_meter
+            if not isinstance(primary, _SUPPORTED_SINGLE_METER_TYPES):
+                label = primary.type.value.replace("_", " ").title()
+                raise PreflightError(f"{label} power meters are not supported by the Home Assistant app")
 
         controller = request.controller
         if controller is None:
@@ -271,12 +294,19 @@ class MeasurementPreflight:
 
     def _validate_power_meter(self, request: MeasurementRequest) -> None:
         power_meter = request.power_meter
-        if not isinstance(power_meter, HassPowerMeterSpec):
-            return
+        primary = power_meter.primary if isinstance(power_meter, CompositePowerMeterSpec) else power_meter
+        if isinstance(primary, HassPowerMeterSpec):
+            self._validate_hass_power_meter(primary, dummy_load=request.dummy_load is not None)
+        if isinstance(power_meter, CompositePowerMeterSpec):
+            for witness in power_meter.witnesses:
+                if isinstance(witness.meter, HassPowerMeterSpec):
+                    self._validate_hass_power_meter(witness.meter, dummy_load=False)
+
+    def _validate_hass_power_meter(self, power_meter: HassPowerMeterSpec, *, dummy_load: bool) -> None:
         powers = {entity.entity_id for entity in self._load_entities(None, DeviceClass.POWER)}
         if power_meter.entity_id not in powers:
             raise PreflightError("Selected power entity is unavailable or not measured in W")
-        if request.dummy_load is not None and not power_meter.voltage_entity_id:
+        if dummy_load and not power_meter.voltage_entity_id:
             raise PreflightError("A voltage sensor is required when using a resistive dummy load")
         if power_meter.voltage_entity_id:
             voltages = {entity.entity_id for entity in self._load_entities(None, DeviceClass.VOLTAGE)}
