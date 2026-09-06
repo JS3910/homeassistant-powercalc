@@ -1,7 +1,31 @@
-import type { OperatingPoint, SessionSnapshot } from "../types";
+import type { OperatingPoint, PlotCollection, SessionSnapshot } from "../types";
 import "./running-view";
 
 describe("running view", () => {
+  it("renders the profile plot(s) built so far, and nothing when there is none yet", async () => {
+    const element = document.createElement("measure-running-view") as HTMLElement & {
+      snapshot: SessionSnapshot; plotCollection: PlotCollection; updateComplete: Promise<boolean>; shadowRoot: ShadowRoot;
+    };
+    element.snapshot = { state: "running", mode: "Light", progress: { completed: 12, total: 884 } };
+    document.body.append(element);
+    await element.updateComplete;
+
+    expect(element.shadowRoot.querySelector(".plots-header")).toBeNull();
+    expect(element.shadowRoot.querySelector("measure-result-plot")).toBeNull();
+
+    element.plotCollection = {
+      partial: true,
+      plots: [{ id: "brightness", title: "Brightness", kind: "scatter", x_label: "Brightness", y_label: "Power", source: "brightness.csv", series: [] }],
+      warnings: [],
+    };
+    await element.updateComplete;
+
+    expect(element.shadowRoot.querySelector(".plots-header")?.textContent).toContain("Profile so far");
+    const plot = element.shadowRoot.querySelector("measure-result-plot");
+    expect(plot).toBeTruthy();
+    expect(plot?.hasAttribute("partial")).toBe(true);
+  });
+
   it("stops averaging through the same action as recording and disables repeated requests", async () => {
     const element = document.createElement("measure-running-view") as HTMLElement & {
       snapshot: SessionSnapshot; busy: boolean; updateComplete: Promise<boolean>; shadowRoot: ShadowRoot;

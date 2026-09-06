@@ -105,7 +105,10 @@ def build_session_plots(
                     max_points=max_points,
                 ),
             )
-        except (OSError, PlotDataError, json.JSONDecodeError) as error:
+        except (OSError, PlotDataError, json.JSONDecodeError, ValueError, csv.Error) as error:
+            # ValueError/csv.Error also cover a row half-written by a still-running
+            # measurement (e.g. a numeric field flushed to disk mid-write) when this is
+            # called for a live preview rather than a finished session.
             warnings.append(f"Could not plot {source}: {error}")
     return PlotBuildResult(plots=tuple(plots), warnings=tuple(warnings))
 

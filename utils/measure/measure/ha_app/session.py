@@ -38,6 +38,19 @@ ACTIVE_SESSION_STATES = frozenset(
     },
 )
 
+# The subset of ACTIVE_SESSION_STATES with no measurement CSV rows written yet -- before
+# the light/controller loop has started taking any readings at all, so there is nothing a
+# plot could show. RUNNING and CANCELLING are deliberately excluded: both can already have
+# real (if partial) data on disk.
+PRE_DATA_SESSION_STATES = frozenset(
+    {
+        SessionState.IDLE,
+        SessionState.VALIDATING,
+        SessionState.READY,
+        SessionState.AWAITING_CONFIRMATION,
+    },
+)
+
 # States a session can be relaunched from. The resume endpoint and the flag the session
 # listing exposes both read this, so a new state cannot make the two disagree.
 RESUMABLE_SESSION_STATES = frozenset(

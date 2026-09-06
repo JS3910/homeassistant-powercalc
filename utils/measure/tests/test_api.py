@@ -1604,15 +1604,18 @@ def test_contribution_preview_rejects_unsupported_generated_session(tmp_path: Pa
     assert service.preview_calls == 0
 
 
-def test_plot_endpoint_rejects_active_session(tmp_path: Path) -> None:
+def test_plot_endpoint_rejects_a_session_with_no_data_yet(tmp_path: Path) -> None:
+    # Before the light/controller loop starts taking readings there is nothing to plot,
+    # unlike RUNNING and CANCELLING, which can already have real (if partial) data.
     test_client = client(tmp_path)
     coordinator = test_client.app.state.context.coordinator
     now = "2026-07-12T12:00:00Z"
-    coordinator._snapshot = SessionSnapshot(id="active", state=SessionState.RUNNING, created_at=now, updated_at=now)  # noqa: SLF001
+    coordinator._snapshot = SessionSnapshot(id="active", state=SessionState.VALIDATING, created_at=now, updated_at=now)  # noqa: SLF001
 
     response = test_client.get("/api/sessions/active/plots")
 
     assert response.status_code == 409
+    assert "starts taking readings" in response.json()["message"]
 
 
 def test_plot_endpoint_marks_terminal_incomplete_session_as_partial(tmp_path: Path) -> None:

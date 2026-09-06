@@ -1,10 +1,11 @@
 import { LitElement, css, html, nothing, svg, type PropertyValues } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { createRef, ref } from "lit/directives/ref.js";
-import type { OperatingPoint, SessionProgress, SessionSnapshot } from "../types";
+import type { OperatingPoint, PlotCollection, SessionProgress, SessionSnapshot } from "../types";
 import { emit } from "../events";
 import { remaining } from "../format";
 import { diagnosticsDownload, sharedStyles } from "../styles";
+import "./result-plot";
 
 type StateChipIcon =
   | "battery"
@@ -44,6 +45,14 @@ export class RunningView extends LitElement {
 
   @property({ attribute: false })
   samples: number[] = [];
+
+  /**
+   * The same shape of profile plot shown on the result screen, refreshed periodically
+   * from what's been sampled so far -- builds the shape of the profile as it goes rather
+   * than only revealing it once the whole measurement finishes.
+   */
+  @property({ attribute: false })
+  plotCollection: PlotCollection = { partial: true, plots: [], warnings: [] };
 
   @property({ type: String })
   diagnosticsUrl = "";
@@ -85,6 +94,9 @@ export class RunningView extends LitElement {
     .log { flex: 1; overflow: auto; padding: 0.9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--well); font: 0.8rem/1.6 ui-monospace, monospace; color: var(--muted); }
     .log p { margin: 0; }
     .log p.warning { color: var(--warning); }
+    .plots-header { margin: 1.5rem 0 0.75rem; }
+    .plots-header h3 { margin: 0; font-size: 1rem; }
+    .plots { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 1rem; }
     .chart { position: relative; margin-top: 1.4rem; }
     .chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
     .chart-head span { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.1em; }
@@ -208,7 +220,19 @@ export class RunningView extends LitElement {
       ${this.snapshot.operating_point ? this.renderOperatingPoint(this.snapshot.operating_point) : nothing}
       ${this.renderMetrics(openEnded, progress)}
       ${this.samples.length ? this.renderChart() : nothing}
+      ${this.renderProfilePlots()}
       ${this.renderEntityStates()}
+    `;
+  }
+
+  private renderProfilePlots() {
+    const { plots } = this.plotCollection;
+    if (!plots.length) return nothing;
+    return html`
+      <div class="plots-header"><h3>Profile so far</h3></div>
+      <div class="plots">
+        ${plots.map((plot) => html`<measure-result-plot .plot=${plot} partial></measure-result-plot>`)}
+      </div>
     `;
   }
 

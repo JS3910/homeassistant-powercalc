@@ -263,7 +263,7 @@ export class AppShell extends LitElement implements MeasureAppState {
     return html`
       <measure-running-view
         .snapshot=${snapshot} .confirmationAction=${this.confirmationAction()} .warningConfirmation=${this.confirmationIsWarning()}
-        .connected=${this.connectedToEvents} .logs=${this.logs} .samples=${this.samples}
+        .connected=${this.connectedToEvents} .logs=${this.logs} .samples=${this.samples} .plotCollection=${this.plotCollection}
         .diagnosticsUrl=${this.api.diagnosticsUrl(snapshot.session_id ?? "")} .busy=${this.busy}
         @cancel=${() => void this.controller.cancel()} @confirm=${() => void this.controller.confirm()}
       ></measure-running-view>`;

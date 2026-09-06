@@ -56,6 +56,7 @@ from measure.ha_app.registry import FieldControl, FieldRole, measurement_definit
 from measure.ha_app.service import MeasurementService
 from measure.ha_app.session import (
     ACTIVE_SESSION_STATES,
+    PRE_DATA_SESSION_STATES,
     RESUMABLE_SESSION_STATES,
     SessionEvent,
     SessionSnapshot,
@@ -815,8 +816,8 @@ def _session_files(context: AppContext, snapshot: SessionSnapshot) -> list[Sessi
 
 
 async def _session_plots(context: AppContext, snapshot: SessionSnapshot) -> SessionPlots:
-    if snapshot.state in ACTIVE_SESSION_STATES:
-        raise HTTPException(status_code=409, detail="Plots are available after the measurement stops")
+    if snapshot.state in PRE_DATA_SESSION_STATES:
+        raise HTTPException(status_code=409, detail="Plots are available once the measurement starts taking readings")
     names = context.storage.list_files(snapshot.id)
     paths = {name: context.storage.file_path(snapshot.id, name) for name in names}
     result = await run_in_threadpool(
