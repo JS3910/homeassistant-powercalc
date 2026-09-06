@@ -8,6 +8,7 @@ from measure.const import (
     MODEL_JSON_VOLTAGE_RANGE_MAX,
     MODEL_JSON_VOLTAGE_RANGE_MIN,
 )
+from measure.powermeter.spec import CompositePowerMeterSpec, PowerMeterSpec
 from measure.tuning import MeasurementParameters
 from measure.version import measure_version
 
@@ -42,6 +43,7 @@ def write_model_json(
     num_lights: int | None = None,
     dummy_load: bool = False,
     dummy_load_resistance: float | None = None,
+    power_meter: PowerMeterSpec | None = None,
 ) -> Path:
     created_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     json_data: dict[str, Any] = {
@@ -75,6 +77,22 @@ def write_model_json(
         }
         json_data[MODEL_JSON_VOLTAGE_RANGE] = voltage_range
         json_data["mains_voltage"] = mains_voltage_from_range(voltage_range)
+    if isinstance(power_meter, CompositePowerMeterSpec):
+        # `measure_settings` is the schema's only untyped, free-form object (see
+        # `profile_library/model_schema.json`), which is why witness provenance belongs
+        # here rather than as a new top-level key: adding one would break the
+        # `additionalProperties: false` contribution/CI validation every other profile
+        # relies on, while existing loaders already ignore keys here they don't recognise.
+        json_data["measure_settings"]["WITNESSES"] = [
+            {
+                "type": witness.meter.type.value,
+                "offset_w": witness.offset_w,
+                "tolerance_w": witness.tolerance_w,
+                "tolerance_pct": witness.tolerance_pct,
+                "required": witness.required,
+            }
+            for witness in power_meter.witnesses
+        ]
     if extra_json_data:
         json_data.update(extra_json_data)
 

@@ -12,6 +12,7 @@ from measure.controller.light.spec import (
 from measure.execution import RunInteraction
 from measure.home_assistant import HomeAssistantManager
 from measure.powermeter.composite import CompositePowerMeter, Witness
+from measure.powermeter.const import OwonOwh98xxChannelType, WitnessPosition
 from measure.powermeter.dummy import DummyPowerMeter
 from measure.powermeter.errors import PowerMeterError
 from measure.powermeter.spec import (
@@ -19,6 +20,7 @@ from measure.powermeter.spec import (
     DummyPowerMeterSpec,
     HassPowerMeterSpec,
     OcrPowerMeterSpec,
+    OwonOwh98xxPowerMeterSpec,
     ShellyPowerMeterSpec,
     TuyaPowerMeterSpec,
     WitnessSpec,
@@ -199,6 +201,11 @@ def test_assembler_reads_shelly_password_from_secret_dependency() -> None:
 
 
 def test_assembler_builds_composite_meter_with_witnesses() -> None:
+    """Also confirms position + magnitude reach the engine as a signed offset: an
+    AFTER_PRIMARY spec (offset_w a positive magnitude) must arrive at `Witness` as the
+    negative `signed_offset_w`, since that's what `CompositePowerMeter` actually uses for
+    both the agreement comparison and, for AFTER_PRIMARY, correcting the primary."""
+
     request = AverageMeasurementRequest(
         duration=10,
         power_meter=CompositePowerMeterSpec(
@@ -206,6 +213,7 @@ def test_assembler_builds_composite_meter_with_witnesses() -> None:
             witnesses=[
                 WitnessSpec(
                     meter=ShellyPowerMeterSpec(device_ip="192.0.2.30"),
+                    position=WitnessPosition.AFTER_PRIMARY,
                     offset_w=2.45,
                     tolerance_w=0.3,
                     tolerance_pct=1.5,
@@ -225,7 +233,8 @@ def test_assembler_builds_composite_meter_with_witnesses() -> None:
         Witness(
             name="shelly",
             meter=shelly.return_value,
-            offset_w=2.45,
+            position=WitnessPosition.AFTER_PRIMARY,
+            offset_w=-2.45,
             tolerance_w=0.3,
             tolerance_pct=1.5,
             required=False,
@@ -253,6 +262,32 @@ def test_assembler_explains_the_missing_ocr_extra(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setitem(sys.modules, "measure.powermeter.ocr", None)  # makes the import raise ImportError
 
     with pytest.raises(PowerMeterError, match="needs the 'ocr' extra: uv sync --extra cli --extra ocr"):
+        _assembler().assemble(request)
+
+
+def test_assembler_explains_the_missing_tuya_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = AverageMeasurementRequest(
+        duration=10,
+        power_meter=TuyaPowerMeterSpec(device_id="device-id", device_ip="192.0.2.20", version="3.4"),
+    )
+    monkeypatch.setitem(sys.modules, "measure.powermeter.tuya", None)  # makes the import raise ImportError
+
+    with pytest.raises(PowerMeterError, match="needs the 'cli' extra: uv sync --extra cli"):
+        _assembler(tuya_device_key="device-key").assemble(request)
+
+
+def test_assembler_explains_the_missing_owon_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = AverageMeasurementRequest(
+        duration=10,
+        power_meter=OwonOwh98xxPowerMeterSpec(
+            port="/dev/ttyUSB0",
+            baudrate=9600,
+            channel=OwonOwh98xxChannelType.CHANNEL1,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "measure.powermeter.serial_scpi", None)  # makes the import raise ImportError
+
+    with pytest.raises(PowerMeterError, match="needs the 'cli' extra: uv sync --extra cli"):
         _assembler().assemble(request)
 
 

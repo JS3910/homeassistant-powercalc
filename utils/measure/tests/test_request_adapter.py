@@ -4,7 +4,7 @@ from measure.cli.request_adapter import request_from_answers
 from measure.const import QUESTION_MEASURE_DEVICE, MeasureType
 from measure.controller.light.const import LightControllerType, LutMode
 from measure.controller.light.spec import HueLightControllerSpec
-from measure.powermeter.const import QUESTION_POWERMETER_ENTITY_ID, PowerMeterType
+from measure.powermeter.const import QUESTION_POWERMETER_ENTITY_ID, PowerMeterType, WitnessPosition
 from measure.powermeter.spec import (
     CompositePowerMeterSpec,
     HassPowerMeterSpec,
@@ -110,6 +110,9 @@ def test_witness_meters_wrap_the_primary_in_a_composite(mock_config_factory: Moc
     environment.shelly_timeout = 5
     environment.hass_call_update_entity_service = False
     environment.hass_max_age_seconds = 30.0
+    environment.witness_position = MagicMock(
+        side_effect=lambda t: WitnessPosition.AFTER_PRIMARY if t == PowerMeterType.SHELLY else WitnessPosition.NONE,
+    )
     environment.witness_offset_w = MagicMock(side_effect=lambda t: 2.45 if t == PowerMeterType.SHELLY else 0.0)
     environment.witness_tolerance_w = MagicMock(return_value=0.5)
     environment.witness_tolerance_pct = MagicMock(return_value=2.0)
@@ -123,6 +126,7 @@ def test_witness_meters_wrap_the_primary_in_a_composite(mock_config_factory: Moc
         witnesses=[
             WitnessSpec(
                 meter=ShellyPowerMeterSpec(device_ip="192.0.2.30", username="admin", timeout=5),
+                position=WitnessPosition.AFTER_PRIMARY,
                 offset_w=2.45,
                 tolerance_w=0.5,
                 tolerance_pct=2.0,
@@ -130,6 +134,7 @@ def test_witness_meters_wrap_the_primary_in_a_composite(mock_config_factory: Moc
             ),
             WitnessSpec(
                 meter=HassPowerMeterSpec(entity_id="sensor.power", max_age_seconds=30.0),
+                position=WitnessPosition.NONE,
                 offset_w=0.0,
                 tolerance_w=0.5,
                 tolerance_pct=2.0,

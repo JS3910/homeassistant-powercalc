@@ -3,6 +3,7 @@ import threading
 import time
 
 from measure.powermeter.composite import CompositePowerMeter, Witness
+from measure.powermeter.const import WitnessPosition
 from measure.powermeter.errors import ApiConnectionError, WitnessDisagreementError
 from measure.powermeter.powermeter import PowerMeasurementResult, PowerMeter, PowerMeterDiagnosticSample
 import pytest
@@ -15,6 +16,8 @@ class FakeMeter(PowerMeter):
         self.error = error
         self.calls: list[bool] = []
         self.voltage_support = voltage is not None
+        self.closed = False
+        self.close_error: Exception | None = None
 
     def get_power(self, include_voltage: bool = False) -> PowerMeasurementResult:
         self.calls.append(include_voltage)
@@ -25,6 +28,11 @@ class FakeMeter(PowerMeter):
 
     def has_voltage_support(self) -> bool:
         return self.voltage_support
+
+    def close(self) -> None:
+        self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 def _composite(primary: PowerMeter, *witnesses: Witness) -> CompositePowerMeter:
@@ -45,12 +53,75 @@ def test_returns_primary_reading_unchanged_when_witness_agrees() -> None:
 
     assert result == PowerMeasurementResult(power=4.94, updated=123.0, voltage=232.9)
     assert primary.calls == [True]
-    assert witness.calls == [False]
+    assert witness.calls == [True]
     assert meter.last_reading is not None
     reading = meter.last_reading.witnesses[0]
     assert reading.agrees
     assert reading.corrected == pytest.approx(4.95)
     assert reading.deviation == pytest.approx(0.01)
+
+
+def test_after_primary_witness_corrects_the_recorded_primary_reading() -> None:
+    """The primary is also seeing the witness's own self-consumption, so it must be subtracted.
+
+    Reproduces the real bug found 2026-09-06: Shelly (primary, upstream) reads the light
+    plus the PR10 witness's own ~2.4 W draw; PR10 (downstream) reads the light alone. The
+    negative ``offset_w`` an ``AFTER_PRIMARY`` witness takes (a positive magnitude, sign
+    applied by whoever builds this, matching ``WitnessSpec.signed_offset_w``) must come off
+    the *recorded* value, not just the agreement comparison.
+    """
+
+    primary = FakeMeter(2.8)
+    witness = FakeMeter(0.35)
+    ocr_witness = Witness(name="ocr", meter=witness, position=WitnessPosition.AFTER_PRIMARY, offset_w=-2.45)
+    meter = _composite(primary, ocr_witness)
+
+    result = meter.get_power()
+
+    assert result.power == pytest.approx(2.8 - 2.45)
+
+
+def test_before_primary_witness_never_corrects_the_recorded_primary_reading() -> None:
+    """The primary already reads the device correctly; only the witness needed correcting."""
+
+    primary = FakeMeter(4.94)
+    witness = FakeMeter(7.40)
+    shelly_witness = Witness(name="shelly", meter=witness, position=WitnessPosition.BEFORE_PRIMARY, offset_w=2.45)
+    meter = _composite(primary, shelly_witness)
+
+    result = meter.get_power()
+
+    assert result.power == pytest.approx(4.94)
+
+
+def test_none_position_witness_never_corrects_the_primary_even_with_a_negative_offset() -> None:
+    """A NONE witness's offset is its own calibration bias and must never reach the primary,
+    regardless of sign — this is the case a naive "negative offset corrects the primary"
+    rule would get wrong."""
+
+    primary = FakeMeter(4.94)
+    witness = FakeMeter(4.50)
+    meter = _composite(primary, Witness(name="clamp", meter=witness, position=WitnessPosition.NONE, offset_w=-0.44))
+
+    result = meter.get_power()
+
+    assert result.power == pytest.approx(4.94)
+
+
+def test_multiple_after_primary_witnesses_stack_their_corrections() -> None:
+    # Each witness's corrected reading (power - offset_w) must itself agree with the raw
+    # primary (10.0) to avoid a WitnessDisagreementError, independent of the correction
+    # this test is actually checking: 9.0 - (-1.0) = 10.0, and 8.5 - (-1.5) = 10.0.
+    primary = FakeMeter(10.0)
+    meter = _composite(
+        primary,
+        Witness(name="a", meter=FakeMeter(9.0), position=WitnessPosition.AFTER_PRIMARY, offset_w=-1.0),
+        Witness(name="b", meter=FakeMeter(8.5), position=WitnessPosition.AFTER_PRIMARY, offset_w=-1.5),
+    )
+
+    result = meter.get_power()
+
+    assert result.power == pytest.approx(10.0 - 1.0 - 1.5)
 
 
 def test_absolute_tolerance_applies_at_low_power() -> None:
@@ -145,3 +216,32 @@ def test_capabilities_and_diagnostics_delegate_to_primary() -> None:
     assert len(meter.witnesses) == 1
     assert meter.diagnostic_sample() == PowerMeterDiagnosticSample(power=3.0, raw_value="3.0", reported_at=123.0)
     meter.close()
+
+
+def test_close_releases_the_primary_and_every_witness() -> None:
+    """A composite is the only meter to hold multiple sub-meters, each of which may own
+    real resources (the OCR meter's capture thread and preview server, in particular) --
+    closing the composite must not leave any of them behind."""
+    primary = FakeMeter(3.0)
+    witness_a = FakeMeter(3.0)
+    witness_b = FakeMeter(3.0)
+    meter = _composite(primary, Witness(name="a", meter=witness_a), Witness(name="b", meter=witness_b))
+
+    meter.close()
+
+    assert primary.closed
+    assert witness_a.closed
+    assert witness_b.closed
+
+
+def test_close_still_closes_every_meter_when_one_fails_to_close(caplog: pytest.LogCaptureFixture) -> None:
+    primary = FakeMeter(3.0)
+    primary.close_error = RuntimeError("stuck")
+    witness = FakeMeter(3.0)
+    meter = _composite(primary, Witness(name="w", meter=witness))
+
+    with caplog.at_level(logging.WARNING):
+        meter.close()
+
+    assert witness.closed
+    assert "stuck" in caplog.text

@@ -35,7 +35,18 @@ from measure.ha_app.storage import SessionStorage
 from measure.home_assistant import HomeAssistantEntityData, HomeAssistantManager
 from measure.powermeter.diagnostics import PowerMeterDiagnostics
 from measure.powermeter.powermeter import PowerMeter, PowerMeterDiagnosticSample
-from measure.powermeter.spec import HassPowerMeterSpec, KasaPowerMeterSpec
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    HassPowerMeterSpec,
+    KasaPowerMeterSpec,
+    MyStromPowerMeterSpec,
+    OcrPowerMeterSpec,
+    OwonOwh98xxPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    TasmotaPowerMeterSpec,
+    TuyaPowerMeterSpec,
+    WitnessSpec,
+)
 from measure.request import MeasurementRequest
 from measure.runner.runner import RunnerResult
 from measure.tuning import MeasurementParameters
@@ -326,9 +337,9 @@ def payload() -> dict[str, object]:
             "sample_count": 1,
             "bri_bri_steps": 1,
             "ct_bri_steps": 5,
-            "ct_mired_steps": 10,
+            "ct_mired_divisions": 10,
             "hs_bri_steps": 32,
-            "hs_hue_steps": 2731,
+            "hs_hue_divisions": 24,
             "hs_sat_steps": 32,
         },
         "resume_policy": "new",
@@ -518,15 +529,18 @@ def test_capabilities_and_entity_filters(tmp_path: Path) -> None:
         "max_nudges": defaults.max_nudges,
         "bri_bri_steps": defaults.bri_bri_steps,
         "ct_bri_steps": defaults.ct_bri_steps,
-        "ct_mired_steps": defaults.ct_mired_steps,
+        "ct_mired_divisions": defaults.ct_mired_divisions,
         "hs_bri_steps": defaults.hs_bri_steps,
-        "hs_hue_steps": defaults.hs_hue_steps,
+        "hs_hue_divisions": defaults.hs_hue_divisions,
         "hs_sat_steps": defaults.hs_sat_steps,
         "min_brightness": defaults.min_brightness,
         "min_sat": defaults.min_sat,
         "max_sat": defaults.max_sat,
         "min_hue": defaults.min_hue,
         "max_hue": defaults.max_hue,
+        "settle_tolerance_pct": defaults.settle_tolerance_pct,
+        "settle_window_seconds": defaults.settle_window_seconds,
+        "settle_poll_interval_seconds": defaults.settle_poll_interval_seconds,
         "sleep_initial": defaults.sleep_initial,
         "sleep_standby": defaults.sleep_standby,
         "effect_bri_steps": defaults.effect_bri_steps,
@@ -616,6 +630,35 @@ def test_dummy_load_calibration_is_returned_only_for_the_configured_meter(tmp_pa
     assert test_client.get("/api/dummy-load/calibration").json() is None
 
 
+def test_dummy_load_calibration_fingerprint_follows_a_composite_primarys_voltage(tmp_path: Path) -> None:
+    """The related-voltage lookup must reach through a composite wrapper to its Hass
+    primary, since that is what changes the fingerprint, not the witnesses."""
+    test_client = client(tmp_path)
+    settings = {
+        "default_power_entity_id": "sensor.test_power",
+        "power_meter": "hass",
+        "witnesses": [{"meter": {"type": "shelly", "device_ip": "192.0.2.50"}}],
+    }
+    assert test_client.put("/api/settings", json=settings).status_code == 200
+    calibration = DummyLoadCalibration(
+        description="40 W incandescent bulb",
+        resistance=1322.5,
+        calibrated_at="2026-07-16T12:00:00Z",
+        power_meter_fingerprint=power_meter_fingerprint(
+            CompositePowerMeterSpec(
+                primary=HassPowerMeterSpec(entity_id="sensor.test_power", voltage_entity_id="sensor.test_voltage"),
+                witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.0.2.50"))],
+            ),
+        ),
+    )
+    test_client.app.state.context.storage.save_dummy_load_calibration(calibration)
+
+    response = test_client.get("/api/dummy-load/calibration")
+
+    assert response.status_code == 200
+    assert response.json()["resistance"] == pytest.approx(1322.5)
+
+
 def test_dummy_load_preflight_requires_voltage_and_includes_calibration_time(tmp_path: Path) -> None:
     test_client = client(tmp_path)
     request = payload() | {
@@ -687,6 +730,110 @@ def test_kasa_settings_round_trip_into_a_power_meter_spec(tmp_path: Path) -> Non
     assert stored.status_code == 200
     assert test_client.get("/api/settings").json()["kasa_ip"] == "192.0.2.30"
     settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == KasaPowerMeterSpec(device_ip="192.0.2.30")
+
+
+def test_new_single_meter_types_round_trip_into_power_meter_specs(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    mystrom = test_client.put("/api/settings", json={"power_meter": "mystrom", "mystrom_ip": "192.0.2.40"})
+    assert mystrom.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == MyStromPowerMeterSpec(device_ip="192.0.2.40")
+
+    tasmota = test_client.put("/api/settings", json={"power_meter": "tasmota", "tasmota_ip": "192.0.2.41"})
+    assert tasmota.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == TasmotaPowerMeterSpec(device_ip="192.0.2.41")
+
+    tuya = test_client.put(
+        "/api/settings",
+        json={"power_meter": "tuya", "tuya_device_id": "abc123", "tuya_device_ip": "192.0.2.42", "tuya_version": "3.4"},
+    )
+    assert tuya.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == TuyaPowerMeterSpec(device_id="abc123", device_ip="192.0.2.42", version="3.4")
+
+    owon = test_client.put(
+        "/api/settings",
+        json={"power_meter": "owh98xx", "owon_port": "/dev/ttyUSB0", "owon_baudrate": 9600, "owon_channel": "1"},
+    )
+    assert owon.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == OwonOwh98xxPowerMeterSpec(port="/dev/ttyUSB0", baudrate=9600, channel="1")
+
+    ocr = test_client.put("/api/settings", json={"power_meter": "ocr", "ocr_source": "http://camera/stream"})
+    assert ocr.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == OcrPowerMeterSpec(source="http://camera/stream")
+
+
+def test_new_single_meter_types_report_missing_address_errors(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    for meter_type, message in [
+        ("mystrom", "Enter the myStrom IP address first"),
+        ("tasmota", "Enter the Tasmota IP address first"),
+        ("tuya", "Enter the Tuya device ID and IP address first"),
+        ("owh98xx", "Configure the Owon serial port, baud rate, and channel first"),
+    ]:
+        response = test_client.post("/api/settings/test-power-meter", json={"power_meter": meter_type})
+        assert response.json()["success"] is False, meter_type
+        assert response.json()["message"] == message, meter_type
+
+
+def test_witnesses_wrap_the_primary_into_a_composite_spec(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    updated = test_client.put(
+        "/api/settings",
+        json={
+            "power_meter": "hass",
+            "default_power_entity_id": "sensor.test_power",
+            "witnesses": [
+                {
+                    "meter": {"type": "shelly", "device_ip": "192.0.2.50"},
+                    "offset_w": 2.5,
+                    "tolerance_w": 0.5,
+                    "tolerance_pct": 3.0,
+                    "required": True,
+                },
+                {
+                    "meter": {"type": "shelly", "device_ip": "192.0.2.51"},
+                    "required": False,
+                },
+            ],
+        },
+    )
+    assert updated.status_code == 200
+    assert len(updated.json()["witnesses"]) == 2
+
+    settings = test_client.app.state.context.storage.load_settings()
+    spec = _power_meter_spec(settings)
+    assert spec == CompositePowerMeterSpec(
+        primary=HassPowerMeterSpec(entity_id="sensor.test_power"),
+        witnesses=[
+            WitnessSpec(
+                meter=ShellyPowerMeterSpec(device_ip="192.0.2.50"),
+                offset_w=2.5,
+                tolerance_w=0.5,
+                tolerance_pct=3.0,
+                required=True,
+            ),
+            WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.0.2.51"), required=False),
+        ],
+    )
+
+
+def test_no_witnesses_returns_the_bare_primary_spec_unchanged(tmp_path: Path) -> None:
+    """A settings.json saved before witness support existed has no ``witnesses`` key,
+    which validates as an empty list; behavior must stay exactly what it was before."""
+    test_client = client(tmp_path)
+
+    test_client.put("/api/settings", json={"power_meter": "kasa", "kasa_ip": "192.0.2.30"})
+    settings = test_client.app.state.context.storage.load_settings()
+
+    assert settings.witnesses == []
     assert _power_meter_spec(settings) == KasaPowerMeterSpec(device_ip="192.0.2.30")
 
 
@@ -787,6 +934,18 @@ def test_measure_definitions_and_average_request(tmp_path: Path) -> None:
         ("vacuum_robot", "Vacuum robot", "vacuum"),
         ("lawn_mower_robot", "Lawn mower robot", "lawn_mower"),
     ]
+    # Regression: a NUMBER field with no explicit step used to render no `step` attribute
+    # at all, which every browser defaults to 1 -- rejecting a genuinely fractional value
+    # like "4.9 W" of rated power outright. Every NUMBER field here must say explicitly
+    # whether it wants integer-only ("1") or fractional ("0.1", "any", ...) input.
+    light = next(item for item in definitions.json() if item["measure_type"] == MeasureType.LIGHT)
+    light_fields = {field["name"]: field for field in light["fields"]}
+    assert light_fields["rated_power_w"]["step"] == "0.1"
+    assert light_fields["multiple_light_count"]["step"] == "1"
+    average = next(item for item in definitions.json() if item["measure_type"] == MeasureType.AVERAGE)
+    average_fields = {field["name"]: field for field in average["fields"]}
+    assert average_fields["duration"]["step"] == "1"
+
     recorder = next(item for item in definitions.json() if item["measure_type"] == MeasureType.RECORDER)
     recorder_fields = {field["name"]: field for field in recorder["fields"]}
     assert recorder_fields["recorder_purpose"]["options"][0]["value"] == "playbook"
@@ -872,17 +1031,87 @@ def test_preflight_rejects_unavailable_entity(tmp_path: Path) -> None:
 
 
 def test_preflight_rejects_cli_only_power_meter_adapter(tmp_path: Path) -> None:
+    # Manual blocks on a console prompt the app has no console to answer -- the one power
+    # meter type genuinely excluded from the app, checked in ha_app/api.py's own builder
+    # dispatch as well as here. Every other single-meter type below is app-supported.
     response = client(tmp_path).post(
         "/api/preflight",
         json={
             "measure_type": "average",
-            "power_meter": {"type": "tasmota", "device_ip": "192.0.2.1"},
+            "power_meter": {"type": "manual"},
             "duration": 60,
         },
     )
 
     assert response.status_code == 422
-    assert response.json()["message"] == "Tasmota power meters are not supported by the Home Assistant app"
+    assert response.json()["message"] == "Manual power meters are not supported by the Home Assistant app"
+
+
+def _stub_diagnostics(test_client: TestClient) -> None:
+    """Swap in a diagnostics stub that reads successfully without touching the network,
+    so a preflight response depends only on the adapter-support check under test."""
+    context = test_client.app.state.context
+    meter = MagicMock(spec=PowerMeter)
+    meter.has_voltage_support.return_value = None
+    meter.diagnostic_sample.return_value = PowerMeterDiagnosticSample(power=4.2, raw_value="4.2", reported_at=100)
+    context.power_meter_diagnostics = PowerMeterDiagnostics(MagicMock(return_value=meter), duration=0)
+
+
+@pytest.mark.parametrize(
+    "power_meter",
+    [
+        {"type": "tasmota", "device_ip": "192.0.2.1"},
+        {"type": "mystrom", "device_ip": "192.0.2.1"},
+        {"type": "tuya", "device_id": "abc123", "device_ip": "192.0.2.1"},
+        {"type": "owh98xx", "port": "/dev/ttyUSB0", "baudrate": 9600, "channel": "1"},
+        {"type": "ocr", "source": "http://camera.local:8080/", "layout": "pr10"},
+    ],
+)
+def test_preflight_accepts_every_single_meter_type_the_app_ui_offers(
+    tmp_path: Path,
+    power_meter: dict[str, object],
+) -> None:
+    """Regression guard: each of these was added to the settings UI (witness/composite work)
+    but preflight's adapter allowlist was never updated to match, so every one of them
+    failed at measurement start with a misleading 'not supported' error despite being
+    fully configurable and buildable."""
+    test_client = client(tmp_path)
+    _stub_diagnostics(test_client)
+
+    response = test_client.post(
+        "/api/preflight",
+        json={"measure_type": "average", "power_meter": power_meter, "duration": 60},
+    )
+
+    assert response.status_code == 200, response.json()
+
+
+def test_preflight_accepts_a_composite_power_meter_via_the_api(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+    _stub_diagnostics(test_client)
+
+    response = test_client.post(
+        "/api/preflight",
+        json={
+            "measure_type": "average",
+            "power_meter": {
+                "type": "composite",
+                "primary": {"type": "shelly", "device_ip": "192.0.2.1"},
+                "witnesses": [
+                    {
+                        "meter": {"type": "tasmota", "device_ip": "192.0.2.2"},
+                        "offset_w": 0.0,
+                        "tolerance_w": 0.5,
+                        "tolerance_pct": 2.0,
+                        "required": True,
+                    },
+                ],
+            },
+            "duration": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.json()
 
 
 def test_preflight_rejects_cli_only_controller_adapter(tmp_path: Path) -> None:
@@ -1387,15 +1616,18 @@ def test_contribution_preview_rejects_unsupported_generated_session(tmp_path: Pa
     assert service.preview_calls == 0
 
 
-def test_plot_endpoint_rejects_active_session(tmp_path: Path) -> None:
+def test_plot_endpoint_rejects_a_session_with_no_data_yet(tmp_path: Path) -> None:
+    # Before the light/controller loop starts taking readings there is nothing to plot,
+    # unlike RUNNING and CANCELLING, which can already have real (if partial) data.
     test_client = client(tmp_path)
     coordinator = test_client.app.state.context.coordinator
     now = "2026-07-12T12:00:00Z"
-    coordinator._snapshot = SessionSnapshot(id="active", state=SessionState.RUNNING, created_at=now, updated_at=now)  # noqa: SLF001
+    coordinator._snapshot = SessionSnapshot(id="active", state=SessionState.VALIDATING, created_at=now, updated_at=now)  # noqa: SLF001
 
     response = test_client.get("/api/sessions/active/plots")
 
     assert response.status_code == 409
+    assert "starts taking readings" in response.json()["message"]
 
 
 def test_plot_endpoint_marks_terminal_incomplete_session_as_partial(tmp_path: Path) -> None:
@@ -1462,6 +1694,25 @@ def test_settings_default_and_update(tmp_path: Path) -> None:
         "shelly_username": "admin",
         "shelly_password_configured": False,
         "kasa_ip": None,
+        "hass_max_age_seconds": None,
+        "mystrom_ip": None,
+        "tasmota_ip": None,
+        "tuya_device_id": None,
+        "tuya_device_ip": None,
+        "tuya_version": "3.3",
+        "owon_port": None,
+        "owon_baudrate": None,
+        "owon_timeout": 5.0,
+        "owon_channel": None,
+        "ocr_source": "0",
+        "ocr_layout": "pr10",
+        "ocr_preview_host": "127.0.0.1",
+        "ocr_preview_port": 8765,
+        "ocr_window_seconds": 1.5,
+        "ocr_stale_after_seconds": 5.0,
+        "ocr_crosscheck_tolerance_pct": 3.0,
+        "ocr_min_current_for_crosscheck": 0.02,
+        "witnesses": [],
         "fast_test_mode": False,
         "measurement_defaults": {
             "sleep_time": 2.0,

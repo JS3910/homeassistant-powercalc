@@ -379,8 +379,8 @@ def test_request_preserves_subsecond_sleep_time() -> None:
         ({"max_hue": 65_536}, "max_hue"),
         ({"bri_bri_steps": 0}, "bri_bri_steps"),
         ({"ct_bri_steps": 11}, "ct_bri_steps"),
-        ({"ct_mired_steps": 11}, "ct_mired_steps"),
-        ({"hs_hue_steps": 65_536}, "hs_hue_steps"),
+        ({"ct_mired_divisions": 200}, "ct_mired_divisions"),
+        ({"hs_hue_divisions": 65_536}, "hs_hue_divisions"),
         ({"measure_time_effect": 10, "measure_time_effect_min": 20}, "measure_time_effect_min"),
         ({"min_sat": 200, "max_sat": 50}, "min_sat must not exceed max_sat"),
         ({"min_hue": 500, "max_hue": 100}, "min_hue must not exceed max_hue"),
@@ -401,18 +401,92 @@ def test_request_rejects_invalid_exposed_tuning(parameters: dict[str, int], mess
     ],
 )
 def test_manual_power_meter_allows_coarser_ct_grid(power_meter: dict[str, str], accepted: bool) -> None:
+    # 3 divisions (min, max, one midpoint) is below the automated floor of 5 -- only the
+    # manual override permits going this coarse.
     payload = valid_request() | {
         "power_meter": power_meter,
-        "parameters": {"ct_bri_steps": 15, "ct_mired_steps": 50},
+        "parameters": {"ct_bri_steps": 15, "ct_mired_divisions": 3},
     }
 
     if accepted:
         request = LightMeasurementRequest.model_validate(payload)
         assert request.parameters.ct_bri_steps == 15
-        assert request.parameters.ct_mired_steps == 50
+        assert request.parameters.ct_mired_divisions == 3
     else:
         with pytest.raises(ValidationError, match="ct_bri_steps"):
             LightMeasurementRequest.model_validate(payload)
+
+
+def test_settle_tolerance_pct_is_rejected_with_a_manual_power_meter() -> None:
+    with pytest.raises(ValidationError, match="settle_tolerance_pct requires a polled power meter"):
+        LightMeasurementRequest.model_validate(
+            valid_request()
+            | {
+                "power_meter": {"type": "manual"},
+                "parameters": {"settle_tolerance_pct": 2.0, "ct_mired_divisions": 3},
+            },
+        )
+
+
+def test_settle_tolerance_pct_is_allowed_with_a_polled_power_meter() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request() | {"parameters": {"settle_tolerance_pct": 2.0}},
+    )
+
+    assert request.parameters.settle_tolerance_pct == 2.0
+
+
+def test_rated_power_w_fills_an_unbounded_ocr_primarys_plausibility_bound() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request()
+        | {
+            "power_meter": {"type": "ocr", "source": "http://camera/mjpeg"},
+            "rated_power_w": 10.0,
+            "multiple_light_count": 2,
+        },
+    )
+
+    assert request.power_meter.max_plausible_power_w == 60.0  # 10 W x 2 lights x 3.0 margin
+
+
+def test_rated_power_w_fills_witnesses_too_but_not_the_primary_if_its_not_ocr() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request()
+        | {
+            "power_meter": {
+                "type": "composite",
+                "primary": {"type": "hass", "entity_id": "sensor.test_power"},
+                "witnesses": [{"meter": {"type": "ocr", "source": "http://camera/mjpeg"}}],
+            },
+            "rated_power_w": 5.0,
+        },
+    )
+
+    assert request.power_meter.witnesses[0].meter.max_plausible_power_w == 15.0
+
+
+def test_rated_power_w_does_not_override_an_explicit_bound() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request()
+        | {
+            "power_meter": {
+                "type": "ocr",
+                "source": "http://camera/mjpeg",
+                "max_plausible_power_w": 42.0,
+            },
+            "rated_power_w": 10.0,
+        },
+    )
+
+    assert request.power_meter.max_plausible_power_w == 42.0
+
+
+def test_without_rated_power_w_ocr_meters_get_no_plausibility_bound() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request() | {"power_meter": {"type": "ocr", "source": "http://camera/mjpeg"}},
+    )
+
+    assert request.power_meter.max_plausible_power_w is None
 
 
 def test_parameter_limits_cover_exactly_the_validated_fields() -> None:

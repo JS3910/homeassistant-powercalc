@@ -145,7 +145,8 @@ class MeasurementAssembler:
                     Witness(
                         name=str(witness.meter.type),
                         meter=self.build_power_meter(witness.meter),
-                        offset_w=witness.offset_w,
+                        position=witness.position,
+                        offset_w=witness.signed_offset_w,
                         tolerance_w=witness.tolerance_w,
                         tolerance_pct=witness.tolerance_pct,
                         required=witness.required,
@@ -195,11 +196,21 @@ class MeasurementAssembler:
         if isinstance(spec, TuyaPowerMeterSpec):
             if self._tuya_device_key is None:
                 raise PowerMeterError("Tuya device key is required")
-            from measure.powermeter.tuya import TuyaPowerMeter
+            try:
+                from measure.powermeter.tuya import TuyaPowerMeter
+            except ImportError as error:
+                raise PowerMeterError(
+                    "The Tuya power meter needs the 'cli' extra: uv sync --extra cli",
+                ) from error
 
             return TuyaPowerMeter(spec.device_id, spec.device_ip, self._tuya_device_key, spec.version)
         if isinstance(spec, OwonOwh98xxPowerMeterSpec):
-            from measure.powermeter.serial_scpi import OwonOwh98xxPowerMeter
+            try:
+                from measure.powermeter.serial_scpi import OwonOwh98xxPowerMeter
+            except ImportError as error:
+                raise PowerMeterError(
+                    "The OWON OWH98xx power meter needs the 'cli' extra: uv sync --extra cli",
+                ) from error
 
             return OwonOwh98xxPowerMeter(spec.port, spec.baudrate, spec.timeout, spec.channel)
         raise PowerMeterError(f"Unsupported power meter specification: {type(spec).__name__}")

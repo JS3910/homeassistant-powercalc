@@ -3,11 +3,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from measure.request import BaseMeasurementRequest
-from measure.util.measure_util import MeasurementResult
+from measure.util.measure_util import MeasurementResult, MeasureUtil
 
 
 class MeasurementRunner[TRequest: BaseMeasurementRequest](ABC):
     """Lifecycle contract for a measurement strategy and request type."""
+
+    #: Every runner holds one of these; declared here so callers -- currently just
+    #: `MeasurementExecution.run`'s cleanup -- can close the underlying power meter
+    #: generically instead of duck-typing each subclass. Each subclass assigns this
+    #: in its own `__init__`.
+    measure_util: MeasureUtil
 
     @abstractmethod
     def run(

@@ -121,6 +121,7 @@ export class MeasureAppController {
   private contributionDevicePollInterval = 0;
   private contributionDeviceExpiresAt = 0;
   private contributionDevicePollTimer?: ReturnType<typeof setTimeout>;
+  private plotsPollTimer?: ReturnType<typeof setInterval>;
   private readonly contributionTouchedFields = new Set<string>();
 
   constructor(
@@ -143,8 +144,38 @@ export class MeasureAppController {
   dispose(): void {
     this.shellyDiscoveryVersion += 1;
     this.stopContributionDevicePolling();
+    this.stopPlotsPolling();
     this.state.contributionAuthBusy = false;
     this.eventConnection?.close();
+  }
+
+  /**
+   * Poll for the profile plot while a measurement is running, so the shape of the result
+   * builds up on screen instead of only appearing once the whole run finishes. A slow
+   * interval (not tied to individual sample events, which arrive far more often) keeps
+   * this cheap: each poll re-parses the CSV(s) written so far.
+   */
+  private startPlotsPolling(): void {
+    this.stopPlotsPolling();
+    void this.refreshPlots();
+    this.plotsPollTimer = setInterval(() => void this.refreshPlots(), 10_000);
+  }
+
+  private stopPlotsPolling(): void {
+    if (this.plotsPollTimer === undefined) return;
+    clearInterval(this.plotsPollTimer);
+    this.plotsPollTimer = undefined;
+  }
+
+  private async refreshPlots(): Promise<void> {
+    const sessionId = this.state.snapshot?.session_id;
+    if (!sessionId) return;
+    try {
+      this.state.plotCollection = await this.api().getPlots(sessionId);
+      this.changed();
+    } catch {
+      // Expected 409 before any reading has been taken yet; keep whatever was last shown.
+    }
   }
 
   async boot(): Promise<void> {
@@ -701,6 +732,7 @@ export class MeasureAppController {
     const sessionId = this.state.snapshot?.session_id;
     if (!sessionId) return;
     this.eventConnection?.close();
+    this.startPlotsPolling();
     this.eventConnection = this.createEventConnection(sessionId, {
       onEvent: (event) => this.consumeEvent(event),
       onConnection: (connected) => {
@@ -738,6 +770,7 @@ export class MeasureAppController {
 
   private async enterResult(): Promise<void> {
     this.eventConnection?.close();
+    this.stopPlotsPolling();
     this.state.connectedToEvents = false;
     if (this.state.view === "settings") this.settingsReturnView = "result";
     else this.state.view = "result";
@@ -756,6 +789,7 @@ export class MeasureAppController {
 
   private resetDraft(request?: MeasurementRequest): void {
     this.eventConnection?.close();
+    this.stopPlotsPolling();
     this.state.connectedToEvents = false;
     this.state.snapshot = { state: "idle" };
     this.state.request = request;

@@ -7,7 +7,7 @@ import pytest
 
 # Fields without their own env var: bri_bri_steps is fixed, the hs_*_steps are
 # derived from the HS_*_PRECISION vars and cannot leave their table range.
-_DERIVED_LIMIT_FIELDS = {"bri_bri_steps", "hs_bri_steps", "hs_hue_steps", "hs_sat_steps"}
+_DERIVED_LIMIT_FIELDS = {"bri_bri_steps", "hs_bri_steps", "hs_hue_divisions", "hs_sat_steps"}
 _ENV_BACKED_LIMIT_FIELDS = sorted(set(PARAMETER_LIMITS) - _DERIVED_LIMIT_FIELDS)
 
 
@@ -15,14 +15,14 @@ def test_cli_environment_preserves_manual_power_meter_overrides(monkeypatch: pyt
     monkeypatch.setenv("POWER_METER", PowerMeterType.MANUAL)
     monkeypatch.setenv("SAMPLE_COUNT", "9")
     monkeypatch.setenv("CT_BRI_STEPS", "2")
-    monkeypatch.setenv("CT_MIRED_STEPS", "3")
+    monkeypatch.setenv("CT_MIRED_DIVISIONS", "3")
 
     config = CliEnvironment()
 
     assert config.selected_power_meter == PowerMeterType.MANUAL
     assert config.sample_count == 1
     assert config.ct_bri_steps == 15
-    assert config.ct_mired_steps == 50
+    assert config.ct_mired_divisions == 9
     assert config.bri_bri_steps == 3
 
 

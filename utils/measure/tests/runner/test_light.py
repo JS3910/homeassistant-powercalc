@@ -26,10 +26,10 @@ import pytest
 def _parameters() -> MeasurementParameters:
     return MeasurementParameters(
         ct_bri_steps=5,
-        ct_mired_steps=10,
+        ct_mired_divisions=10,
         bri_bri_steps=1,
         hs_bri_steps=32,
-        hs_hue_steps=2731,
+        hs_hue_divisions=24,
         hs_sat_steps=32,
     )
 
@@ -44,6 +44,70 @@ def _zero_sleep_parameters() -> MeasurementParameters:
         sleep_time_sat=0,
         sleep_time_effect_change=0,
     )
+
+
+def test_settle_waits_the_fixed_sleep_time_when_tolerance_is_zero() -> None:
+    measure_util_mock = MagicMock(MeasureUtil)
+    config = replace(_parameters(), sleep_time=3, settle_tolerance_pct=0)
+    runner = LightRunner(measure_util_mock, config, DummyLightController())
+    runner._wait = MagicMock()  # noqa: SLF001
+
+    runner._settle()  # noqa: SLF001
+
+    runner._wait.assert_called_once_with(3)  # noqa: SLF001
+    measure_util_mock.wait_for_plateau.assert_not_called()
+
+
+def test_settle_polls_for_a_plateau_when_tolerance_is_set() -> None:
+    measure_util_mock = MagicMock(MeasureUtil)
+    measure_util_mock.wait_for_plateau.return_value = 1.2
+    config = replace(
+        _parameters(),
+        sleep_time=10,
+        settle_tolerance_pct=2.0,
+        settle_window_seconds=1.5,
+        settle_poll_interval_seconds=0.3,
+    )
+    runner = LightRunner(measure_util_mock, config, DummyLightController())
+    runner._wait = MagicMock()  # noqa: SLF001
+
+    runner._settle()  # noqa: SLF001
+
+    runner._wait.assert_not_called()  # noqa: SLF001
+    measure_util_mock.wait_for_plateau.assert_called_once_with(
+        10,
+        tolerance_pct=2.0,
+        window_seconds=1.5,
+        poll_interval=0.3,
+    )
+    assert runner.last_settle_seconds == 1.2
+    assert runner.last_settle_hit_cap is False
+
+
+def test_settle_records_none_for_settle_fields_when_tolerance_is_zero() -> None:
+    measure_util_mock = MagicMock(MeasureUtil)
+    config = replace(_parameters(), sleep_time=3, settle_tolerance_pct=0)
+    runner = LightRunner(measure_util_mock, config, DummyLightController())
+    runner._wait = MagicMock()  # noqa: SLF001
+    runner.last_settle_seconds = 999.0  # left over from a previous variation
+    runner.last_settle_hit_cap = True
+
+    runner._settle()  # noqa: SLF001
+
+    assert runner.last_settle_seconds is None
+    assert runner.last_settle_hit_cap is None
+
+
+def test_settle_flags_hitting_the_cap_when_the_plateau_wait_never_settled() -> None:
+    measure_util_mock = MagicMock(MeasureUtil)
+    measure_util_mock.wait_for_plateau.return_value = 9.97  # never went flat, gave up near the 10s cap
+    config = replace(_parameters(), sleep_time=10, settle_tolerance_pct=2.0)
+    runner = LightRunner(measure_util_mock, config, DummyLightController())
+    runner._wait = MagicMock()  # noqa: SLF001
+
+    runner._settle()  # noqa: SLF001
+
+    assert runner.last_settle_hit_cap is True
 
 
 @dataclass
@@ -88,7 +152,7 @@ def _brightness_run(tmp_path: Path, variations: list[Variation]) -> _BrightnessR
         ),
         (
             LutMode.COLOR_TEMP,
-            1872,
+            520,
         ),
         (
             LutMode.HS,
@@ -295,6 +359,102 @@ def _flaky_light_controller(failures_after_startup: int) -> MagicMock:
 
     light_controller.change_light_state.side_effect = change_light_state
     return light_controller
+
+
+def test_run_mode_writes_no_raw_samples_file_content_for_a_bare_power_meter(tmp_path: Path) -> None:
+    """A raw-samples file is still created (so tooling doesn't need to guess), but stays empty.
+
+    Only a composite power meter has a primary+witness(es) reading worth recording; a bare
+    meter's own measurement is already exactly what the CSV records, so there is nothing
+    the raw-samples file would add.
+    """
+    variations = [Variation(1), Variation(2)]
+    run = _brightness_run(tmp_path, variations)
+    run.measure_util.take_measurement.return_value = MeasurementResult(power=1, voltages=[])
+    # MagicMock(spec=MeasureUtil) has no `power_meter` attribute unless one is set.
+
+    run.execute()
+
+    raw_path = tmp_path / "brightness.raw.jsonl"
+    assert raw_path.exists()
+    assert raw_path.read_text() == ""
+
+
+def test_run_mode_records_one_raw_sample_per_variation_from_the_composite_meters_last_reading(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from measure.powermeter.composite import CompositePowerMeter, CompositeReading, WitnessReading
+    from measure.powermeter.powermeter import PowerMeasurementResult
+
+    variations = [Variation(1), Variation(2)]
+    run = _brightness_run(tmp_path, variations)
+    readings = [
+        CompositeReading(
+            primary=PowerMeasurementResult(power=1.0, updated=1.0, voltage=230.0, current=0.01, power_factor=0.4),
+            witnesses=(
+                WitnessReading(
+                    name="ocr",
+                    power=0.9,
+                    corrected=0.9,
+                    deviation=-0.1,
+                    agrees=True,
+                    voltage=230.1,
+                    current=0.009,
+                    power_factor=0.41,
+                ),
+            ),
+        ),
+        CompositeReading(
+            primary=PowerMeasurementResult(power=2.0, updated=2.0),
+            witnesses=(
+                WitnessReading(name="ocr", power=None, corrected=None, deviation=None, agrees=True, error="stale"),
+            ),
+        ),
+    ]
+    composite = MagicMock(spec=CompositePowerMeter)
+    run.measure_util.power_meter = composite
+
+    # Simulates the composite meter's last_reading updating on every get_power() the
+    # runner triggers internally via take_measurement().
+    call_count = {"n": 0}
+
+    def _take_measurement(*_args: object, **_kwargs: object) -> MeasurementResult:
+        composite.last_reading = readings[call_count["n"]]
+        call_count["n"] += 1
+        return MeasurementResult(power=composite.last_reading.primary.power, voltages=[])
+
+    run.measure_util.take_measurement.side_effect = _take_measurement
+
+    run.execute()
+
+    raw_path = tmp_path / "brightness.raw.jsonl"
+    lines = [json.loads(line) for line in raw_path.read_text().splitlines()]
+    assert len(lines) == 2
+    assert lines[0]["mode"] == "brightness"
+    assert lines[0]["variation"] == {"bri": 1}
+    assert lines[0]["primary"] == {"power": 1.0, "voltage": 230.0, "current": 0.01, "power_factor": 0.4}
+    assert lines[0]["witnesses"] == [
+        {
+            "name": "ocr",
+            "power": 0.9,
+            "corrected": 0.9,
+            "deviation": -0.1,
+            "agrees": True,
+            "error": None,
+            "voltage": 230.1,
+            "current": 0.009,
+            "power_factor": 0.41,
+        },
+    ]
+    assert lines[1]["variation"] == {"bri": 2}
+    assert lines[1]["witnesses"][0]["error"] == "stale"
+    assert lines[1]["witnesses"][0]["power"] is None
+    # settle detection wasn't enabled for this run (_zero_sleep_parameters leaves
+    # settle_tolerance_pct at its default 0), so both points record no settle data.
+    assert lines[0]["settle_seconds"] is None
+    assert lines[0]["settle_hit_cap"] is None
 
 
 def test_change_light_state_is_retried_after_a_dropped_connection(tmp_path: Path) -> None:

@@ -382,6 +382,25 @@ def test_reports_invalid_artifact_without_hiding_other_plots(tmp_path: Path) -> 
     assert "color_temp.csv" in result.warnings[0]
 
 
+def test_a_row_with_a_missing_trailing_value_from_a_still_running_write_is_skipped(tmp_path: Path) -> None:
+    # Simulates polling a light's CSV while it's still being written for a live preview
+    # (see docs/integrations.md "live-plot"): a trailing row's numeric field can be empty
+    # if a flush landed between fields. Already handled gracefully -- the missing value
+    # just drops that one point, same as any other unreadable row -- with no special
+    # casing needed for a session that's still RUNNING versus one that's finished.
+    brightness = tmp_path / "brightness.csv"
+    brightness.write_text("bri,watt\n1,1.0\n2,\n", encoding="utf-8")
+
+    result = build_session_plots(
+        light_request("brightness"),
+        {"LCT010/brightness.csv": brightness},
+    )
+
+    assert not result.warnings
+    assert len(result.plots) == 1
+    assert [point.x for point in result.plots[0].series[0].points] == [1.0]
+
+
 def test_reads_effect_csv_with_utf8_bom(tmp_path: Path) -> None:
     effect = tmp_path / "effect.csv.gz"
     with gzip.open(effect, "wt", encoding="utf-8-sig") as file:

@@ -275,6 +275,57 @@ class MeasureUtil:
         self._emit_calibration_sample(power, resistance, voltage)
         return MeasurementResult(power=resistance, voltages=[voltage])
 
+    def wait_for_plateau(
+        self,
+        max_wait: float,
+        *,
+        tolerance_pct: float,
+        window_seconds: float = 1.0,
+        poll_interval: float = 0.25,
+    ) -> float:
+        """Poll the power meter until its reading has been flat for `window_seconds`, or
+        `max_wait` total has elapsed, whichever comes first. Returns the elapsed time
+        actually waited, for logging.
+
+        A reading error doesn't abort the wait -- it's treated the same as "not yet
+        stable", since the meter commonly has no fresh sample right after a light change.
+        Only the most recent readings within `window_seconds` are considered, so a slow
+        early transient doesn't need to re-settle from scratch once it passes.
+        """
+        start = time.time()
+        readings: list[tuple[float, float]] = []
+        while True:
+            now = time.time()
+            elapsed = now - start
+            try:
+                power = self.power_meter.get_power().power
+            except PowerMeterError:
+                power = None
+            if power is not None:
+                readings.append((now, power))
+            while len(readings) > 1 and now - readings[0][0] > window_seconds:
+                readings.pop(0)
+            if (
+                readings
+                and readings[-1][0] - readings[0][0] >= window_seconds * 0.9
+                and self._is_flat(
+                    [value for _, value in readings],
+                    tolerance_pct,
+                )
+            ):
+                return elapsed
+            if elapsed >= max_wait:
+                return elapsed
+            self._wait(min(poll_interval, max(0.0, max_wait - elapsed)))
+
+    @staticmethod
+    def _is_flat(values: list[float], tolerance_pct: float) -> bool:
+        if len(values) < 2:
+            return False
+        spread = max(values) - min(values)
+        scale = max((abs(value) for value in values), default=0.0) or 1.0
+        return spread / scale * 100 <= tolerance_pct
+
     def take_measurement(
         self,
         start_timestamp: float | None = None,

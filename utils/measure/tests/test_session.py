@@ -1,8 +1,21 @@
 from threading import Event, Thread
 
 from measure.execution import FanOperatingPoint, MeasurementCancelledError
-from measure.ha_app.session import SessionControl, SessionEvent, SessionEventType
+from measure.ha_app.session import PRE_DATA_SESSION_STATES, SessionControl, SessionEvent, SessionEventType, SessionState
 import pytest
+
+
+def test_pre_data_states_exclude_running_and_cancelling() -> None:
+    # RUNNING and CANCELLING can already have real (if partial) measurement data on disk
+    # -- only the states before the loop starts taking readings have nothing to plot yet.
+    assert SessionState.RUNNING not in PRE_DATA_SESSION_STATES
+    assert SessionState.CANCELLING not in PRE_DATA_SESSION_STATES
+    assert {
+        SessionState.IDLE,
+        SessionState.VALIDATING,
+        SessionState.READY,
+        SessionState.AWAITING_CONFIRMATION,
+    } == PRE_DATA_SESSION_STATES
 
 
 def test_cancel_is_idempotent_and_checkpoint_raises() -> None:

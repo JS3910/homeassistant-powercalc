@@ -16,8 +16,10 @@ export type LutMode = "brightness" | "color_temp" | "hs" | "effect";
 export type DeviceClass = "power" | "voltage" | "battery";
 export type ChargingDeviceType = "vacuum_robot" | "lawn_mower_robot";
 export type ResumePolicy = "new" | "resume";
-/** Derived from the spec union so a new meter variant automatically widens it. */
-export type PowerMeterType = PowerMeterSpec["type"];
+/** Derived from the spec union so a new meter variant automatically widens it. Excludes
+ * `composite`, which is not itself selectable as a meter — it emerges from configuring at
+ * least one witness alongside whichever of these is chosen as the primary. */
+export type PowerMeterType = SingleMeterSpec["type"];
 
 export type OperatingPoint =
   | { type: "light"; on: boolean; brightness?: number; color_temp_mired?: number; hue?: number; saturation?: number; effect?: string }
@@ -77,9 +79,9 @@ export interface MeasurementParameters {
   max_nudges: number;
   bri_bri_steps: number;
   ct_bri_steps: number;
-  ct_mired_steps: number;
+  ct_mired_divisions: number;
   hs_bri_steps: number;
-  hs_hue_steps: number;
+  hs_hue_divisions: number;
   hs_sat_steps: number;
   min_brightness: number;
   sleep_initial: number;
@@ -131,6 +133,10 @@ export interface FormField {
   default?: PrimitiveValue;
   minimum?: number | null;
   maximum?: number | null;
+  /** HTML `step` for a NUMBER control. Missing/null renders no `step` attribute, which
+   * every browser defaults to `1` -- fine for an inherently integer field, wrong for
+   * anything that can genuinely take a decimal. */
+  step?: string | null;
   /** Whether several entities can be selected for this field at once. */
   multiple?: boolean;
   /** Label to use while several entities are selected. */
@@ -203,11 +209,47 @@ export type AppMeasurementDefaults = Pick<
   "sleep_time" | "sample_count" | "sleep_time_sample" | "max_retries" | "max_nudges"
 >;
 
-export type PowerMeterSpec =
+/** Every meter that reads one physical device. A composite is built from two or more of these. */
+export type SingleMeterSpec =
   | { type: "dummy" }
-  | { type: "hass"; entity_id: string; voltage_entity_id?: string | null; call_update_entity?: boolean }
+  | { type: "hass"; entity_id: string; voltage_entity_id?: string | null; call_update_entity?: boolean; max_age_seconds?: number | null }
   | { type: "shelly"; device_ip: string; username?: string; timeout?: number }
-  | { type: "kasa"; device_ip: string };
+  | { type: "kasa"; device_ip: string }
+  | { type: "mystrom"; device_ip: string }
+  | { type: "tasmota"; device_ip: string }
+  | { type: "tuya"; device_id: string; device_ip: string; version?: string }
+  | { type: "owh98xx"; port: string; baudrate: number; timeout?: number; channel: "1" | "2" }
+  | {
+      type: "ocr";
+      source?: string;
+      layout?: string;
+      preview_host?: string;
+      preview_port?: number | null;
+      window_seconds?: number;
+      stale_after_seconds?: number;
+      crosscheck_tolerance_pct?: number;
+      min_current_for_crosscheck?: number;
+    };
+
+/** Where a witness sits relative to the primary in the wiring, if at all — mirrors
+ * `measure.powermeter.const.WitnessPosition`. Decides whether `offset_w` also corrects
+ * the primary's recorded reading (`after_primary` only) or just the agreement check. */
+export type WitnessPosition = "none" | "before_primary" | "after_primary";
+
+/** A secondary meter read together with the primary; it must agree or the sample is retried.
+ * Mirrors `measure.powermeter.spec.WitnessSpec` field-for-field. */
+export interface WitnessSpec {
+  meter: SingleMeterSpec;
+  position?: WitnessPosition;
+  offset_w?: number;
+  tolerance_w?: number;
+  tolerance_pct?: number;
+  required?: boolean;
+}
+
+export type CompositePowerMeterSpec = { type: "composite"; primary: SingleMeterSpec; witnesses: WitnessSpec[] };
+
+export type PowerMeterSpec = SingleMeterSpec | CompositePowerMeterSpec;
 
 export type LightControllerSpec =
   | { type: "dummy" }
@@ -225,6 +267,7 @@ export interface LightMeasurementRequest extends BaseMeasurementRequest {
   modes: LutMode[];
   gzip: boolean;
   multiple_light_count: number;
+  rated_power_w?: number | null;
 }
 
 export interface AverageMeasurementRequest extends BaseMeasurementRequest { measure_type: "average"; controller?: null; duration: number; }
@@ -403,6 +446,40 @@ interface OperatingPointSessionEvent {
 
 export type SessionEvent = RegularSessionEvent | OperatingPointSessionEvent;
 
+/** A witness meter as a saved session default: every field flat and optional, like the
+ * primary meter's own settings fields, so an incomplete draft can still round-trip. */
+export interface WitnessMeterSettings {
+  type: PowerMeterType;
+  entity_id?: string | null;
+  voltage_entity_id?: string | null;
+  max_age_seconds?: number | null;
+  device_ip?: string | null;
+  username?: string;
+  device_id?: string | null;
+  version?: string;
+  port?: string | null;
+  baudrate?: number | null;
+  timeout?: number;
+  channel?: "1" | "2" | null;
+  source?: string;
+  layout?: string;
+  preview_host?: string;
+  preview_port?: number | null;
+  window_seconds?: number;
+  stale_after_seconds?: number;
+  crosscheck_tolerance_pct?: number;
+  min_current_for_crosscheck?: number;
+}
+
+export interface WitnessSettings {
+  meter: WitnessMeterSettings;
+  position: WitnessPosition;
+  offset_w: number;
+  tolerance_w: number;
+  tolerance_pct: number;
+  required: boolean;
+}
+
 export interface AppSettings {
   default_power_entity_id: string | null;
   default_measure_device: string | null;
@@ -415,6 +492,27 @@ export interface AppSettings {
   shelly_username?: string;
   shelly_password_configured?: boolean;
   kasa_ip: string | null;
+  // Added alongside the four fields above; see AppPreferences (preferences.py) for why
+  // they stay flat rather than nested, and why `witnesses` defaults to an empty list.
+  hass_max_age_seconds?: number | null;
+  mystrom_ip?: string | null;
+  tasmota_ip?: string | null;
+  tuya_device_id?: string | null;
+  tuya_device_ip?: string | null;
+  tuya_version?: string;
+  owon_port?: string | null;
+  owon_baudrate?: number | null;
+  owon_timeout?: number;
+  owon_channel?: "1" | "2" | null;
+  ocr_source?: string;
+  ocr_layout?: string;
+  ocr_preview_host?: string;
+  ocr_preview_port?: number | null;
+  ocr_window_seconds?: number;
+  ocr_stale_after_seconds?: number;
+  ocr_crosscheck_tolerance_pct?: number;
+  ocr_min_current_for_crosscheck?: number;
+  witnesses?: WitnessSettings[];
   fast_test_mode: boolean;
   measurement_defaults: AppMeasurementDefaults;
 }

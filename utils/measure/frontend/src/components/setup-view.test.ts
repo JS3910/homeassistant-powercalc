@@ -103,7 +103,7 @@ describe("setup view", () => {
     expect((element.shadowRoot.querySelector('input[name="sleep_time_sample"]') as HTMLInputElement).disabled).toBe(false);
     expect((element.shadowRoot.querySelector('input[name="bri_bri_steps"]') as HTMLInputElement).value).toBe("1");
     // The desk lamp supports brightness only, so no other mode's parameters are offered at all.
-    const unsupported = ["ct_bri_steps", "ct_mired_steps", "hs_bri_steps", "hs_hue_steps", "hs_sat_steps", "effect_bri_steps", "measure_time_effect"];
+    const unsupported = ["ct_bri_steps", "ct_mired_divisions", "hs_bri_steps", "hs_hue_divisions", "hs_sat_steps", "effect_bri_steps", "measure_time_effect"];
     expect(unsupported.filter((name) => element.shadowRoot.querySelector(`input[name="${name}"]`))).toEqual([]);
 
     selectEntity(light, "light.desk");
@@ -195,9 +195,9 @@ describe("setup view", () => {
     expect(request.parameters).toMatchObject({
       bri_bri_steps: 1,
       ct_bri_steps: 5,
-      ct_mired_steps: 10,
+      ct_mired_divisions: 10,
       hs_bri_steps: 32,
-      hs_hue_steps: 2731,
+      hs_hue_divisions: 2731,
       hs_sat_steps: 32,
     });
   });
@@ -240,6 +240,13 @@ describe("setup view", () => {
     expect(element.shadowRoot.querySelectorAll('input[name="modes"]')).toHaveLength(1);
     expect(element.shadowRoot.querySelector('input[name="model_id"]')).toBeNull();
     expect((element.shadowRoot.querySelector('input[name="multiple_light_count"]') as HTMLInputElement).value).toBe("2");
+    // Regression: a NUMBER field with no explicit `step` rendered none at all, which
+    // every browser defaults to "1" -- silently rejecting a genuinely fractional value
+    // like a rated power of "4.9" W (confirmed 2026-09-06). An inherently integer field
+    // like a light count must still say so explicitly rather than picking up that same
+    // default by accident.
+    expect(element.shadowRoot.querySelector('input[name="multiple_light_count"]')?.getAttribute("step")).toBe("1");
+    expect(element.shadowRoot.querySelector('input[name="rated_power_w"]')?.getAttribute("step")).toBe("0.1");
 
     const submitted = new Promise<MeasurementRequest>((resolve) => {
       element.addEventListener("preflight", (event) => resolve((event as CustomEvent<MeasurementRequest>).detail));

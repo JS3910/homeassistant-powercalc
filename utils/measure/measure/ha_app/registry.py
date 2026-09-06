@@ -58,6 +58,14 @@ class FormFieldDefinition:
     default: str | int | bool | None = None
     minimum: int | float | None = None
     maximum: int | float | None = None
+    #: HTML `step` for a NUMBER control. `None` renders no `step` attribute, which every
+    #: browser treats as the number-input default of `1` -- fine for an inherently integer
+    #: field (a count of lights, a duration in seconds), wrong for anything that can
+    #: genuinely take a decimal (confirmed 2026-09-06: a fractional watt value was
+    #: rejected outright). Set explicitly per field rather than defaulting to "any" here,
+    #: so a field that really is integer-only keeps native step validation instead of
+    #: silently accepting fractions.
+    step: str | None = None
     #: Whether several entities can be selected for this field at once.
     multiple: bool = False
     #: Label to use while several entities are selected.
@@ -143,8 +151,12 @@ def _controller(
 #: activates. A light only offers the subset its entity reports as supported.
 LIGHT_MODE_OPTIONS = (
     FieldOption(value=LutMode.BRIGHTNESS, label="Brightness", enables=("bri_bri_steps",)),
-    FieldOption(value=LutMode.COLOR_TEMP, label="Color temperature", enables=("ct_bri_steps", "ct_mired_steps")),
-    FieldOption(value=LutMode.HS, label="Hue & saturation", enables=("hs_bri_steps", "hs_hue_steps", "hs_sat_steps")),
+    FieldOption(value=LutMode.COLOR_TEMP, label="Color temperature", enables=("ct_bri_steps", "ct_mired_divisions")),
+    FieldOption(
+        value=LutMode.HS,
+        label="Hue & saturation",
+        enables=("hs_bri_steps", "hs_hue_divisions", "hs_sat_steps"),
+    ),
     FieldOption(
         value=LutMode.EFFECT,
         label="Effect",
@@ -192,7 +204,22 @@ LIGHT_PARAMETERS = (
     ParameterDefinition(
         name="sleep_time",
         label="Settle time (seconds)",
-        hint="Wait after changing the light before reading power.",
+        hint=(
+            "Wait after changing the light before reading power. Acts as an upper bound, "
+            "not a fixed wait, when settle detection below is enabled."
+        ),
+        step="0.1",
+        group=SAMPLING,
+    ),
+    ParameterDefinition(
+        name="settle_tolerance_pct",
+        label="Settle detection tolerance (%)",
+        hint=(
+            "0 disables this and always waits the full settle time above. Above 0, proceed "
+            "as soon as the reading has been within this tolerance for a second or so, "
+            "instead of always waiting the full settle time -- falls back to the full wait "
+            "if it never stabilizes. Requires a polled power meter (not manual entry)."
+        ),
         step="0.1",
         group=SAMPLING,
     ),
@@ -218,9 +245,13 @@ LIGHT_PARAMETERS = (
         group=RESOLUTION,
     ),
     ParameterDefinition(
-        name="ct_mired_steps",
-        label="Color temperature mired step",
-        hint="Native color-temperature increment in mired.",
+        name="ct_mired_divisions",
+        label="Color temperature divisions",
+        hint=(
+            "How many points to divide the color-temperature range into (min and max "
+            "always included). Swept warm/cold-first, then bisected, so the profile's "
+            "shape emerges early and only sharpens with more divisions."
+        ),
         group=RESOLUTION,
     ),
     ParameterDefinition(
@@ -230,9 +261,13 @@ LIGHT_PARAMETERS = (
         group=RESOLUTION,
     ),
     ParameterDefinition(
-        name="hs_hue_steps",
-        label="HS hue step",
-        hint="Native Home Assistant hue increment (0–65535).",  # noqa: RUF001
+        name="hs_hue_divisions",
+        label="HS hue divisions",
+        hint=(
+            "How many points around the hue wheel. Seeded at red/green/blue (an RGB(WW) "
+            "fixture's actual emitters), then bisected, so the profile's shape emerges "
+            "early and only sharpens with more divisions."
+        ),
         group=RESOLUTION,
     ),
     ParameterDefinition(
@@ -288,8 +323,23 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
                 default=1,
                 minimum=1,
                 maximum=100,
+                step="1",
                 derived_from="light_entity_id",
                 hint="Total number of identical physical lights; measured power is divided by this value.",
+            ),
+            FormFieldDefinition(
+                name="rated_power_w",
+                label="Rated power per light (W)",
+                control=FieldControl.NUMBER,
+                required=False,
+                minimum=0,
+                step="0.1",
+                hint=(
+                    "Optional. Used only to bound an OCR power meter's readings against "
+                    "gross misreads (e.g. a missed decimal point) that its own internal "
+                    "cross-check can't catch. Leave blank to skip this check; ignored for "
+                    "non-OCR meters."
+                ),
             ),
         ),
         supports_resume=True,
@@ -460,6 +510,7 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
                 default=60,
                 minimum=1,
                 maximum=86_400,
+                step="1",
             ),
         ),
         supports_profile=False,

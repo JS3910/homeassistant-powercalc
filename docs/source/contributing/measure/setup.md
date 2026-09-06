@@ -160,6 +160,15 @@ WITNESS_SHELLY_REQUIRED=true
 
 Only the primary's reading is recorded; witnesses decide whether it is trusted. Voltage, when used, also comes from the primary.
 
+The Home Assistant app's settings screen offers the same thing under **Power meter →
+Witness meters**: pick any meter type (except Manual, which needs an interactive prompt
+the app has no console for) as the primary, then add one or more witness rows, each with
+its own type, address, offset, and tolerances. A composite meter — the primary plus its
+witnesses — is what gets used for the session once at least one witness row exists;
+provenance (each witness's type, offset, and tolerances) is written into the resulting
+`model.json`'s `measure_settings.WITNESSES`, which existing Powercalc installs ignore
+safely since they read `measure_settings` as an unstructured dict.
+
 ## OCR power meter
 
 With `POWER_METER=ocr`, the tool reads a physical power meter by pointing a camera at its display. This is useful for a bench meter that has no network interface. Nothing else needs to run: the camera is read inside the measure tool itself.

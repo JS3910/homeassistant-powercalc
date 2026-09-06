@@ -13,7 +13,14 @@ from measure.controller.media.spec import HassMediaControllerSpec
 from measure.ha_app.preflight import ActiveSessionError, EntityRecord, MeasurementPreflight, PreflightError
 from measure.home_assistant_entities import DeviceClass
 from measure.powermeter.diagnostics import DiagnosticStatus, PowerMeterDiagnostic
-from measure.powermeter.spec import DummyPowerMeterSpec, HassPowerMeterSpec, ShellyPowerMeterSpec
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    DummyPowerMeterSpec,
+    HassPowerMeterSpec,
+    ManualPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    WitnessSpec,
+)
 from measure.request import (
     AverageMeasurementRequest,
     ChargingMeasurementRequest,
@@ -111,6 +118,66 @@ def test_preflight_validates_runtime_dependencies_for_every_non_light_kind(paylo
 
 def test_preflight_rejects_missing_hass_power_entity_for_non_light_kind() -> None:
     request = AverageMeasurementRequest(power_meter=HassPowerMeterSpec(entity_id="sensor.missing"))
+    checker = preflight(base_entities())
+
+    with pytest.raises(PreflightError, match="power entity"):
+        checker.validate(request)
+
+
+def test_preflight_rejects_a_power_meter_type_the_app_cannot_build() -> None:
+    """Manual power meters block on a console prompt the app has no console to answer."""
+    request = AverageMeasurementRequest(power_meter=ManualPowerMeterSpec())
+    checker = preflight(base_entities())
+
+    with pytest.raises(PreflightError, match="not supported by the Home Assistant app"):
+        checker.validate(request)
+
+
+def test_preflight_accepts_a_composite_power_meter_with_a_hass_primary() -> None:
+    """A composite must not be rejected outright -- its primary drives whether it's supported."""
+    request = AverageMeasurementRequest(
+        power_meter=CompositePowerMeterSpec(
+            primary=HassPowerMeterSpec(entity_id="sensor.power"),
+            witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.168.1.50"))],
+        ),
+    )
+
+    assert preflight(base_entities()).validate(request).warnings == ()
+
+
+def test_preflight_rejects_a_composite_power_meter_whose_primary_is_unsupported() -> None:
+    request = AverageMeasurementRequest(
+        power_meter=CompositePowerMeterSpec(
+            primary=ManualPowerMeterSpec(),
+            witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.168.1.50"))],
+        ),
+    )
+    checker = preflight(base_entities())
+
+    with pytest.raises(PreflightError, match="not supported by the Home Assistant app"):
+        checker.validate(request)
+
+
+def test_preflight_rejects_a_missing_hass_power_entity_behind_a_composite_primary() -> None:
+    request = AverageMeasurementRequest(
+        power_meter=CompositePowerMeterSpec(
+            primary=HassPowerMeterSpec(entity_id="sensor.missing"),
+            witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.168.1.50"))],
+        ),
+    )
+    checker = preflight(base_entities())
+
+    with pytest.raises(PreflightError, match="power entity"):
+        checker.validate(request)
+
+
+def test_preflight_rejects_a_missing_hass_power_entity_behind_a_composite_witness() -> None:
+    request = AverageMeasurementRequest(
+        power_meter=CompositePowerMeterSpec(
+            primary=ShellyPowerMeterSpec(device_ip="192.168.1.50"),
+            witnesses=[WitnessSpec(meter=HassPowerMeterSpec(entity_id="sensor.missing"))],
+        ),
+    )
     checker = preflight(base_entities())
 
     with pytest.raises(PreflightError, match="power entity"):
@@ -491,7 +558,7 @@ def test_light_preflight_uses_device_color_temperature_range() -> None:
         power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
         controller=HassLightControllerSpec(entity_id="light.test"),
         modes={LutMode.COLOR_TEMP},
-        parameters={"ct_bri_steps": 10, "ct_mired_steps": 10},
+        parameters={"ct_bri_steps": 10, "ct_mired_divisions": 10},
     )
 
     result = preflight(entities).validate(request)
@@ -520,7 +587,7 @@ def test_light_preflight_uses_default_color_temperature_resolution() -> None:
 
     result = preflight(entities).validate(request)
 
-    assert result.estimated_variations == 1_872
+    assert result.estimated_variations == 884
 
 
 def test_hs_preflight_uses_default_native_resolution() -> None:

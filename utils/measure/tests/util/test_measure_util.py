@@ -363,3 +363,63 @@ def test_average_measurement_excludes_failed_readings_from_average(
 
     # Average should be exactly 7.0 since all successful readings are 7.0
     assert result.power == 7.0
+
+
+@patch("time.time")
+def test_wait_for_plateau_stops_once_the_reading_is_flat_for_the_window(
+    mock_time: MagicMock,
+    mock_config_factory: MockConfigFactory,
+) -> None:
+    # Readings drift, then hold flat within tolerance for the whole trailing window.
+    mock_time.side_effect = [0.0, 0.0, 0.5, 1.0, 1.5, 2.0]
+    power_meter = MagicMock(PowerMeter)
+    power_meter.get_power.side_effect = [
+        PowerMeasurementResult(power=10.0, updated=0.0),
+        PowerMeasurementResult(power=5.0, updated=0.0),
+        PowerMeasurementResult(power=5.02, updated=0.0),
+        PowerMeasurementResult(power=4.99, updated=0.0),
+    ]
+    waited: list[float] = []
+    measure_util = MeasureUtil(power_meter, mock_config_factory(), wait=waited.append)
+
+    elapsed = measure_util.wait_for_plateau(10.0, tolerance_pct=2.0, window_seconds=1.0, poll_interval=0.5)
+
+    assert elapsed == 1.5
+    assert power_meter.get_power.call_count == 4
+    assert waited == [0.5, 0.5, 0.5]
+
+
+@patch("time.time")
+def test_wait_for_plateau_gives_up_at_max_wait_if_never_stable(
+    mock_time: MagicMock,
+    mock_config_factory: MockConfigFactory,
+) -> None:
+    # Keeps drifting past the tolerance the whole time; must fall back to the cap.
+    mock_time.side_effect = [0.0, 0.0, 0.5, 1.0, 1.5, 2.0]
+    power_meter = MagicMock(PowerMeter)
+    power_meter.get_power.side_effect = [PowerMeasurementResult(power=1.0 + index, updated=0.0) for index in range(5)]
+    measure_util = MeasureUtil(power_meter, mock_config_factory(), wait=lambda _seconds: None)
+
+    elapsed = measure_util.wait_for_plateau(2.0, tolerance_pct=1.0, window_seconds=1.0, poll_interval=0.5)
+
+    assert elapsed == 2.0
+
+
+@patch("time.time")
+def test_wait_for_plateau_treats_read_errors_as_not_yet_stable(
+    mock_time: MagicMock,
+    mock_config_factory: MockConfigFactory,
+) -> None:
+    mock_time.side_effect = [0.0, 0.0, 0.5, 1.0, 1.5]
+    power_meter = MagicMock(PowerMeter)
+    power_meter.get_power.side_effect = [
+        ApiConnectionError("no reading yet"),
+        PowerMeasurementResult(power=5.0, updated=0.0),
+        PowerMeasurementResult(power=5.0, updated=0.0),
+        PowerMeasurementResult(power=5.0, updated=0.0),
+    ]
+    measure_util = MeasureUtil(power_meter, mock_config_factory(), wait=lambda _seconds: None)
+
+    elapsed = measure_util.wait_for_plateau(5.0, tolerance_pct=1.0, window_seconds=1.0, poll_interval=0.5)
+
+    assert elapsed == 1.5

@@ -5,12 +5,18 @@ from typing import Any, cast, overload
 
 from decouple import Choices, UndefinedValueError, config
 
-from measure.const import CT_BRI_STEPS_MANUAL, CT_MIRED_STEPS_MANUAL, PARAMETER_LIMITS, MeasureType, parse_measure_type
+from measure.const import (
+    CT_BRI_STEPS_MANUAL,
+    CT_MIRED_DIVISIONS_MANUAL_MAX,
+    PARAMETER_LIMITS,
+    MeasureType,
+    parse_measure_type,
+)
 from measure.controller.charging.const import ChargingControllerType
 from measure.controller.fan.const import FanControllerType
 from measure.controller.light.const import DEFAULT_LIGHT_TRANSITION_TIME, LightControllerType
 from measure.controller.media.const import MediaControllerType
-from measure.powermeter.const import OwonOwh98xxChannelType, PowerMeterType
+from measure.powermeter.const import OwonOwh98xxChannelType, PowerMeterType, WitnessPosition
 from measure.tuning import MeasurementParameters
 
 _LOGGER = logging.getLogger("measure")
@@ -92,6 +98,18 @@ class CliEnvironment:
         return _DEFAULTS.max_brightness
 
     @property
+    def settle_tolerance_pct(self) -> float:
+        return _bounded_float("settle_tolerance_pct")
+
+    @property
+    def settle_window_seconds(self) -> float:
+        return _bounded_float("settle_window_seconds")
+
+    @property
+    def settle_poll_interval_seconds(self) -> float:
+        return _bounded_float("settle_poll_interval_seconds")
+
+    @property
     def min_sat(self) -> int:
         return _bounded_int("min_sat")
 
@@ -114,10 +132,10 @@ class CliEnvironment:
         return _bounded_int("ct_bri_steps")
 
     @property
-    def ct_mired_steps(self) -> int:
+    def ct_mired_divisions(self) -> int:
         if self.selected_power_meter == PowerMeterType.MANUAL:
-            return CT_MIRED_STEPS_MANUAL
-        return _bounded_int("ct_mired_steps")
+            return CT_MIRED_DIVISIONS_MANUAL_MAX
+        return _bounded_int("ct_mired_divisions")
 
     @property
     def bri_bri_steps(self) -> int:
@@ -142,8 +160,11 @@ class CliEnvironment:
         return max(hs_hue_precision, 0.5)
 
     @property
-    def hs_hue_steps(self) -> int:
-        return round(2731 / self.hs_hue_precision)
+    def hs_hue_divisions(self) -> int:
+        # Hue is swept in bisection order (see runner/light_plan.py), not a native step
+        # size, so this is a division count; 24 at the default precision of 1 matches what
+        # the old 2731-step default used to produce.
+        return round(24 * self.hs_hue_precision)
 
     @property
     def hs_sat_precision(self) -> float:
@@ -203,6 +224,9 @@ class CliEnvironment:
                 raise ValueError(f"WITNESS_METERS: {item} is listed twice")
             witnesses.append(meter_type)
         return witnesses
+
+    def witness_position(self, meter_type: PowerMeterType) -> WitnessPosition:
+        return _enum_value(f"WITNESS_{meter_type.name}_POSITION", WitnessPosition, WitnessPosition.NONE)
 
     def witness_offset_w(self, meter_type: PowerMeterType) -> float:
         return _config_value(f"WITNESS_{meter_type.name}_OFFSET_W", default=0.0, converter=float)

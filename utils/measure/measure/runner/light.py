@@ -12,6 +12,7 @@ from measure.controller.errors import ApiConnectionError
 from measure.controller.light.const import LutMode
 from measure.controller.light.controller import LightController, LightInfo
 from measure.execution import ImmediateInteraction, LightOperatingPoint, RunInteraction
+from measure.powermeter.composite import CompositePowerMeter, CompositeReading
 from measure.powermeter.errors import (
     OutdatedMeasurementError,
     PowerMeterError,
@@ -33,11 +34,11 @@ from measure.runner.light_plan import (
     variations_after,
 )
 from measure.runner.light_setup import set_light_to_maximum_brightness
+from measure.runner.raw_sample_writer import RawSampleWriter
 from measure.runner.runner import MeasurementRunner, RunnerResult
 from measure.tuning import MeasurementParameters
 from measure.util.measure_util import AverageMeasurementConvergence, MeasurementResult, MeasureUtil
 
-CSV_WRITE_BUFFER = 50
 MAX_CONSECUTIVE_ZERO_READINGS = 5
 ZERO_READING_ABORT_MESSAGE = (
     "Aborting measurement session after repeated 0 W readings. The power meter may not resolve this low load. "
@@ -74,6 +75,11 @@ class LightRunner(MeasurementRunner[LightMeasurementRequest]):
         self.gzip = True
         self.interaction = interaction or ImmediateInteraction()
         self._resume = resume
+        # Only meaningful when settle_tolerance_pct > 0 -- None otherwise, since a fixed
+        # wait has no "did it hit the cap" question to answer. Read by run_mode() right
+        # after wait() to attach to that variation's raw sample.
+        self.last_settle_seconds: float | None = None
+        self.last_settle_hit_cap: bool | None = None
 
     def _wait(self, seconds: float) -> None:
         self.interaction.wait(seconds)
@@ -188,72 +194,91 @@ class LightRunner(MeasurementRunner[LightMeasurementRequest]):
             self.calculate_time_left(mode, all_variations, remaining_variations),
         )
 
-        with open(measurement_info.csv_file, file_write_mode, newline="") as csv_file:
-            csv_writer = CsvWriter(csv_file, mode, write_header_row, self.config)
+        raw_sample_writer = RawSampleWriter(f"{os.path.splitext(measurement_info.csv_file)[0]}.raw.jsonl")
+        try:
+            with open(measurement_info.csv_file, file_write_mode, newline="") as csv_file:
+                csv_writer = CsvWriter(csv_file, mode, write_header_row, self.config)
 
-            # To avoid bugs in some lights, when set to low brightness initially
-            # where they turn off again. And also bugs where lights will turn off
-            # again, after they received two turn-off commands, followed by a single
-            # turn on command, we set them to maximum brightness, twice here.
-            # See issue #2598
-            assert self.light_info is not None
-            set_light_to_maximum_brightness(
-                self.light_controller,
-                self.light_info,
-                mode,
-                sleep_time=self.config.sleep_time,
-                wait=self._wait,
-                checkpoint=self._checkpoint,
-            )
+                # To avoid bugs in some lights, when set to low brightness initially
+                # where they turn off again. And also bugs where lights will turn off
+                # again, after they received two turn-off commands, followed by a single
+                # turn on command, we set them to maximum brightness, twice here.
+                # See issue #2598
+                assert self.light_info is not None
+                set_light_to_maximum_brightness(
+                    self.light_controller,
+                    self.light_info,
+                    mode,
+                    sleep_time=self.config.sleep_time,
+                    wait=self._wait,
+                    checkpoint=self._checkpoint,
+                )
 
-            _LOGGER.info(
-                "Start taking measurements for color mode: %s",
-                mode.value,
-            )
+                _LOGGER.info(
+                    "Start taking measurements for color mode: %s",
+                    mode.value,
+                )
 
-            self._report_progress(mode, all_variations, remaining_variations)
-            previous_variation = None
-            for count, variation in enumerate(measurement_info.variations):
-                while True:
-                    self._log_progress(mode, count, variation, all_variations, remaining_variations)
-                    _LOGGER.info("Changing light to: %s", variation)
-                    self._checkpoint()
-                    variation_start_time = time.time()
-                    self._change_light_with_retry(mode, variation)
-                    self.wait(variation, previous_variation)
-
-                    previous_variation = variation
-
-                    try:
+                self._report_progress(mode, all_variations, remaining_variations)
+                previous_variation = None
+                for count, variation in enumerate(measurement_info.variations):
+                    while True:
+                        self._log_progress(mode, count, variation, all_variations, remaining_variations)
+                        _LOGGER.info("Changing light to: %s", variation)
                         self._checkpoint()
-                        measurement_result = self.take_power_measurement(mode, variation_start_time)
-                    except OutdatedMeasurementError:
-                        measurement_result = self.nudge_and_remeasure(mode, variation)
-                    except ZeroReadingError as error:
-                        self._record_zero_reading()
-                        self._report_progress(mode, all_variations, remaining_variations, variation)
-                        _LOGGER.warning("Discarding measurement: %s", error)
-                        self._raise_for_repeated_zero_readings(error)
-                        continue
-                    except PowerMeterError as error:
-                        raise RunnerError(f"Aborting measurement session: {error}") from error
-                    self.num_0_readings = 0
-                    _LOGGER.info("Measured power: %.2f", measurement_result.power)
-                    self._checkpoint()
-                    csv_writer.write_measurement(variation, measurement_result.power)
-                    voltages.extend(measurement_result.voltages)
-                    remaining_variations.remove(variation)
-                    self._report_progress(mode, all_variations, remaining_variations, variation)
-                    break
+                        variation_start_time = time.time()
+                        self._change_light_with_retry(mode, variation)
+                        self.wait(variation, previous_variation)
 
-            _LOGGER.info(
-                "Hooray! measurements finished. Exported CSV file %s",
-                measurement_info.csv_file,
-            )
+                        previous_variation = variation
+
+                        try:
+                            self._checkpoint()
+                            measurement_result = self.take_power_measurement(mode, variation_start_time)
+                        except OutdatedMeasurementError:
+                            measurement_result = self.nudge_and_remeasure(mode, variation)
+                        except ZeroReadingError as error:
+                            self._record_zero_reading()
+                            self._report_progress(mode, all_variations, remaining_variations, variation)
+                            _LOGGER.warning("Discarding measurement: %s", error)
+                            self._raise_for_repeated_zero_readings(error)
+                            continue
+                        except PowerMeterError as error:
+                            raise RunnerError(f"Aborting measurement session: {error}") from error
+                        self.num_0_readings = 0
+                        _LOGGER.info("Measured power: %.2f", measurement_result.power)
+                        self._checkpoint()
+                        csv_writer.write_measurement(variation, measurement_result.power)
+                        raw_sample_writer.write(
+                            mode=mode,
+                            variation=variation,
+                            reading=self._last_composite_reading(),
+                            settle_seconds=self.last_settle_seconds,
+                            settle_hit_cap=self.last_settle_hit_cap,
+                        )
+                        voltages.extend(measurement_result.voltages)
+                        remaining_variations.remove(variation)
+                        self._report_progress(mode, all_variations, remaining_variations, variation)
+                        break
+
+                _LOGGER.info(
+                    "Hooray! measurements finished. Exported CSV file %s",
+                    measurement_info.csv_file,
+                )
+        finally:
+            raw_sample_writer.close()
 
         if self.gzip:
             self.gzip_csv(measurement_info.csv_file)
         return voltages
+
+    def _last_composite_reading(self) -> CompositeReading | None:
+        """The most recent primary+witness(es) reading, if the power meter is a composite one."""
+
+        power_meter = getattr(self.measure_util, "power_meter", None)
+        if isinstance(power_meter, CompositePowerMeter):
+            return power_meter.last_reading
+        return None
 
     def _get_csv_write_options(self, measurement_info: MeasurementRunInput) -> tuple[Literal["w", "a"], bool]:
         if not measurement_info.is_resuming:
@@ -306,6 +331,34 @@ class LightRunner(MeasurementRunner[LightMeasurementRequest]):
         if self.num_0_readings >= MAX_CONSECUTIVE_ZERO_READINGS:
             raise RunnerError(ZERO_READING_ABORT_MESSAGE) from error
 
+    def _settle(self) -> None:
+        """Wait for the light's power draw to stabilize after a change, before reading it.
+
+        `sleep_time` is a fixed wait by default (`settle_tolerance_pct == 0`, opt-in
+        required since not every power meter refreshes fast enough for polling to make
+        sense). When enabled, `sleep_time` instead becomes an upper bound: the run polls
+        the meter and proceeds as soon as its reading has been flat for
+        `settle_window_seconds`, falling back to the full fixed wait if it never
+        stabilizes -- e.g. a meter that doesn't support polling faster than its own
+        reporting interval, or a light whose driver genuinely never settles.
+        """
+        if self.config.settle_tolerance_pct <= 0:
+            self.last_settle_seconds = None
+            self.last_settle_hit_cap = None
+            self._wait(self.config.sleep_time)
+            return
+        elapsed = self.measure_util.wait_for_plateau(
+            self.config.sleep_time,
+            tolerance_pct=self.config.settle_tolerance_pct,
+            window_seconds=self.config.settle_window_seconds,
+            poll_interval=self.config.settle_poll_interval_seconds,
+        )
+        self.last_settle_seconds = elapsed
+        # A small epsilon since wait_for_plateau's own loop can return a hair under the
+        # cap (it stops polling once elapsed >= max_wait, not exactly at it).
+        self.last_settle_hit_cap = elapsed >= self.config.sleep_time - 0.05
+        _LOGGER.debug("Settle wait finished after %.1fs (cap %.1fs)", elapsed, self.config.sleep_time)
+
     def _change_light_with_retry(self, mode: LutMode, variation: Variation) -> None:
         for _ in range(5):
             try:
@@ -324,7 +377,7 @@ class LightRunner(MeasurementRunner[LightMeasurementRequest]):
 
     def wait(self, variation: Variation, previous_variation: Variation | None) -> None:
         """Wait for the light to process the change"""
-        self._wait(self.config.sleep_time)
+        self._settle()
 
         if not previous_variation:
             # Initially wait longer after selecting the first measurement point so
@@ -613,6 +666,12 @@ class CsvWriter:
             row.append(dt.now().strftime("%Y%m%d%H%M%S"))
         self.writer.writerow(row)
         self.rows_written += 1
-        if self.rows_written % CSV_WRITE_BUFFER == 1:
-            self.csv_file.flush()
-            _LOGGER.debug("Flushing CSV buffer")
+        # Flush every row, not just every 50th: the CSV is now read mid-run by the live
+        # "profile so far" plot (see api.py's /plots endpoint), so a buffered-but-unflushed
+        # row is invisible to that reader even though the measurement itself has already
+        # completed and moved on. Confirmed 2026-09-06: 22 variations measured, only the
+        # first showed up on the live plot, because 22 % 50 never crossed a flush boundary.
+        # A per-point wait of at least a fraction of a second (settle time, sampling, the
+        # light API round-trip) makes the flush() cost irrelevant next to everything else
+        # already happening on that same point.
+        self.csv_file.flush()

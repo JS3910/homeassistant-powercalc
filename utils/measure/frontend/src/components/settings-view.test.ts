@@ -556,3 +556,205 @@ describe("settings power meter test", () => {
     expect(cleared).toHaveBeenCalledTimes(3);
   });
 });
+
+describe("settings witness meters", () => {
+  function element(settings: AppSettings = defaultSettings) {
+    const el = document.createElement("measure-settings-view") as HTMLElement & {
+      powers: EntityDescriptor[]; settings: AppSettings;
+      updateComplete: Promise<boolean>; shadowRoot: ShadowRoot;
+    };
+    el.powers = [{ entity_id: "sensor.plug_power", name: "Plug power" }];
+    el.settings = settings;
+    document.body.append(el);
+    return el;
+  }
+
+  it("starts with no witnesses and adds one with sensible defaults", async () => {
+    const view = element();
+    await view.updateComplete;
+
+    expect(view.shadowRoot.querySelectorAll(".witness-row").length).toBe(0);
+    const addButton = [...view.shadowRoot.querySelectorAll("button")].find((button) => button.textContent === "Add witness");
+    addButton?.click();
+    await view.updateComplete;
+
+    const rows = view.shadowRoot.querySelectorAll(".witness-row");
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.textContent).toContain("Witness 1");
+    // Defaults to Shelly, the same first-listed meter the primary picker defaults to.
+    expect(settingsCombobox(view.shadowRoot, "witness_0_type").value).toBe("shelly");
+  });
+
+  it("removes a witness row and renumbers the rest", async () => {
+    const view = element({
+      ...defaultSettings,
+      witnesses: [
+        { meter: { type: "shelly", device_ip: "10.0.0.5" }, position: "none", offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+        { meter: { type: "kasa", device_ip: "10.0.0.6" }, position: "none", offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+      ],
+    });
+    await view.updateComplete;
+
+    expect(view.shadowRoot.querySelectorAll(".witness-row").length).toBe(2);
+    const removeFirst = view.shadowRoot.querySelector(".witness-row button.danger") as HTMLButtonElement;
+    removeFirst.click();
+    await view.updateComplete;
+
+    const rows = view.shadowRoot.querySelectorAll(".witness-row");
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.textContent).toContain("Witness 1");
+    expect((view.shadowRoot.querySelector('.witness-row input[type="number"]') as HTMLInputElement)).toBeTruthy();
+  });
+
+  it("switches a witness's own fields when its type changes, independent of the primary meter", async () => {
+    const view = element({
+      ...defaultSettings,
+      power_meter: "hass",
+      witnesses: [{ meter: { type: "shelly", device_ip: "10.0.0.5" }, position: "none", offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true }],
+    });
+    await view.updateComplete;
+
+    expect(view.shadowRoot.querySelector('.witness-row input[placeholder="192.168.1.51"]')).toBeTruthy();
+    chooseOption(settingsCombobox(view.shadowRoot, "witness_0_type"), "hass");
+    await view.updateComplete;
+
+    expect(view.shadowRoot.querySelector('.witness-row input[placeholder="sensor.plug_power"]')).toBeTruthy();
+  });
+
+  it("saves configured witnesses converted into request-shaped specs", async () => {
+    const view = element({
+      ...defaultSettings,
+      witnesses: [{ meter: { type: "shelly", device_ip: "10.0.0.5" }, position: "none", offset_w: 1, tolerance_w: 0.5, tolerance_pct: 2, required: true }],
+    });
+    await view.updateComplete;
+
+    const addressInput = view.shadowRoot.querySelector('.witness-row input[placeholder="192.168.1.51"]') as HTMLInputElement;
+    addressInput.value = "10.0.0.9";
+    addressInput.dispatchEvent(new Event("input"));
+    await view.updateComplete;
+
+    const saved = new Promise<AppSettingsUpdate>((resolve) => {
+      view.addEventListener("save", (event) => resolve((event as CustomEvent<AppSettingsUpdate>).detail));
+    });
+    (view.shadowRoot.querySelector("form") as HTMLFormElement).requestSubmit();
+    const settings = await saved;
+
+    expect(settings.witnesses).toEqual([
+      { meter: { type: "shelly", device_ip: "10.0.0.9" }, position: "none", offset_w: 1, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+    ]);
+  });
+
+  it("toggles a witness's required flag independently of other rows", async () => {
+    const view = element({
+      ...defaultSettings,
+      witnesses: [
+        { meter: { type: "shelly", device_ip: "10.0.0.5" }, position: "none", offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+        { meter: { type: "kasa", device_ip: "10.0.0.6" }, position: "none", offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+      ],
+    });
+    await view.updateComplete;
+
+    const checkboxes = view.shadowRoot.querySelectorAll<HTMLInputElement>('.witness-row input[type="checkbox"]');
+    expect(checkboxes.length).toBe(2);
+    checkboxes[0]!.checked = false;
+    checkboxes[0]!.dispatchEvent(new Event("change"));
+    await view.updateComplete;
+
+    const saved = new Promise<AppSettingsUpdate>((resolve) => {
+      view.addEventListener("save", (event) => resolve((event as CustomEvent<AppSettingsUpdate>).detail));
+    });
+    (view.shadowRoot.querySelector("form") as HTMLFormElement).requestSubmit();
+    const settings = await saved;
+    expect(settings.witnesses?.[0]?.required).toBe(false);
+    expect(settings.witnesses?.[1]?.required).toBe(true);
+  });
+});
+
+describe("settings additional single meter types", () => {
+  function element(settings: AppSettings = defaultSettings) {
+    const el = document.createElement("measure-settings-view") as HTMLElement & {
+      powers: EntityDescriptor[]; settings: AppSettings;
+      updateComplete: Promise<boolean>; shadowRoot: ShadowRoot;
+    };
+    el.powers = [];
+    el.settings = settings;
+    document.body.append(el);
+    return el;
+  }
+
+  it.each([
+    { type: "mystrom", field: "mystrom_ip" },
+    { type: "tasmota", field: "tasmota_ip" },
+  ])("collects the $type address", async ({ type, field }) => {
+    const view = element();
+    await view.updateComplete;
+    chooseOption(settingsCombobox(view.shadowRoot, "power_meter"), type);
+    await view.updateComplete;
+
+    const input = view.shadowRoot.querySelector(`input[name="${field}"]`) as HTMLInputElement;
+    input.value = "192.0.2.60";
+    input.dispatchEvent(new Event("input"));
+    await view.updateComplete;
+
+    const saved = new Promise<AppSettingsUpdate>((resolve) => {
+      view.addEventListener("save", (event) => resolve((event as CustomEvent<AppSettingsUpdate>).detail));
+    });
+    (view.shadowRoot.querySelector("form") as HTMLFormElement).requestSubmit();
+    const settings = await saved;
+    expect(settings.power_meter).toBe(type);
+    expect((settings as unknown as Record<string, unknown>)[field]).toBe("192.0.2.60");
+  });
+
+  it("collects Tuya device ID, IP, and version", async () => {
+    const view = element();
+    await view.updateComplete;
+    chooseOption(settingsCombobox(view.shadowRoot, "power_meter"), "tuya");
+    await view.updateComplete;
+
+    (view.shadowRoot.querySelector('input[name="tuya_device_id"]') as HTMLInputElement).value = "abc123";
+    (view.shadowRoot.querySelector('input[name="tuya_device_ip"]') as HTMLInputElement).value = "192.0.2.61";
+    const saved = new Promise<AppSettingsUpdate>((resolve) => {
+      view.addEventListener("save", (event) => resolve((event as CustomEvent<AppSettingsUpdate>).detail));
+    });
+    (view.shadowRoot.querySelector("form") as HTMLFormElement).requestSubmit();
+    const settings = await saved;
+    expect(settings.tuya_device_id).toBe("abc123");
+    expect(settings.tuya_device_ip).toBe("192.0.2.61");
+    expect(settings.tuya_version).toBe("3.3");
+  });
+
+  it("collects Owon serial port, baud rate, and channel", async () => {
+    const view = element();
+    await view.updateComplete;
+    chooseOption(settingsCombobox(view.shadowRoot, "power_meter"), "owh98xx");
+    await view.updateComplete;
+
+    (view.shadowRoot.querySelector('input[name="owon_port"]') as HTMLInputElement).value = "/dev/ttyUSB0";
+    (view.shadowRoot.querySelector('input[name="owon_baudrate"]') as HTMLInputElement).value = "9600";
+    chooseOption(settingsCombobox(view.shadowRoot, "owon_channel"), "2");
+    const saved = new Promise<AppSettingsUpdate>((resolve) => {
+      view.addEventListener("save", (event) => resolve((event as CustomEvent<AppSettingsUpdate>).detail));
+    });
+    (view.shadowRoot.querySelector("form") as HTMLFormElement).requestSubmit();
+    const settings = await saved;
+    expect(settings.owon_port).toBe("/dev/ttyUSB0");
+    expect(settings.owon_baudrate).toBe(9600);
+    expect(settings.owon_channel).toBe("2");
+  });
+
+  it("collects the OCR camera source and layout", async () => {
+    const view = element();
+    await view.updateComplete;
+    chooseOption(settingsCombobox(view.shadowRoot, "power_meter"), "ocr");
+    await view.updateComplete;
+
+    (view.shadowRoot.querySelector('input[name="ocr_source"]') as HTMLInputElement).value = "http://camera.local:8080/";
+    const saved = new Promise<AppSettingsUpdate>((resolve) => {
+      view.addEventListener("save", (event) => resolve((event as CustomEvent<AppSettingsUpdate>).detail));
+    });
+    (view.shadowRoot.querySelector("form") as HTMLFormElement).requestSubmit();
+    const settings = await saved;
+    expect(settings.ocr_source).toBe("http://camera.local:8080/");
+    expect(settings.ocr_layout).toBe("pr10");
+  });
+});

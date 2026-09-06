@@ -8,7 +8,13 @@ from measure.home_assistant import HomeAssistantManager
 from measure.powermeter.diagnostics import DiagnosticStatus, PowerMeterDiagnostics
 from measure.powermeter.hass import HassPowerMeter
 from measure.powermeter.powermeter import PowerMeasurementResult, PowerMeter, PowerMeterDiagnosticSample
-from measure.powermeter.spec import DummyPowerMeterSpec, HassPowerMeterSpec, ShellyPowerMeterSpec
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    DummyPowerMeterSpec,
+    HassPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    WitnessSpec,
+)
 import pytest
 
 
@@ -24,11 +30,19 @@ class FakeClock:
 
 
 class SampledPowerMeter(PowerMeter):
-    def __init__(self, sample: Callable[[int], PowerMeterDiagnosticSample], *, supports_voltage: bool = False) -> None:
+    def __init__(
+        self,
+        sample: Callable[[int], PowerMeterDiagnosticSample],
+        *,
+        supports_voltage: bool = False,
+        close_error: Exception | None = None,
+    ) -> None:
         self._sample = sample
         self._supports_voltage = supports_voltage
         self.calls = 0
         self.voltage_support_calls = 0
+        self.closed = False
+        self._close_error = close_error
 
     def get_power(self, include_voltage: bool = False) -> PowerMeasurementResult:
         sample = self.diagnostic_sample()
@@ -42,6 +56,11 @@ class SampledPowerMeter(PowerMeter):
         sample = self._sample(self.calls)
         self.calls += 1
         return sample
+
+    def close(self) -> None:
+        self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
 
 
 def diagnose(
@@ -216,6 +235,54 @@ def test_diagnostics_leave_voltage_capability_unknown_when_building_fails() -> N
     assert result.supports_voltage is None
 
 
+def test_diagnostics_closes_the_meter_it_built() -> None:
+    """Diagnostics is a throwaway probe distinct from the meter the real run -- and the
+    app's own active-light preflight check, run right after this in the same request --
+    will build for the same spec next. Leaving this one open leaks whatever it holds
+    (for OCR/composite, a bound preview-server port and a capture thread), which then
+    fails *that* next build with a confusing 'Address already in use' far from its
+    actual cause."""
+    meter = SampledPowerMeter(lambda call: PowerMeterDiagnosticSample(power=1.0, raw_value="1.0", reported_at=call))
+
+    PowerMeterDiagnostics(lambda _: meter, duration=0).evaluate(ShellyPowerMeterSpec(device_ip="192.0.2.1"))
+
+    assert meter.closed
+
+
+def test_diagnostics_closes_the_meter_even_after_the_deadline_loop() -> None:
+    diagnostics, meter, spec = diagnose(
+        lambda call: PowerMeterDiagnosticSample(power=1.0, raw_value="1.0", reported_at=float(call)),
+        duration=2,
+    )
+
+    diagnostics.evaluate(spec)
+
+    assert meter.closed
+
+
+def test_diagnostics_closes_the_meter_even_when_sampling_fails() -> None:
+    def fail(_: int) -> PowerMeterDiagnosticSample:
+        raise RuntimeError("Could not read power")
+
+    meter = SampledPowerMeter(fail)
+
+    PowerMeterDiagnostics(lambda _: meter, duration=0).evaluate(ShellyPowerMeterSpec(device_ip="192.0.2.1"))
+
+    assert meter.closed
+
+
+def test_diagnostics_closing_the_meter_does_not_mask_the_result_when_it_fails() -> None:
+    meter = SampledPowerMeter(
+        lambda call: PowerMeterDiagnosticSample(power=1.0, raw_value="1.0", reported_at=call),
+        close_error=OSError("Address already in use"),
+    )
+
+    result = PowerMeterDiagnostics(lambda _: meter, duration=0).evaluate(ShellyPowerMeterSpec(device_ip="192.0.2.1"))
+
+    assert result.success is True
+    assert meter.closed
+
+
 def test_hass_diagnostic_sample_uses_raw_state_and_never_forces_an_update() -> None:
     reported = datetime(2026, 7, 15, 10, 0, tzinfo=UTC)
     home_assistant = MagicMock(spec=HomeAssistantManager)
@@ -251,6 +318,43 @@ def test_direct_meter_reports_cadence_as_not_applicable() -> None:
     assert result.precision_decimals is None
     assert result.update_interval_status is DiagnosticStatus.UNSUPPORTED
     assert result.max_report_interval_seconds is None
+    assert meter.calls == 1
+
+
+def test_composite_with_a_hass_primary_gets_cadence_checked_like_hass_alone() -> None:
+    """The composite spec itself is not a ``HassPowerMeterSpec``; the fix under test
+    unwraps to its primary so a Hass-backed composite still runs the polling loop rather
+    than falling into the direct-meter single-shot path meant for polled devices."""
+    diagnostics, meter, _ = diagnose(
+        lambda call: PowerMeterDiagnosticSample(power=1.2, raw_value="1.2", reported_at=float(call)),
+        duration=2,
+    )
+    spec = CompositePowerMeterSpec(
+        primary=HassPowerMeterSpec(entity_id="sensor.power"),
+        witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.0.2.1"))],
+    )
+
+    result = diagnostics.evaluate(spec)
+
+    assert result.precision_status is DiagnosticStatus.GOOD
+    assert result.update_interval_status is not DiagnosticStatus.UNSUPPORTED
+    assert meter.calls > 1
+
+
+def test_composite_with_a_polled_primary_is_reported_as_not_applicable() -> None:
+    clock = FakeClock()
+    meter = SampledPowerMeter(
+        lambda _: PowerMeterDiagnosticSample(power=4.2, raw_value="4.2", reported_at=clock.current),
+    )
+    diagnostics = PowerMeterDiagnostics(lambda _: meter, monotonic=clock.monotonic, wait=clock.wait)
+    spec = CompositePowerMeterSpec(
+        primary=ShellyPowerMeterSpec(device_ip="192.0.2.1"),
+        witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.0.2.2"))],
+    )
+
+    result = diagnostics.evaluate(spec)
+
+    assert result.update_interval_status is DiagnosticStatus.UNSUPPORTED
     assert meter.calls == 1
 
 

@@ -1,5 +1,8 @@
+from collections import deque
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
+from itertools import pairwise
+import logging
 import math
 
 from measure.controller.light.const import LutMode
@@ -7,8 +10,14 @@ from measure.controller.light.controller import LightInfo
 from measure.runner.errors import RunnerError
 from measure.tuning import MeasurementParameters
 
+_LOGGER = logging.getLogger("measure")
+
 ESTIMATED_IO_DELAY = 0.15
 LIGHT_MODE_ORDER = (LutMode.BRIGHTNESS, LutMode.COLOR_TEMP, LutMode.HS, LutMode.EFFECT)
+#: Modes that already sweep the full 0-100% brightness range at every point they measure,
+#: making a standalone plain-brightness pass redundant alongside either of them -- see
+#: `build_light_plan`.
+_COLOR_MODES = (LutMode.COLOR_TEMP, LutMode.HS)
 
 CSV_HEADERS = {
     LutMode.HS: ["bri", "hue", "sat", "watt"],
@@ -149,6 +158,21 @@ def build_light_plan(
     """Build the ordered variations used by preflight and runtime execution."""
 
     mode_set = set(modes)
+    if LutMode.BRIGHTNESS in mode_set and mode_set.intersection(_COLOR_MODES):
+        # A plain-brightness pass measures whatever color/temp the light already happens
+        # to be set to -- there is no "default" color or color temperature, so it isn't
+        # holding anything meaningful constant. Once a color mode is also selected, that
+        # mode's own sweep already covers the full brightness range at every color point
+        # it measures, so the standalone pass adds nothing and is dropped. Confirmed
+        # 2026-09-06: without this, a brightness+color_temp+HS request ran an initial
+        # brightness pass against whatever color the light was last left in (observed:
+        # solid blue, left over from a previous HS run), producing a LUT column that
+        # doesn't correspond to any real, repeatable device state.
+        _LOGGER.info(
+            "Dropping the standalone brightness sweep: redundant once %s is also being measured",
+            " and ".join(mode.value for mode in _COLOR_MODES if mode in mode_set),
+        )
+        mode_set = mode_set - {LutMode.BRIGHTNESS}
     effect_list = list(effects or [])
     return LightMeasurementPlan(
         modes=[
@@ -252,24 +276,41 @@ def _variations_for_mode(
     if mode == LutMode.COLOR_TEMP:
         min_mired = round(light_info.min_mired)
         max_mired = round(light_info.max_mired)
+        # Warm/cold-white LEDs are physically two emitters blended by drive ratio, so the
+        # two extremes are the most informative points; everything else only interpolates
+        # between them. Sweep mired in bisection order (min, max, midpoint, then the
+        # midpoints of the two halves, ...) so the profile's shape emerges quickly and only
+        # gains resolution the longer the run is allowed to continue. Brightness stays a
+        # plain dense sweep at each mired point, same as before.
+        mired_values = _bisection_order(
+            _divisions_range(parameters, min_mired, max_mired, parameters.ct_mired_divisions),
+        )
         return [
             ColorTempVariation(bri=bri, ct=mired)
+            for mired in mired_values
             for bri in _measurement_range(
                 parameters,
                 parameters.min_brightness,
                 parameters.max_brightness,
                 parameters.ct_bri_steps,
             )
-            for mired in _measurement_range(
-                parameters,
-                min_mired,
-                max_mired,
-                parameters.ct_mired_steps,
-            )
         ]
     if mode == LutMode.HS:
+        # An RGB(WW) fixture is three emitters (red/green/blue) mixed by drive ratio, so
+        # those three hues are the most informative points on the wheel; seed there first
+        # (same three hues `low_load_probe_variations` above already singles out), then
+        # bisect the gaps between them, recursing into each half, wrapping around the
+        # circle. Brightness and saturation stay plain dense sweeps at each hue.
+        # _divisions_range treats [min_hue, max_hue] as a closed linear interval (like
+        # mired), so the resulting grid doesn't land exactly on the ideal R/G/B thirds when
+        # min_hue/max_hue span the full circle -- close enough for candidate density, and
+        # low_load_probe_variations already picks whichever grid point ends up nearest.
+        hue_values = _circular_bisection_order(
+            _divisions_range(parameters, parameters.min_hue, parameters.max_hue, parameters.hs_hue_divisions),
+        )
         return [
             HsVariation(bri=bri, hue=hue, sat=sat)
+            for hue in hue_values
             for bri in _measurement_range(
                 parameters,
                 parameters.min_brightness,
@@ -281,12 +322,6 @@ def _variations_for_mode(
                 parameters.min_sat,
                 parameters.max_sat,
                 parameters.hs_sat_steps,
-            )
-            for hue in _measurement_range(
-                parameters,
-                parameters.min_hue,
-                parameters.max_hue,
-                parameters.hs_hue_steps,
             )
         ]
     if mode == LutMode.EFFECT:
@@ -317,6 +352,76 @@ def _measurement_range(parameters: MeasurementParameters, start: int, end: int, 
     return _inclusive_range(start, end, step)
 
 
+def _divisions_range(parameters: MeasurementParameters, start: int, end: int, divisions: int) -> list[int]:
+    """Like `_measurement_range`, but the caller picks how many points to divide the
+    range into (min and max both always included) rather than a native step size.
+
+    Used for the axes that are swept in bisection order (color-temp mired, HS hue): once
+    the sweep order is "build the shape fast, then refine," a step size in native units no
+    longer maps intuitively to "how much of the profile's shape will exist after N points
+    run" the way a division count does.
+    """
+    if parameters.fast_test_mode:
+        return [start] if start == end else [start, end]
+    divisions = max(1, divisions)
+    if divisions == 1 or start == end:
+        return [start]
+    step = max(1, round((end - start) / (divisions - 1)))
+    return _inclusive_range(start, end, step)
+
+
+def _bisection_order(values: list[int]) -> list[int]:
+    """Reorder a sorted line (e.g. mired) so it builds shape fast: both ends first, then
+    the midpoint of the whole range, then the midpoints of each remaining half, and so on
+    (breadth-first, so accuracy improves evenly across the range the longer this runs).
+    """
+    n = len(values)
+    if n <= 2:
+        return list(values)
+    result = [values[0], values[-1]]
+    seen = {0, n - 1}
+    queue: deque[tuple[int, int]] = deque([(0, n - 1)])
+    while queue:
+        lo, hi = queue.popleft()
+        if hi - lo <= 1:
+            continue
+        mid = (lo + hi) // 2
+        if mid not in seen:
+            result.append(values[mid])
+            seen.add(mid)
+        queue.append((lo, mid))
+        queue.append((mid, hi))
+    return result
+
+
+def _circular_bisection_order(values: list[int], seed_count: int = 3) -> list[int]:
+    """Reorder a sorted ring (hue, 0..65535 wrapping) so it builds shape fast: `seed_count`
+    evenly spaced seeds first (the red/green/blue primaries an RGB(WW) fixture is actually
+    built from, for the default of 3), then breadth-first bisection of the gaps between
+    consecutive seeds, wrapping the last gap back to the first.
+    """
+    n = len(values)
+    if n <= seed_count:
+        return list(values)
+    seed_indices = sorted({round(i * n / seed_count) % n for i in range(seed_count)})
+    result = [values[index] for index in seed_indices]
+    seen = set(seed_indices)
+    wrapped_indices = [*seed_indices, seed_indices[0] + n]
+    queue: deque[tuple[int, int]] = deque(pairwise(wrapped_indices))
+    while queue:
+        lo, hi = queue.popleft()
+        if hi - lo <= 1:
+            continue
+        mid = (lo + hi) // 2
+        mid_index = mid % n
+        if mid_index not in seen:
+            result.append(values[mid_index])
+            seen.add(mid_index)
+        queue.append((lo, mid))
+        queue.append((mid, hi))
+    return result
+
+
 def _step_time(mode: LutMode, parameters: MeasurementParameters) -> float:
     if mode == LutMode.EFFECT:
         return parameters.measure_time_effect + ESTIMATED_IO_DELAY
@@ -342,7 +447,7 @@ def _mode_transition_time(
             - 1
         )
         time_left = sat_steps_left * parameters.sleep_time_sat
-        hue_steps_left = round(parameters.max_hue / parameters.hs_hue_steps * sat_steps_left)
+        hue_steps_left = round(parameters.hs_hue_divisions * sat_steps_left)
         return time_left + hue_steps_left * parameters.sleep_time_hue
     if mode == LutMode.COLOR_TEMP:
         ct_variation = current_variation if isinstance(current_variation, ColorTempVariation) else None

@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
 from statistics import mean
 import time
@@ -17,6 +18,8 @@ from measure.request import (
 )
 from measure.runner.runner import MeasurementRunner, RunnerResult
 from measure.util.measure_util import DummyLoadMeasurementError, MeasureUtil
+
+_LOGGER = logging.getLogger("measure")
 
 
 class LightOperatingPoint(TypedDict):
@@ -287,10 +290,15 @@ class MeasurementExecution:
                     num_lights=request.multiple_light_count if isinstance(request, LightMeasurementRequest) else None,
                     dummy_load=request.dummy_load is not None,
                     dummy_load_resistance=self._dummy_load_resistance(),
+                    power_meter=request.power_meter,
                 )
             return result
         finally:
             runner.cleanup()
+            try:
+                runner.measure_util.power_meter.close()
+            except Exception as error:  # noqa: BLE001 - cleanup must not mask the measurement outcome
+                _LOGGER.warning("Could not close the power meter after measurement cleanup: %s", error)
 
     def _dummy_load_resistance(self) -> float | None:
         if isinstance(self.measurement.request.dummy_load, DummyLoadReuseRequest):

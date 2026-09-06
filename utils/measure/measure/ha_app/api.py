@@ -50,12 +50,13 @@ from measure.ha_app.light_probe import (
     LightLoadProbeResult,
     app_measurement_assembler,
 )
-from measure.ha_app.preferences import AppPreferences, AppSettingsResponse, AppSettingsUpdate
+from measure.ha_app.preferences import AppPreferences, AppSettingsResponse, AppSettingsUpdate, WitnessMeterSettings
 from measure.ha_app.preflight import ActiveSessionError, MeasurementPreflight, PreflightError
 from measure.ha_app.registry import FieldControl, FieldRole, measurement_definitions
 from measure.ha_app.service import MeasurementService
 from measure.ha_app.session import (
     ACTIVE_SESSION_STATES,
+    PRE_DATA_SESSION_STATES,
     RESUMABLE_SESSION_STATES,
     SessionEvent,
     SessionSnapshot,
@@ -77,11 +78,19 @@ from measure.powermeter.diagnostics import DiagnosticStatus, PowerMeterDiagnosti
 from measure.powermeter.errors import PowerMeterError
 from measure.powermeter.powermeter import PowerMeter
 from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
     DummyPowerMeterSpec,
     HassPowerMeterSpec,
     KasaPowerMeterSpec,
+    MyStromPowerMeterSpec,
+    OcrPowerMeterSpec,
+    OwonOwh98xxPowerMeterSpec,
     PowerMeterSpec,
     ShellyPowerMeterSpec,
+    SinglePowerMeterSpec,
+    TasmotaPowerMeterSpec,
+    TuyaPowerMeterSpec,
+    WitnessSpec,
 )
 from measure.request import LightMeasurementRequest, MeasurementRequest
 from measure.tuning import MeasurementParameters
@@ -224,6 +233,7 @@ class FormField(BaseModel):
     default: str | int | bool | None = None
     minimum: int | float | None = None
     maximum: int | float | None = None
+    step: str | None = None
     multiple: bool = False
     plural_label: str = ""
     derived_from: str | None = None
@@ -807,8 +817,8 @@ def _session_files(context: AppContext, snapshot: SessionSnapshot) -> list[Sessi
 
 
 async def _session_plots(context: AppContext, snapshot: SessionSnapshot) -> SessionPlots:
-    if snapshot.state in ACTIVE_SESSION_STATES:
-        raise HTTPException(status_code=409, detail="Plots are available after the measurement stops")
+    if snapshot.state in PRE_DATA_SESSION_STATES:
+        raise HTTPException(status_code=409, detail="Plots are available once the measurement starts taking readings")
     names = context.storage.list_files(snapshot.id)
     paths = {name: context.storage.file_path(snapshot.id, name) for name in names}
     result = await run_in_threadpool(
@@ -888,6 +898,7 @@ def _measure_definitions() -> list[MeasureDefinition]:
                     default=field.default,
                     minimum=field.minimum,
                     maximum=field.maximum,
+                    step=field.step,
                     multiple=field.multiple,
                     plural_label=field.plural_label,
                     derived_from=field.derived_from,
@@ -950,20 +961,118 @@ def _test_power_meter(context: AppContext, settings: AppSettingsUpdate) -> Power
     )
 
 
-def _power_meter_spec(settings: AppPreferences) -> PowerMeterSpec:
-    if settings.power_meter == PowerMeterType.DUMMY:
-        return DummyPowerMeterSpec()
-    if settings.power_meter == PowerMeterType.SHELLY:
-        if not settings.shelly_ip:
-            raise PowerMeterError("Enter the Shelly IP address first")
-        return ShellyPowerMeterSpec(device_ip=settings.shelly_ip, username=settings.shelly_username)
-    if settings.power_meter == PowerMeterType.KASA:
-        if not settings.kasa_ip:
-            raise PowerMeterError("Enter the Kasa IP address first")
-        return KasaPowerMeterSpec(device_ip=settings.kasa_ip)
-    if not settings.default_power_entity_id:
+def _dummy_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    return DummyPowerMeterSpec()
+
+
+def _shelly_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.device_ip:
+        raise PowerMeterError("Enter the Shelly IP address first")
+    return ShellyPowerMeterSpec(device_ip=draft.device_ip, username=draft.username)
+
+
+def _kasa_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.device_ip:
+        raise PowerMeterError("Enter the Kasa IP address first")
+    return KasaPowerMeterSpec(device_ip=draft.device_ip)
+
+
+def _mystrom_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.device_ip:
+        raise PowerMeterError("Enter the myStrom IP address first")
+    return MyStromPowerMeterSpec(device_ip=draft.device_ip)
+
+
+def _tasmota_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.device_ip:
+        raise PowerMeterError("Enter the Tasmota IP address first")
+    return TasmotaPowerMeterSpec(device_ip=draft.device_ip)
+
+
+def _tuya_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.device_id or not draft.device_ip:
+        raise PowerMeterError("Enter the Tuya device ID and IP address first")
+    return TuyaPowerMeterSpec(device_id=draft.device_id, device_ip=draft.device_ip, version=draft.version)
+
+
+def _owon_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.port or draft.baudrate is None or draft.channel is None:
+        raise PowerMeterError("Configure the Owon serial port, baud rate, and channel first")
+    return OwonOwh98xxPowerMeterSpec(
+        port=draft.port,
+        baudrate=draft.baudrate,
+        timeout=draft.timeout,
+        channel=draft.channel,
+    )
+
+
+def _ocr_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    return OcrPowerMeterSpec(
+        source=draft.source,
+        layout=draft.layout,
+        preview_host=draft.preview_host,
+        preview_port=draft.preview_port,
+        window_seconds=draft.window_seconds,
+        stale_after_seconds=draft.stale_after_seconds,
+        crosscheck_tolerance_pct=draft.crosscheck_tolerance_pct,
+        min_current_for_crosscheck=draft.min_current_for_crosscheck,
+    )
+
+
+def _hass_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.entity_id:
         raise PowerMeterError("Select a power sensor first")
-    return HassPowerMeterSpec(entity_id=settings.default_power_entity_id)
+    return HassPowerMeterSpec(
+        entity_id=draft.entity_id,
+        voltage_entity_id=draft.voltage_entity_id,
+        max_age_seconds=draft.max_age_seconds,
+    )
+
+
+_SINGLE_METER_SPEC_BUILDERS: dict[PowerMeterType, Callable[[WitnessMeterSettings], SinglePowerMeterSpec]] = {
+    PowerMeterType.DUMMY: _dummy_meter_spec,
+    PowerMeterType.SHELLY: _shelly_meter_spec,
+    PowerMeterType.KASA: _kasa_meter_spec,
+    PowerMeterType.MYSTROM: _mystrom_meter_spec,
+    PowerMeterType.TASMOTA: _tasmota_meter_spec,
+    PowerMeterType.TUYA: _tuya_meter_spec,
+    PowerMeterType.OWON_OWH98XX: _owon_meter_spec,
+    PowerMeterType.OCR: _ocr_meter_spec,
+    PowerMeterType.HASS: _hass_meter_spec,
+}
+"""Every meter the app can build from a settings-level draft. Deliberately excludes
+``MANUAL`` (blocks on ``input()``, which has no console to read from inside the app's
+background worker) and ``COMPOSITE`` (a composite wraps these, rather than being one)."""
+
+
+def _single_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    """Convert one settings-level meter draft (the primary's, or a witness's) into a
+    validated spec, raising ``PowerMeterError`` naming whatever is still missing."""
+    builder = _SINGLE_METER_SPEC_BUILDERS.get(draft.type, _hass_meter_spec)
+    return builder(draft)
+
+
+def _power_meter_spec(settings: AppPreferences) -> PowerMeterSpec:
+    """The configured session-default meter: the primary alone, or wrapped as a composite
+    with its witnesses once at least one is configured (matching
+    ``CompositePowerMeterSpec.witnesses``' minimum length of one)."""
+    primary = _single_meter_spec(settings.primary_meter_draft())
+    if not settings.witnesses:
+        return primary
+    return CompositePowerMeterSpec(
+        primary=primary,
+        witnesses=[
+            WitnessSpec(
+                meter=_single_meter_spec(witness.meter),
+                position=witness.position,
+                offset_w=witness.offset_w,
+                tolerance_w=witness.tolerance_w,
+                tolerance_pct=witness.tolerance_pct,
+                required=witness.required,
+            )
+            for witness in settings.witnesses
+        ],
+    )
 
 
 def _matching_dummy_load_calibration(context: AppContext) -> DummyLoadCalibration | None:
@@ -974,14 +1083,23 @@ def _matching_dummy_load_calibration(context: AppContext) -> DummyLoadCalibratio
         spec = _power_meter_spec(context.storage.load_settings())
     except PowerMeterError:
         return None
+    spec = _with_related_voltage(spec, context)
+    return calibration if calibration.power_meter_fingerprint == power_meter_fingerprint(spec) else None
+
+
+def _with_related_voltage(spec: PowerMeterSpec, context: AppContext) -> PowerMeterSpec:
+    """Attach the Home Assistant-associated voltage sensor to a Hass meter, whether it is
+    the whole spec or a composite's primary — the fingerprint must reflect it either way
+    since it changes what the meter actually reads."""
     if isinstance(spec, HassPowerMeterSpec):
         snapshot = HomeAssistantEntityCatalog(context.home_assistant).load_snapshot()
-        spec = spec.model_copy(
-            update={
-                "voltage_entity_id": snapshot.related_entity_id(spec.entity_id, DeviceClass.VOLTAGE),
-            },
+        return spec.model_copy(
+            update={"voltage_entity_id": snapshot.related_entity_id(spec.entity_id, DeviceClass.VOLTAGE)},
         )
-    return calibration if calibration.power_meter_fingerprint == power_meter_fingerprint(spec) else None
+    if isinstance(spec, CompositePowerMeterSpec) and isinstance(spec.primary, HassPowerMeterSpec):
+        primary = cast(HassPowerMeterSpec, _with_related_voltage(spec.primary, context))
+        return spec.model_copy(update={"primary": primary})
+    return spec
 
 
 def _preflight(context: AppContext, payload: MeasurementRequest) -> PreflightResponse:

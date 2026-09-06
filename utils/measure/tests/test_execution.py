@@ -11,7 +11,13 @@ from measure.execution import (
     PreparedMeasurement,
     RunInteraction,
 )
-from measure.powermeter.spec import DummyPowerMeterSpec, HassPowerMeterSpec
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    DummyPowerMeterSpec,
+    HassPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    WitnessSpec,
+)
 from measure.request import (
     AverageMeasurementRequest,
     DummyLoadCalibrationRequest,
@@ -42,6 +48,38 @@ def test_execution_consumes_prepared_measurement_without_reassembling_fields(tmp
     runner.run.assert_called_once_with(request, "")
     runner.cleanup.assert_called_once_with()
     assert not unused_output_directory.exists()
+    assert result.model_json_data == {}
+
+
+def test_execution_closes_the_power_meter_after_cleanup(tmp_path: Path) -> None:
+    """A runner's power meter may hold real resources -- OCR's capture thread and
+    preview-server port, in particular -- that must be released after every run, not
+    just runner.cleanup()'s own request-specific teardown (turning off a light, etc.)."""
+    request = AverageMeasurementRequest(power_meter=DummyPowerMeterSpec(), duration=1)
+    runner = MagicMock(spec=MeasurementRunner)
+    runner.run.return_value = RunnerResult(model_json_data={})
+    runner.writes_export_files.return_value = False
+    manager = MagicMock()
+    runner.measure_util = manager.measure_util
+    prepared = PreparedMeasurement(request=request, runner=runner)
+
+    MeasurementExecution(measurement=prepared, output_directory=tmp_path / "unused").run()
+
+    runner.cleanup.assert_called_once_with()
+    manager.measure_util.power_meter.close.assert_called_once_with()
+
+
+def test_execution_closing_the_power_meter_does_not_mask_the_result_when_it_fails(tmp_path: Path) -> None:
+    request = AverageMeasurementRequest(power_meter=DummyPowerMeterSpec(), duration=1)
+    runner = MagicMock(spec=MeasurementRunner)
+    runner.run.return_value = RunnerResult(model_json_data={})
+    runner.writes_export_files.return_value = False
+    runner.measure_util = MagicMock()
+    runner.measure_util.power_meter.close.side_effect = OSError("Address already in use")
+    prepared = PreparedMeasurement(request=request, runner=runner)
+
+    result = MeasurementExecution(measurement=prepared, output_directory=tmp_path / "unused").run()
+
     assert result.model_json_data == {}
 
 
@@ -154,6 +192,63 @@ def test_execution_records_new_dummy_load_calibration_in_measure_settings(
     model = json.loads((tmp_path / "model.json").read_text(encoding="utf-8"))
     assert model["measure_settings"]["DUMMY_LOAD_RESISTANCE"] == pytest.approx(529.0)
     assert model["measure_settings"]["DUMMY_LOAD_POWER"] == pytest.approx(100.0)
+
+
+def test_execution_records_witness_provenance_in_measure_settings(tmp_path: Path) -> None:
+    request = AverageMeasurementRequest(
+        product_name="Test device",
+        measure_device="Test meter",
+        power_meter=CompositePowerMeterSpec(
+            primary=HassPowerMeterSpec(entity_id="sensor.power"),
+            witnesses=[
+                WitnessSpec(
+                    meter=ShellyPowerMeterSpec(device_ip="192.0.2.50"),
+                    offset_w=1.5,
+                    tolerance_w=0.5,
+                    tolerance_pct=3.0,
+                    required=True,
+                ),
+                WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.0.2.51"), required=False),
+            ],
+        ),
+        generate_model=True,
+    )
+    runner = MagicMock(spec=MeasurementRunner)
+    runner.run.return_value = RunnerResult(model_json_data={"device_type": "generic"}, voltages=[230.0])
+    runner.measure_standby_power.return_value = MeasurementResult(power=0.3, voltages=[230.0])
+
+    MeasurementExecution(
+        measurement=PreparedMeasurement(request=request, runner=runner),
+        output_directory=tmp_path,
+    ).run()
+
+    model = json.loads((tmp_path / "model.json").read_text(encoding="utf-8"))
+    assert model["measure_settings"]["WITNESSES"] == [
+        {"type": "shelly", "offset_w": 1.5, "tolerance_w": 0.5, "tolerance_pct": 3.0, "required": True},
+        {"type": "shelly", "offset_w": 0.0, "tolerance_w": 0.5, "tolerance_pct": 2.0, "required": False},
+    ]
+
+
+def test_execution_records_no_witnesses_key_for_a_single_meter(tmp_path: Path) -> None:
+    """A profile made without witnesses is unchanged: no `WITNESSES` key, so it stays
+    exactly what existing Powercalc profiles already look like."""
+    request = AverageMeasurementRequest(
+        product_name="Test device",
+        measure_device="Test meter",
+        power_meter=DummyPowerMeterSpec(),
+        generate_model=True,
+    )
+    runner = MagicMock(spec=MeasurementRunner)
+    runner.run.return_value = RunnerResult(model_json_data={"device_type": "generic"}, voltages=[230.0])
+    runner.measure_standby_power.return_value = MeasurementResult(power=0.3, voltages=[230.0])
+
+    MeasurementExecution(
+        measurement=PreparedMeasurement(request=request, runner=runner),
+        output_directory=tmp_path,
+    ).run()
+
+    model = json.loads((tmp_path / "model.json").read_text(encoding="utf-8"))
+    assert "WITNESSES" not in model["measure_settings"]
 
 
 @pytest.mark.parametrize("num_lights", [1, 3])
