@@ -5,7 +5,13 @@ from typing import Any, cast, overload
 
 from decouple import Choices, UndefinedValueError, config
 
-from measure.const import CT_BRI_STEPS_MANUAL, CT_MIRED_STEPS_MANUAL, PARAMETER_LIMITS, MeasureType, parse_measure_type
+from measure.const import (
+    CT_BRI_STEPS_MANUAL,
+    CT_MIRED_DIVISIONS_MANUAL_MAX,
+    PARAMETER_LIMITS,
+    MeasureType,
+    parse_measure_type,
+)
 from measure.controller.charging.const import ChargingControllerType
 from measure.controller.fan.const import FanControllerType
 from measure.controller.light.const import DEFAULT_LIGHT_TRANSITION_TIME, LightControllerType
@@ -114,10 +120,10 @@ class CliEnvironment:
         return _bounded_int("ct_bri_steps")
 
     @property
-    def ct_mired_steps(self) -> int:
+    def ct_mired_divisions(self) -> int:
         if self.selected_power_meter == PowerMeterType.MANUAL:
-            return CT_MIRED_STEPS_MANUAL
-        return _bounded_int("ct_mired_steps")
+            return CT_MIRED_DIVISIONS_MANUAL_MAX
+        return _bounded_int("ct_mired_divisions")
 
     @property
     def bri_bri_steps(self) -> int:
@@ -142,8 +148,11 @@ class CliEnvironment:
         return max(hs_hue_precision, 0.5)
 
     @property
-    def hs_hue_steps(self) -> int:
-        return round(2731 / self.hs_hue_precision)
+    def hs_hue_divisions(self) -> int:
+        # Hue is swept in bisection order (see runner/light_plan.py), not a native step
+        # size, so this is a division count; 24 at the default precision of 1 matches what
+        # the old 2731-step default used to produce.
+        return round(24 * self.hs_hue_precision)
 
     @property
     def hs_sat_precision(self) -> float:

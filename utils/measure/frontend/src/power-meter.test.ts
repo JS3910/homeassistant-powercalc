@@ -104,13 +104,15 @@ describe("power meter registry", () => {
 
   it("wraps the primary in a composite once at least one witness is configured", () => {
     const witnesses: WitnessSettings[] = [
-      { meter: { type: "shelly", device_ip: "192.0.2.50" }, offset_w: 1, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+      { meter: { type: "shelly", device_ip: "192.0.2.50" }, position: "none", offset_w: 1, tolerance_w: 0.5, tolerance_pct: 2, required: true },
     ];
     const spec = specFromSettings({ ...settings, witnesses }, context);
     expect(spec).toEqual({
       type: "composite",
       primary: { type: "hass", entity_id: "sensor.plug_power", voltage_entity_id: "sensor.plug_voltage" },
-      witnesses: [{ meter: { type: "shelly", device_ip: "192.0.2.50", username: "admin" }, offset_w: 1, tolerance_w: 0.5, tolerance_pct: 2, required: true }],
+      witnesses: [
+        { meter: { type: "shelly", device_ip: "192.0.2.50", username: "admin" }, position: "none", offset_w: 1, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+      ],
     });
   });
 
@@ -124,9 +126,17 @@ describe("power meter registry", () => {
   });
 
   it("carries a witness's tolerances and requiredness into its spec unchanged", () => {
-    const witness: WitnessSettings = { meter: { type: "kasa", device_ip: "192.0.2.53" }, offset_w: -2, tolerance_w: 1, tolerance_pct: 5, required: false };
+    const witness: WitnessSettings = {
+      meter: { type: "kasa", device_ip: "192.0.2.53" },
+      position: "none",
+      offset_w: -2,
+      tolerance_w: 1,
+      tolerance_pct: 5,
+      required: false,
+    };
     expect(witnessSpecFromSettings(witness)).toEqual({
       meter: { type: "kasa", device_ip: "192.0.2.53" },
+      position: "none",
       offset_w: -2,
       tolerance_w: 1,
       tolerance_pct: 5,

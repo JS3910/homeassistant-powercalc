@@ -103,7 +103,7 @@ describe("setup view", () => {
     expect((element.shadowRoot.querySelector('input[name="sleep_time_sample"]') as HTMLInputElement).disabled).toBe(false);
     expect((element.shadowRoot.querySelector('input[name="bri_bri_steps"]') as HTMLInputElement).value).toBe("1");
     // The desk lamp supports brightness only, so no other mode's parameters are offered at all.
-    const unsupported = ["ct_bri_steps", "ct_mired_steps", "hs_bri_steps", "hs_hue_steps", "hs_sat_steps", "effect_bri_steps", "measure_time_effect"];
+    const unsupported = ["ct_bri_steps", "ct_mired_divisions", "hs_bri_steps", "hs_hue_divisions", "hs_sat_steps", "effect_bri_steps", "measure_time_effect"];
     expect(unsupported.filter((name) => element.shadowRoot.querySelector(`input[name="${name}"]`))).toEqual([]);
 
     selectEntity(light, "light.desk");
@@ -195,9 +195,9 @@ describe("setup view", () => {
     expect(request.parameters).toMatchObject({
       bri_bri_steps: 1,
       ct_bri_steps: 5,
-      ct_mired_steps: 10,
+      ct_mired_divisions: 10,
       hs_bri_steps: 32,
-      hs_hue_steps: 2731,
+      hs_hue_divisions: 2731,
       hs_sat_steps: 32,
     });
   });

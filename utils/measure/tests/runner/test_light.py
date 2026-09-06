@@ -26,10 +26,10 @@ import pytest
 def _parameters() -> MeasurementParameters:
     return MeasurementParameters(
         ct_bri_steps=5,
-        ct_mired_steps=10,
+        ct_mired_divisions=10,
         bri_bri_steps=1,
         hs_bri_steps=32,
-        hs_hue_steps=2731,
+        hs_hue_divisions=24,
         hs_sat_steps=32,
     )
 
@@ -88,7 +88,7 @@ def _brightness_run(tmp_path: Path, variations: list[Variation]) -> _BrightnessR
         ),
         (
             LutMode.COLOR_TEMP,
-            1872,
+            520,
         ),
         (
             LutMode.HS,

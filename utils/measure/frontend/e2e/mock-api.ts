@@ -28,8 +28,8 @@ import type {
 
 const parameters: MeasurementParameters = {
   sleep_time: 2, sample_count: 1, sleep_time_sample: 1, max_retries: 5, max_nudges: 0,
-  bri_bri_steps: 1, ct_bri_steps: 5, ct_mired_steps: 10,
-  hs_bri_steps: 32, hs_hue_steps: 2731, hs_sat_steps: 32,
+  bri_bri_steps: 1, ct_bri_steps: 5, ct_mired_divisions: 10,
+  hs_bri_steps: 32, hs_hue_divisions: 2731, hs_sat_steps: 32,
   min_brightness: 1, sleep_initial: 10, sleep_standby: 20,
   effect_bri_steps: 40, measure_time_effect: 180, measure_time_effect_min: 20,
 };

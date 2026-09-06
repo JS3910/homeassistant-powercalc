@@ -143,8 +143,12 @@ def _controller(
 #: activates. A light only offers the subset its entity reports as supported.
 LIGHT_MODE_OPTIONS = (
     FieldOption(value=LutMode.BRIGHTNESS, label="Brightness", enables=("bri_bri_steps",)),
-    FieldOption(value=LutMode.COLOR_TEMP, label="Color temperature", enables=("ct_bri_steps", "ct_mired_steps")),
-    FieldOption(value=LutMode.HS, label="Hue & saturation", enables=("hs_bri_steps", "hs_hue_steps", "hs_sat_steps")),
+    FieldOption(value=LutMode.COLOR_TEMP, label="Color temperature", enables=("ct_bri_steps", "ct_mired_divisions")),
+    FieldOption(
+        value=LutMode.HS,
+        label="Hue & saturation",
+        enables=("hs_bri_steps", "hs_hue_divisions", "hs_sat_steps"),
+    ),
     FieldOption(
         value=LutMode.EFFECT,
         label="Effect",
@@ -218,9 +222,13 @@ LIGHT_PARAMETERS = (
         group=RESOLUTION,
     ),
     ParameterDefinition(
-        name="ct_mired_steps",
-        label="Color temperature mired step",
-        hint="Native color-temperature increment in mired.",
+        name="ct_mired_divisions",
+        label="Color temperature divisions",
+        hint=(
+            "How many points to divide the color-temperature range into (min and max "
+            "always included). Swept warm/cold-first, then bisected, so the profile's "
+            "shape emerges early and only sharpens with more divisions."
+        ),
         group=RESOLUTION,
     ),
     ParameterDefinition(
@@ -230,9 +238,13 @@ LIGHT_PARAMETERS = (
         group=RESOLUTION,
     ),
     ParameterDefinition(
-        name="hs_hue_steps",
-        label="HS hue step",
-        hint="Native Home Assistant hue increment (0–65535).",  # noqa: RUF001
+        name="hs_hue_divisions",
+        label="HS hue divisions",
+        hint=(
+            "How many points around the hue wheel. Seeded at red/green/blue (an RGB(WW) "
+            "fixture's actual emitters), then bisected, so the profile's shape emerges "
+            "early and only sharpens with more divisions."
+        ),
         group=RESOLUTION,
     ),
     ParameterDefinition(

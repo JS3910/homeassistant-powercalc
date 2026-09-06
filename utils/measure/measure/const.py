@@ -94,6 +94,10 @@ MEASUREMENT_SAMPLE_COUNT_MAX = 100
 MAX_NUDGES_LIMIT = 20
 # Density guard: automated sessions may not produce ct profiles coarser than step 10.
 CT_STEPS_MAX = 10
+# Density guard for the bisected mired axis: an automated session must divide the color-
+# temperature range into at least this many points (mired is swept in bisection order, not
+# a native step size -- see runner/light_plan.py -- so "how coarse" is a division count).
+CT_MIRED_DIVISIONS_MIN = 5
 
 # Single source of measurement-parameter bounds. Request validation, persisted app
 # preferences, the capabilities endpoint (which the frontend forms read) and the
@@ -111,9 +115,9 @@ PARAMETER_LIMITS: dict[str, tuple[float, float]] = {
     "max_hue": (1, 65535),
     "bri_bri_steps": (1, 255),
     "ct_bri_steps": (1, CT_STEPS_MAX),
-    "ct_mired_steps": (1, CT_STEPS_MAX),
+    "ct_mired_divisions": (CT_MIRED_DIVISIONS_MIN, 129),
     "hs_bri_steps": (1, 255),
-    "hs_hue_steps": (1, 65535),
+    "hs_hue_divisions": (3, 360),
     "hs_sat_steps": (1, 255),
     "effect_bri_steps": (1, 255),
     "sleep_initial": (0, 3600),
@@ -123,10 +127,12 @@ PARAMETER_LIMITS: dict[str, tuple[float, float]] = {
 }
 
 CT_BRI_STEPS_MANUAL = 15
-CT_MIRED_STEPS_MANUAL = 50
-# Manual meters get a coarser fixed ct grid than the density guard allows,
-# because hand-reading every step is laborious.
+CT_MIRED_DIVISIONS_MANUAL_MIN = 3
+CT_MIRED_DIVISIONS_MANUAL_MAX = 9
+# Manual meters get a coarser fixed ct grid than the density guard allows (as few as 3
+# divisions -- min, max, and one midpoint -- versus the automated floor of 5), because
+# hand-reading every point is laborious.
 MANUAL_PARAMETER_LIMIT_OVERRIDES: dict[str, tuple[float, float]] = {
     "ct_bri_steps": (1, CT_BRI_STEPS_MANUAL),
-    "ct_mired_steps": (1, CT_MIRED_STEPS_MANUAL),
+    "ct_mired_divisions": (CT_MIRED_DIVISIONS_MANUAL_MIN, CT_MIRED_DIVISIONS_MANUAL_MAX),
 }

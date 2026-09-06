@@ -589,8 +589,8 @@ describe("settings witness meters", () => {
     const view = element({
       ...defaultSettings,
       witnesses: [
-        { meter: { type: "shelly", device_ip: "10.0.0.5" }, offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
-        { meter: { type: "kasa", device_ip: "10.0.0.6" }, offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+        { meter: { type: "shelly", device_ip: "10.0.0.5" }, position: "none", offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+        { meter: { type: "kasa", device_ip: "10.0.0.6" }, position: "none", offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
       ],
     });
     await view.updateComplete;
@@ -610,7 +610,7 @@ describe("settings witness meters", () => {
     const view = element({
       ...defaultSettings,
       power_meter: "hass",
-      witnesses: [{ meter: { type: "shelly", device_ip: "10.0.0.5" }, offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true }],
+      witnesses: [{ meter: { type: "shelly", device_ip: "10.0.0.5" }, position: "none", offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true }],
     });
     await view.updateComplete;
 
@@ -624,7 +624,7 @@ describe("settings witness meters", () => {
   it("saves configured witnesses converted into request-shaped specs", async () => {
     const view = element({
       ...defaultSettings,
-      witnesses: [{ meter: { type: "shelly", device_ip: "10.0.0.5" }, offset_w: 1, tolerance_w: 0.5, tolerance_pct: 2, required: true }],
+      witnesses: [{ meter: { type: "shelly", device_ip: "10.0.0.5" }, position: "none", offset_w: 1, tolerance_w: 0.5, tolerance_pct: 2, required: true }],
     });
     await view.updateComplete;
 
@@ -640,7 +640,7 @@ describe("settings witness meters", () => {
     const settings = await saved;
 
     expect(settings.witnesses).toEqual([
-      { meter: { type: "shelly", device_ip: "10.0.0.9" }, offset_w: 1, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+      { meter: { type: "shelly", device_ip: "10.0.0.9" }, position: "none", offset_w: 1, tolerance_w: 0.5, tolerance_pct: 2, required: true },
     ]);
   });
 
@@ -648,8 +648,8 @@ describe("settings witness meters", () => {
     const view = element({
       ...defaultSettings,
       witnesses: [
-        { meter: { type: "shelly", device_ip: "10.0.0.5" }, offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
-        { meter: { type: "kasa", device_ip: "10.0.0.6" }, offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+        { meter: { type: "shelly", device_ip: "10.0.0.5" }, position: "none", offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
+        { meter: { type: "kasa", device_ip: "10.0.0.6" }, position: "none", offset_w: 0, tolerance_w: 0.5, tolerance_pct: 2, required: true },
       ],
     });
     await view.updateComplete;

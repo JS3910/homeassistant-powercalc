@@ -142,12 +142,12 @@ def test_active_probe_checks_rgb_primaries_and_caches_an_exact_request() -> None
     assert result.minimum_aggregate_power_w == 0.9
     assert [point.label for point in result.points] == [
         "Color 0° / 100% saturation · brightness 1",
-        "Color 120° / 100% saturation · brightness 1",
-        "Color 240° / 100% saturation · brightness 1",
+        "Color 125° / 100% saturation · brightness 1",
+        "Color 235° / 100% saturation · brightness 1",
     ]
     assert meter.calls == 3
     hues = [change[2]["hue"] for change in controller.changes if change[0] == LutMode.HS and change[2]["bri"] == 1]
-    assert hues == [1, 21849, 43697]
+    assert hues == [1, 22793, 42736]
     assert controller.changes[-1] == (LutMode.BRIGHTNESS, False, {})
     assert controller.closed
     assert meter.closed

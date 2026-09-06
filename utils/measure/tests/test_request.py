@@ -379,8 +379,8 @@ def test_request_preserves_subsecond_sleep_time() -> None:
         ({"max_hue": 65_536}, "max_hue"),
         ({"bri_bri_steps": 0}, "bri_bri_steps"),
         ({"ct_bri_steps": 11}, "ct_bri_steps"),
-        ({"ct_mired_steps": 11}, "ct_mired_steps"),
-        ({"hs_hue_steps": 65_536}, "hs_hue_steps"),
+        ({"ct_mired_divisions": 200}, "ct_mired_divisions"),
+        ({"hs_hue_divisions": 65_536}, "hs_hue_divisions"),
         ({"measure_time_effect": 10, "measure_time_effect_min": 20}, "measure_time_effect_min"),
         ({"min_sat": 200, "max_sat": 50}, "min_sat must not exceed max_sat"),
         ({"min_hue": 500, "max_hue": 100}, "min_hue must not exceed max_hue"),
@@ -401,15 +401,17 @@ def test_request_rejects_invalid_exposed_tuning(parameters: dict[str, int], mess
     ],
 )
 def test_manual_power_meter_allows_coarser_ct_grid(power_meter: dict[str, str], accepted: bool) -> None:
+    # 3 divisions (min, max, one midpoint) is below the automated floor of 5 -- only the
+    # manual override permits going this coarse.
     payload = valid_request() | {
         "power_meter": power_meter,
-        "parameters": {"ct_bri_steps": 15, "ct_mired_steps": 50},
+        "parameters": {"ct_bri_steps": 15, "ct_mired_divisions": 3},
     }
 
     if accepted:
         request = LightMeasurementRequest.model_validate(payload)
         assert request.parameters.ct_bri_steps == 15
-        assert request.parameters.ct_mired_steps == 50
+        assert request.parameters.ct_mired_divisions == 3
     else:
         with pytest.raises(ValidationError, match="ct_bri_steps"):
             LightMeasurementRequest.model_validate(payload)

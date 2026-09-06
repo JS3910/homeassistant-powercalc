@@ -79,9 +79,9 @@ export interface MeasurementParameters {
   max_nudges: number;
   bri_bri_steps: number;
   ct_bri_steps: number;
-  ct_mired_steps: number;
+  ct_mired_divisions: number;
   hs_bri_steps: number;
-  hs_hue_steps: number;
+  hs_hue_divisions: number;
   hs_sat_steps: number;
   min_brightness: number;
   sleep_initial: number;
