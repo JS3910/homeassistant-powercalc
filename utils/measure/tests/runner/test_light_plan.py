@@ -111,3 +111,44 @@ class TestModeSweepOrder:
         block_len = sum(1 for h in hues if h == first_hue and hues.index(h) < len(hues))
         assert hues[:block_len] == [first_hue] * block_len
         assert hues[block_len] != first_hue
+
+
+class TestRedundantBrightnessModeIsDropped:
+    """A plain-brightness pass has no defined color/temp to hold constant -- it just
+    measures whatever the light already happened to be left set to. Once a color mode is
+    also being measured, that mode's own sweep already covers the full brightness range
+    at every color point, so the standalone pass is dropped rather than run first against
+    an undefined color state. Confirmed 2026-09-06 during hardware testing: without this,
+    a brightness+color_temp+hs request ran its brightness pass against whatever color the
+    light was last left in from an earlier test (solid blue), not anything repeatable.
+    """
+
+    def test_brightness_is_dropped_alongside_color_temp(self) -> None:
+        parameters = MeasurementParameters()
+        plan = build_light_plan({LutMode.BRIGHTNESS, LutMode.COLOR_TEMP}, parameters, _light_info(), [])
+
+        assert [mode_plan.mode for mode_plan in plan.modes] == [LutMode.COLOR_TEMP]
+
+    def test_brightness_is_dropped_alongside_hs(self) -> None:
+        parameters = MeasurementParameters()
+        plan = build_light_plan({LutMode.BRIGHTNESS, LutMode.HS}, parameters, _light_info(), [])
+
+        assert [mode_plan.mode for mode_plan in plan.modes] == [LutMode.HS]
+
+    def test_brightness_is_dropped_when_all_three_are_requested(self) -> None:
+        parameters = MeasurementParameters()
+        plan = build_light_plan(
+            {LutMode.BRIGHTNESS, LutMode.COLOR_TEMP, LutMode.HS},
+            parameters,
+            _light_info(),
+            [],
+        )
+
+        assert [mode_plan.mode for mode_plan in plan.modes] == [LutMode.COLOR_TEMP, LutMode.HS]
+
+    def test_brightness_alone_is_kept_when_no_color_mode_is_requested(self) -> None:
+        parameters = MeasurementParameters()
+        plan = build_light_plan({LutMode.BRIGHTNESS}, parameters, _light_info(), [])
+
+        assert [mode_plan.mode for mode_plan in plan.modes] == [LutMode.BRIGHTNESS]
+        assert plan.for_mode(LutMode.BRIGHTNESS).variations  # still does real work

@@ -2,6 +2,7 @@ from collections import deque
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
+import logging
 import math
 
 from measure.controller.light.const import LutMode
@@ -9,8 +10,14 @@ from measure.controller.light.controller import LightInfo
 from measure.runner.errors import RunnerError
 from measure.tuning import MeasurementParameters
 
+_LOGGER = logging.getLogger("measure")
+
 ESTIMATED_IO_DELAY = 0.15
 LIGHT_MODE_ORDER = (LutMode.BRIGHTNESS, LutMode.COLOR_TEMP, LutMode.HS, LutMode.EFFECT)
+#: Modes that already sweep the full 0-100% brightness range at every point they measure,
+#: making a standalone plain-brightness pass redundant alongside either of them -- see
+#: `build_light_plan`.
+_COLOR_MODES = (LutMode.COLOR_TEMP, LutMode.HS)
 
 CSV_HEADERS = {
     LutMode.HS: ["bri", "hue", "sat", "watt"],
@@ -151,6 +158,21 @@ def build_light_plan(
     """Build the ordered variations used by preflight and runtime execution."""
 
     mode_set = set(modes)
+    if LutMode.BRIGHTNESS in mode_set and mode_set.intersection(_COLOR_MODES):
+        # A plain-brightness pass measures whatever color/temp the light already happens
+        # to be set to -- there is no "default" color or color temperature, so it isn't
+        # holding anything meaningful constant. Once a color mode is also selected, that
+        # mode's own sweep already covers the full brightness range at every color point
+        # it measures, so the standalone pass adds nothing and is dropped. Confirmed
+        # 2026-09-06: without this, a brightness+color_temp+HS request ran an initial
+        # brightness pass against whatever color the light was last left in (observed:
+        # solid blue, left over from a previous HS run), producing a LUT column that
+        # doesn't correspond to any real, repeatable device state.
+        _LOGGER.info(
+            "Dropping the standalone brightness sweep: redundant once %s is also being measured",
+            " and ".join(mode.value for mode in _COLOR_MODES if mode in mode_set),
+        )
+        mode_set = mode_set - {LutMode.BRIGHTNESS}
     effect_list = list(effects or [])
     return LightMeasurementPlan(
         modes=[

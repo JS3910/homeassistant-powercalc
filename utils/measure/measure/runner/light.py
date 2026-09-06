@@ -39,7 +39,6 @@ from measure.runner.runner import MeasurementRunner, RunnerResult
 from measure.tuning import MeasurementParameters
 from measure.util.measure_util import AverageMeasurementConvergence, MeasurementResult, MeasureUtil
 
-CSV_WRITE_BUFFER = 50
 MAX_CONSECUTIVE_ZERO_READINGS = 5
 ZERO_READING_ABORT_MESSAGE = (
     "Aborting measurement session after repeated 0 W readings. The power meter may not resolve this low load. "
@@ -667,6 +666,12 @@ class CsvWriter:
             row.append(dt.now().strftime("%Y%m%d%H%M%S"))
         self.writer.writerow(row)
         self.rows_written += 1
-        if self.rows_written % CSV_WRITE_BUFFER == 1:
-            self.csv_file.flush()
-            _LOGGER.debug("Flushing CSV buffer")
+        # Flush every row, not just every 50th: the CSV is now read mid-run by the live
+        # "profile so far" plot (see api.py's /plots endpoint), so a buffered-but-unflushed
+        # row is invisible to that reader even though the measurement itself has already
+        # completed and moved on. Confirmed 2026-09-06: 22 variations measured, only the
+        # first showed up on the live plot, because 22 % 50 never crossed a flush boundary.
+        # A per-point wait of at least a fraction of a second (settle time, sampling, the
+        # light API round-trip) makes the flush() cost irrelevant next to everything else
+        # already happening on that same point.
+        self.csv_file.flush()
