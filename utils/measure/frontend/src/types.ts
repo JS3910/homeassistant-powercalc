@@ -263,6 +263,7 @@ export interface LightMeasurementRequest extends BaseMeasurementRequest {
   modes: LutMode[];
   gzip: boolean;
   multiple_light_count: number;
+  rated_power_w?: number | null;
 }
 
 export interface AverageMeasurementRequest extends BaseMeasurementRequest { measure_type: "average"; controller?: null; duration: number; }

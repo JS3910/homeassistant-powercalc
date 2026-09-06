@@ -303,6 +303,19 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
                 derived_from="light_entity_id",
                 hint="Total number of identical physical lights; measured power is divided by this value.",
             ),
+            FormFieldDefinition(
+                name="rated_power_w",
+                label="Rated power per light (W)",
+                control=FieldControl.NUMBER,
+                required=False,
+                minimum=0,
+                hint=(
+                    "Optional. Used only to bound an OCR power meter's readings against "
+                    "gross misreads (e.g. a missed decimal point) that its own internal "
+                    "cross-check can't catch. Leave blank to skip this check; ignored for "
+                    "non-OCR meters."
+                ),
+            ),
         ),
         supports_resume=True,
     ),

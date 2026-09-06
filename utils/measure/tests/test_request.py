@@ -417,5 +417,58 @@ def test_manual_power_meter_allows_coarser_ct_grid(power_meter: dict[str, str], 
             LightMeasurementRequest.model_validate(payload)
 
 
+def test_rated_power_w_fills_an_unbounded_ocr_primarys_plausibility_bound() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request()
+        | {
+            "power_meter": {"type": "ocr", "source": "http://camera/mjpeg"},
+            "rated_power_w": 10.0,
+            "multiple_light_count": 2,
+        },
+    )
+
+    assert request.power_meter.max_plausible_power_w == 60.0  # 10 W x 2 lights x 3.0 margin
+
+
+def test_rated_power_w_fills_witnesses_too_but_not_the_primary_if_its_not_ocr() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request()
+        | {
+            "power_meter": {
+                "type": "composite",
+                "primary": {"type": "hass", "entity_id": "sensor.test_power"},
+                "witnesses": [{"meter": {"type": "ocr", "source": "http://camera/mjpeg"}}],
+            },
+            "rated_power_w": 5.0,
+        },
+    )
+
+    assert request.power_meter.witnesses[0].meter.max_plausible_power_w == 15.0
+
+
+def test_rated_power_w_does_not_override_an_explicit_bound() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request()
+        | {
+            "power_meter": {
+                "type": "ocr",
+                "source": "http://camera/mjpeg",
+                "max_plausible_power_w": 42.0,
+            },
+            "rated_power_w": 10.0,
+        },
+    )
+
+    assert request.power_meter.max_plausible_power_w == 42.0
+
+
+def test_without_rated_power_w_ocr_meters_get_no_plausibility_bound() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request() | {"power_meter": {"type": "ocr", "source": "http://camera/mjpeg"}},
+    )
+
+    assert request.power_meter.max_plausible_power_w is None
+
+
 def test_parameter_limits_cover_exactly_the_validated_fields() -> None:
     assert set(_BASE_PARAMETER_FIELDS) | set(_LIGHT_PARAMETER_FIELDS) == set(PARAMETER_LIMITS)

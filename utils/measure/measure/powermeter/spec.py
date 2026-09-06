@@ -61,6 +61,13 @@ class OcrPowerMeterSpec(_PowerMeterSpec):
     stale_after_seconds: float = Field(default=5.0, gt=0)
     crosscheck_tolerance_pct: float = Field(default=3.0, ge=0)
     min_current_for_crosscheck: float = Field(default=0.02, ge=0)
+    # A reading above this is rejected outright, independent of the V*I*PF crosscheck --
+    # catches misreads the crosscheck can't (e.g. a decimal point read as absent, or a
+    # digit's neighbour glyph mistaken for it, inflating every field consistently by the
+    # same wrong factor so V*I*PF still agrees with the equally-wrong power). Left unset,
+    # no absolute check is applied. See `LightMeasurementRequest.rated_power_w`, which
+    # `request_adapter`/`ha_app/api.py` multiply by a safety margin to derive this.
+    max_plausible_power_w: float | None = Field(default=None, gt=0)
 
 
 class ShellyPowerMeterSpec(_PowerMeterSpec):

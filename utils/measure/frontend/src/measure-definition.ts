@@ -158,6 +158,10 @@ export function buildMeasurementRequest(
       declared.controller = controllerSpec(form, field, dummyController);
       continue;
     }
+    // An optional number left blank should stay unset (server default of null/undefined),
+    // not submit as 0 -- formNumber("") is 0, which would fail a `gt=0` server validation
+    // instead of just being absent.
+    if (field.control === "number" && !field.required && formText(form, field.name) === "") continue;
     declared[field.name] = formValue(form, field);
   }
 

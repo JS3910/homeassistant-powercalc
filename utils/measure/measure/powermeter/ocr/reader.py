@@ -89,6 +89,7 @@ class DisplayReader:
         *,
         crosscheck_tolerance_pct: float = 3.0,
         min_current_for_crosscheck: float = 0.02,
+        max_plausible_power_w: float | None = None,
         margin: int = 6,
         upscale: float = 2.0,
     ) -> None:
@@ -96,6 +97,7 @@ class DisplayReader:
         self._layout = layout
         self._crosscheck_tolerance_pct = crosscheck_tolerance_pct
         self._min_current_for_crosscheck = min_current_for_crosscheck
+        self._max_plausible_power_w = max_plausible_power_w
         self._margin = margin
         self._upscale = upscale
         self.location: Location | None = None
@@ -242,7 +244,14 @@ class DisplayReader:
         return self._engine.recognize(crop).replace(" ", "")
 
     def _crosscheck(self, values: dict[str, float]) -> str | None:
-        """Power must equal voltage x current x power factor; a misread digit breaks that."""
+        """Power must be plausible for the device under test, and equal voltage x current x
+        power factor; a misread digit usually breaks the latter, but a misread that shifts
+        every field by the same wrong factor (a missed decimal point, say) can pass it
+        while still being an obviously wrong power -- the absolute bound catches that case.
+        """
+        power = values.get("power")
+        if power is not None and self._max_plausible_power_w is not None and power > self._max_plausible_power_w:
+            return f"power {power:g} W exceeds the plausible bound of {self._max_plausible_power_w:g} W"
         if not {"power", "voltage", "current", "pf"} <= values.keys():
             return None
         power, voltage, current, pf = values["power"], values["voltage"], values["current"], values["pf"]

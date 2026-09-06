@@ -82,6 +82,40 @@ def test_read_rejects_a_dropped_decimal_through_the_cross_check() -> None:
     assert reading.power == 4067.0  # still reported, for the preview
 
 
+def test_read_rejects_a_reading_above_the_plausible_power_bound_even_when_internally_consistent() -> None:
+    # A misread that shifts every field by the same wrong factor (a missed decimal point
+    # across the whole display, say) can stay internally consistent and still pass the
+    # V*I*PF crosscheck -- only an absolute bound catches it.
+    engine = scripted_engine("Power406.7w", "V230.0vC1.780A", "PF0.994")
+    reader = DisplayReader(engine, PR10, max_plausible_power_w=100.0)
+    reader.locate(blank_frame())
+
+    reading = reader.read(blank_frame(), timestamp=1.0)
+
+    assert not reading.accepted
+    assert reading.reason == "power 406.7 W exceeds the plausible bound of 100 W"
+    assert reading.power == 406.7  # still reported, for the preview
+
+
+def test_read_accepts_a_reading_within_the_plausible_power_bound() -> None:
+    engine = scripted_engine("Power4.60w", "V233.0vC0.055A", "PF0.354")
+    reader = DisplayReader(engine, PR10, max_plausible_power_w=100.0)
+    reader.locate(blank_frame())
+
+    assert reader.read(blank_frame(), timestamp=1.0).accepted
+
+
+def test_read_applies_no_bound_when_none_is_configured() -> None:
+    engine = scripted_engine("Power4067w", "V230.0vC1.780A", "PF0.994")
+    reader = DisplayReader(engine, PR10)  # crosscheck alone still rejects this one
+    reader.locate(blank_frame())
+
+    reading = reader.read(blank_frame(), timestamp=1.0)
+
+    assert not reading.accepted
+    assert "exceeds the plausible bound" not in (reading.reason or "")
+
+
 def test_cross_check_is_skipped_below_the_current_floor_and_respects_tolerance() -> None:
     # PF and current are unreliable near zero; a 1 W bulb reads 0.000 A.
     engine = scripted_engine("Power1.00w", "V233.4vC0.000A", "PF0.000")

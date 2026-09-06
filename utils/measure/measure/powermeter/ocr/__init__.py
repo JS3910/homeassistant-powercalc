@@ -31,6 +31,7 @@ def build_ocr_power_meter(spec: OcrPowerMeterSpec) -> OcrPowerMeter:
         layout,
         crosscheck_tolerance_pct=spec.crosscheck_tolerance_pct,
         min_current_for_crosscheck=spec.min_current_for_crosscheck,
+        max_plausible_power_w=spec.max_plausible_power_w,
     )
     preview = PreviewServer(spec.preview_host, spec.preview_port).start() if spec.preview_port is not None else None
     frames = FrameSource(spec.source).start()

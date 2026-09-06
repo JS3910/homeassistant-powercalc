@@ -13,7 +13,13 @@ from measure.controller.light.const import LutMode
 from measure.controller.light.spec import LightControllerSpec
 from measure.controller.media.spec import MediaControllerSpec
 from measure.controller.spec import BaseControllerSpec
-from measure.powermeter.spec import DummyPowerMeterSpec, ManualPowerMeterSpec, PowerMeterSpec
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    DummyPowerMeterSpec,
+    ManualPowerMeterSpec,
+    OcrPowerMeterSpec,
+    PowerMeterSpec,
+)
 from measure.runner.const import COMPLEX_PROFILE_EXPORT_FILENAME, DEFAULT_EXPORT_FILENAME
 from measure.tuning import MeasurementParameters
 
@@ -93,6 +99,40 @@ _LIGHT_PARAMETER_FIELDS = (
     "measure_time_effect",
     "measure_time_effect_min",
 )
+
+
+# Headroom above rated power before an OCR reading is rejected as implausible: generous
+# enough for power-factor correction inrush and dimming-curve nonlinearity, tight enough
+# to still catch the failure mode this exists for -- a misread that inflates every field
+# by the same wrong factor (a missed decimal point, say), which the V*I*PF crosscheck
+# alone can't catch since it stays internally consistent.
+_OCR_RATED_POWER_MARGIN = 3.0
+
+
+def _with_ocr_plausibility_bound(spec: PowerMeterSpec, bound: float) -> PowerMeterSpec:
+    """Fill `max_plausible_power_w` on every OCR meter in `spec` that doesn't already have
+    its own explicit bound, recursing into a composite's primary and witnesses. Returns
+    `spec` unchanged (same object) if nothing needed filling in.
+    """
+    if isinstance(spec, OcrPowerMeterSpec):
+        if spec.max_plausible_power_w is not None:
+            return spec
+        return spec.model_copy(update={"max_plausible_power_w": bound})
+    if isinstance(spec, CompositePowerMeterSpec):
+        primary = _with_ocr_plausibility_bound(spec.primary, bound)
+        witnesses = []
+        witnesses_changed = False
+        for witness in spec.witnesses:
+            meter = _with_ocr_plausibility_bound(witness.meter, bound)
+            if meter is witness.meter:
+                witnesses.append(witness)
+            else:
+                witnesses.append(witness.model_copy(update={"meter": meter}))
+                witnesses_changed = True
+        if primary is spec.primary and not witnesses_changed:
+            return spec
+        return spec.model_copy(update={"primary": primary, "witnesses": witnesses})
+    return spec
 
 
 def _validate_parameter_limits(
@@ -177,6 +217,11 @@ class LightMeasurementRequest(BaseMeasurementRequest):
     generate_model: bool = True
     gzip: bool = True
     multiple_light_count: int = Field(default=1, ge=1, le=100)
+    # Optional; only used to derive a plausibility bound for an OCR power meter (primary
+    # or witness) so a misread that inflates every field by the same wrong factor -- which
+    # the V*I*PF crosscheck alone can't catch -- still gets rejected. Left unset, no such
+    # bound is applied. Per-unit, before `multiple_light_count` is factored in.
+    rated_power_w: float | None = Field(default=None, gt=0, le=100_000)
 
     @field_validator("modes")
     @classmethod
@@ -199,6 +244,22 @@ class LightMeasurementRequest(BaseMeasurementRequest):
         if value.min_hue > value.max_hue:
             raise ValueError("min_hue must not exceed max_hue")
         return self
+
+    @model_validator(mode="after")
+    def apply_rated_power_to_ocr_meters(self) -> LightMeasurementRequest:
+        """Derive every OCR meter's plausibility bound from `rated_power_w`, if given.
+
+        Applies to the primary and any witnesses alike (a witness OCR meter reads the same
+        physical device, or one wired in series with it, so the same rating applies), and
+        only fills meters that don't already carry their own explicit bound.
+        """
+        if self.rated_power_w is None:
+            return self
+        bound = self.rated_power_w * self.multiple_light_count * _OCR_RATED_POWER_MARGIN
+        power_meter = _with_ocr_plausibility_bound(self.power_meter, bound)
+        if power_meter is self.power_meter:
+            return self
+        return self.model_copy(update={"power_meter": power_meter})
 
 
 class AverageMeasurementRequest(BaseMeasurementRequest):
