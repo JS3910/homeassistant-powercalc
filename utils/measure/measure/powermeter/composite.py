@@ -44,6 +44,9 @@ class WitnessReading:
     deviation: float | None
     agrees: bool
     error: str | None = None
+    voltage: float | None = None
+    current: float | None = None
+    power_factor: float | None = None
 
 
 @dataclass(frozen=True)
@@ -81,7 +84,10 @@ class CompositePowerMeter(PowerMeter):
 
     def get_power(self, include_voltage: bool = False) -> PowerMeasurementResult:
         primary_future = self._executor.submit(self._primary.get_power, include_voltage)
-        witness_futures = [self._executor.submit(witness.meter.get_power, False) for witness in self._witnesses]
+        # include_voltage=True even though only the correction math below needs .power --
+        # the raw-samples diagnostics writer wants whatever V/I/PF a witness can report
+        # too, and it's cheap: the meters that support it already compute it per reading.
+        witness_futures = [self._executor.submit(witness.meter.get_power, True) for witness in self._witnesses]
 
         primary = primary_future.result()
         readings: list[WitnessReading] = []
@@ -110,6 +116,9 @@ class CompositePowerMeter(PowerMeter):
                     corrected=corrected,
                     deviation=deviation,
                     agrees=abs(deviation) <= allowed,
+                    voltage=result.voltage,
+                    current=result.current,
+                    power_factor=result.power_factor,
                 ),
             )
 

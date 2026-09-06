@@ -82,11 +82,19 @@ class OcrPowerMeter(PowerMeter):
                 raise OutdatedMeasurementError(self._stale_reason(now, newest, last))
         powers = [r.power for r in recent if r.power is not None]
         voltages = [r.voltage for r in recent if r.voltage is not None]
+        currents = [r.current for r in recent if r.current is not None]
+        power_factors = [r.pf for r in recent if r.pf is not None]
         updated = max(r.timestamp for r in recent)
         return PowerMeasurementResult(
             power=statistics.median(powers),
             updated=updated,
             voltage=statistics.median(voltages) if include_voltage and voltages else None,
+            # Unlike voltage, these aren't gated on include_voltage -- they're already
+            # computed for the crosscheck on every accepted reading, so reporting them
+            # back out costs nothing extra and the raw-samples diagnostics writer wants
+            # them regardless of what the caller asked for.
+            current=statistics.median(currents) if currents else None,
+            power_factor=statistics.median(power_factors) if power_factors else None,
         )
 
     def has_voltage_support(self) -> bool:

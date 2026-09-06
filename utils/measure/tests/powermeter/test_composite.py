@@ -53,7 +53,7 @@ def test_returns_primary_reading_unchanged_when_witness_agrees() -> None:
 
     assert result == PowerMeasurementResult(power=4.94, updated=123.0, voltage=232.9)
     assert primary.calls == [True]
-    assert witness.calls == [False]
+    assert witness.calls == [True]
     assert meter.last_reading is not None
     reading = meter.last_reading.witnesses[0]
     assert reading.agrees

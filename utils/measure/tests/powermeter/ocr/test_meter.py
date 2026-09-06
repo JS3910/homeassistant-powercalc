@@ -86,6 +86,13 @@ def test_get_power_is_the_median_of_the_window_and_voltage_follows() -> None:
     assert meter.get_power().voltage is None
     assert meter.has_voltage_support()
 
+    # Current and power factor are already computed for every accepted reading's
+    # crosscheck, so they're reported regardless of include_voltage -- unlike voltage,
+    # which is deliberately gated because most callers don't want the extra median cost.
+    no_voltage_result = meter.get_power()
+    assert no_voltage_result.current == 0.056
+    assert no_voltage_result.power_factor == 0.354
+
 
 def test_get_power_falls_back_to_the_newest_accepted_reading_within_stale_after() -> None:
     clock = Clock()

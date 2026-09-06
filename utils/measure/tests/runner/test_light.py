@@ -333,6 +333,98 @@ def _flaky_light_controller(failures_after_startup: int) -> MagicMock:
     return light_controller
 
 
+def test_run_mode_writes_no_raw_samples_file_content_for_a_bare_power_meter(tmp_path: Path) -> None:
+    """A raw-samples file is still created (so tooling doesn't need to guess), but stays empty.
+
+    Only a composite power meter has a primary+witness(es) reading worth recording; a bare
+    meter's own measurement is already exactly what the CSV records, so there is nothing
+    the raw-samples file would add.
+    """
+    variations = [Variation(1), Variation(2)]
+    run = _brightness_run(tmp_path, variations)
+    run.measure_util.take_measurement.return_value = MeasurementResult(power=1, voltages=[])
+    # MagicMock(spec=MeasureUtil) has no `power_meter` attribute unless one is set.
+
+    run.execute()
+
+    raw_path = tmp_path / "brightness.raw.jsonl"
+    assert raw_path.exists()
+    assert raw_path.read_text() == ""
+
+
+def test_run_mode_records_one_raw_sample_per_variation_from_the_composite_meters_last_reading(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from measure.powermeter.composite import CompositePowerMeter, CompositeReading, WitnessReading
+    from measure.powermeter.powermeter import PowerMeasurementResult
+
+    variations = [Variation(1), Variation(2)]
+    run = _brightness_run(tmp_path, variations)
+    readings = [
+        CompositeReading(
+            primary=PowerMeasurementResult(power=1.0, updated=1.0, voltage=230.0, current=0.01, power_factor=0.4),
+            witnesses=(
+                WitnessReading(
+                    name="ocr",
+                    power=0.9,
+                    corrected=0.9,
+                    deviation=-0.1,
+                    agrees=True,
+                    voltage=230.1,
+                    current=0.009,
+                    power_factor=0.41,
+                ),
+            ),
+        ),
+        CompositeReading(
+            primary=PowerMeasurementResult(power=2.0, updated=2.0),
+            witnesses=(
+                WitnessReading(name="ocr", power=None, corrected=None, deviation=None, agrees=True, error="stale"),
+            ),
+        ),
+    ]
+    composite = MagicMock(spec=CompositePowerMeter)
+    run.measure_util.power_meter = composite
+
+    # Simulates the composite meter's last_reading updating on every get_power() the
+    # runner triggers internally via take_measurement().
+    call_count = {"n": 0}
+
+    def _take_measurement(*_args: object, **_kwargs: object) -> MeasurementResult:
+        composite.last_reading = readings[call_count["n"]]
+        call_count["n"] += 1
+        return MeasurementResult(power=composite.last_reading.primary.power, voltages=[])
+
+    run.measure_util.take_measurement.side_effect = _take_measurement
+
+    run.execute()
+
+    raw_path = tmp_path / "brightness.raw.jsonl"
+    lines = [json.loads(line) for line in raw_path.read_text().splitlines()]
+    assert len(lines) == 2
+    assert lines[0]["mode"] == "brightness"
+    assert lines[0]["variation"] == {"bri": 1}
+    assert lines[0]["primary"] == {"power": 1.0, "voltage": 230.0, "current": 0.01, "power_factor": 0.4}
+    assert lines[0]["witnesses"] == [
+        {
+            "name": "ocr",
+            "power": 0.9,
+            "corrected": 0.9,
+            "deviation": -0.1,
+            "agrees": True,
+            "error": None,
+            "voltage": 230.1,
+            "current": 0.009,
+            "power_factor": 0.41,
+        },
+    ]
+    assert lines[1]["variation"] == {"bri": 2}
+    assert lines[1]["witnesses"][0]["error"] == "stale"
+    assert lines[1]["witnesses"][0]["power"] is None
+
+
 def test_change_light_state_is_retried_after_a_dropped_connection(tmp_path: Path) -> None:
     """A Home Assistant light must survive a dropped WebSocket mid-session.
 

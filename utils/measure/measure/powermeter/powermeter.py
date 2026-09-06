@@ -38,6 +38,12 @@ class PowerMeasurementResult(NamedTuple):
     power: float
     updated: float
     voltage: float | None = None
+    # Only the OCR meter populates these today, read straight off the display alongside
+    # power; every other adapter leaves them None rather than guessing. Additive fields --
+    # nothing reads them yet except the raw-samples diagnostics writer (see
+    # measure.runner.raw_sample_writer), so a meter that doesn't set them changes nothing.
+    current: float | None = None
+    power_factor: float | None = None
 
 
 @dataclass(frozen=True)
