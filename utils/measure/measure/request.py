@@ -87,6 +87,9 @@ _LIGHT_PARAMETER_FIELDS = (
     "max_sat",
     "min_hue",
     "max_hue",
+    "settle_tolerance_pct",
+    "settle_window_seconds",
+    "settle_poll_interval_seconds",
     "bri_bri_steps",
     "ct_bri_steps",
     "ct_mired_divisions",
@@ -243,6 +246,9 @@ class LightMeasurementRequest(BaseMeasurementRequest):
             raise ValueError("min_sat must not exceed max_sat")
         if value.min_hue > value.max_hue:
             raise ValueError("min_hue must not exceed max_hue")
+        if value.settle_tolerance_pct > 0 and isinstance(self.power_meter, ManualPowerMeterSpec):
+            # Polling a manual meter means prompting a human for a value on every poll.
+            raise ValueError("settle_tolerance_pct requires a polled power meter, not manual entry")
         return self
 
     @model_validator(mode="after")

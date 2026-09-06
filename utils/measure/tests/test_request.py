@@ -417,6 +417,25 @@ def test_manual_power_meter_allows_coarser_ct_grid(power_meter: dict[str, str], 
             LightMeasurementRequest.model_validate(payload)
 
 
+def test_settle_tolerance_pct_is_rejected_with_a_manual_power_meter() -> None:
+    with pytest.raises(ValidationError, match="settle_tolerance_pct requires a polled power meter"):
+        LightMeasurementRequest.model_validate(
+            valid_request()
+            | {
+                "power_meter": {"type": "manual"},
+                "parameters": {"settle_tolerance_pct": 2.0, "ct_mired_divisions": 3},
+            },
+        )
+
+
+def test_settle_tolerance_pct_is_allowed_with_a_polled_power_meter() -> None:
+    request = LightMeasurementRequest.model_validate(
+        valid_request() | {"parameters": {"settle_tolerance_pct": 2.0}},
+    )
+
+    assert request.parameters.settle_tolerance_pct == 2.0
+
+
 def test_rated_power_w_fills_an_unbounded_ocr_primarys_plausibility_bound() -> None:
     request = LightMeasurementRequest.model_validate(
         valid_request()

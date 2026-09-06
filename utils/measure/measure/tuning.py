@@ -30,6 +30,13 @@ class MeasurementParameters:
     sleep_initial: int = 10
     sleep_standby: int = 20
     sleep_time: float = 2
+    # Opt-in: 0 keeps sleep_time a fixed wait after every light change. Above 0, sleep_time
+    # instead becomes an upper bound and the run polls the power meter, proceeding as soon
+    # as the reading has been flat within this tolerance for settle_window_seconds --
+    # falling back to the full sleep_time if it never stabilizes. See LightRunner._settle.
+    settle_tolerance_pct: float = 0.0
+    settle_window_seconds: float = 1.0
+    settle_poll_interval_seconds: float = 0.25
     sleep_time_sample: int = 1
     sleep_time_hue: int = 5
     sleep_time_sat: int = 10

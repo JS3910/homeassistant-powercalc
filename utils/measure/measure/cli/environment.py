@@ -98,6 +98,18 @@ class CliEnvironment:
         return _DEFAULTS.max_brightness
 
     @property
+    def settle_tolerance_pct(self) -> float:
+        return _bounded_float("settle_tolerance_pct")
+
+    @property
+    def settle_window_seconds(self) -> float:
+        return _bounded_float("settle_window_seconds")
+
+    @property
+    def settle_poll_interval_seconds(self) -> float:
+        return _bounded_float("settle_poll_interval_seconds")
+
+    @property
     def min_sat(self) -> int:
         return _bounded_int("min_sat")
 

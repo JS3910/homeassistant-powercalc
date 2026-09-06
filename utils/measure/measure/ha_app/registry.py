@@ -196,7 +196,22 @@ LIGHT_PARAMETERS = (
     ParameterDefinition(
         name="sleep_time",
         label="Settle time (seconds)",
-        hint="Wait after changing the light before reading power.",
+        hint=(
+            "Wait after changing the light before reading power. Acts as an upper bound, "
+            "not a fixed wait, when settle detection below is enabled."
+        ),
+        step="0.1",
+        group=SAMPLING,
+    ),
+    ParameterDefinition(
+        name="settle_tolerance_pct",
+        label="Settle detection tolerance (%)",
+        hint=(
+            "0 disables this and always waits the full settle time above. Above 0, proceed "
+            "as soon as the reading has been within this tolerance for a second or so, "
+            "instead of always waiting the full settle time -- falls back to the full wait "
+            "if it never stabilizes. Requires a polled power meter (not manual entry)."
+        ),
         step="0.1",
         group=SAMPLING,
     ),

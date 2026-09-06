@@ -46,6 +46,42 @@ def _zero_sleep_parameters() -> MeasurementParameters:
     )
 
 
+def test_settle_waits_the_fixed_sleep_time_when_tolerance_is_zero() -> None:
+    measure_util_mock = MagicMock(MeasureUtil)
+    config = replace(_parameters(), sleep_time=3, settle_tolerance_pct=0)
+    runner = LightRunner(measure_util_mock, config, DummyLightController())
+    runner._wait = MagicMock()  # noqa: SLF001
+
+    runner._settle()  # noqa: SLF001
+
+    runner._wait.assert_called_once_with(3)  # noqa: SLF001
+    measure_util_mock.wait_for_plateau.assert_not_called()
+
+
+def test_settle_polls_for_a_plateau_when_tolerance_is_set() -> None:
+    measure_util_mock = MagicMock(MeasureUtil)
+    measure_util_mock.wait_for_plateau.return_value = 1.2
+    config = replace(
+        _parameters(),
+        sleep_time=10,
+        settle_tolerance_pct=2.0,
+        settle_window_seconds=1.5,
+        settle_poll_interval_seconds=0.3,
+    )
+    runner = LightRunner(measure_util_mock, config, DummyLightController())
+    runner._wait = MagicMock()  # noqa: SLF001
+
+    runner._settle()  # noqa: SLF001
+
+    runner._wait.assert_not_called()  # noqa: SLF001
+    measure_util_mock.wait_for_plateau.assert_called_once_with(
+        10,
+        tolerance_pct=2.0,
+        window_seconds=1.5,
+        poll_interval=0.3,
+    )
+
+
 @dataclass
 class _BrightnessRun:
     runner: LightRunner

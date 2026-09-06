@@ -306,6 +306,28 @@ class LightRunner(MeasurementRunner[LightMeasurementRequest]):
         if self.num_0_readings >= MAX_CONSECUTIVE_ZERO_READINGS:
             raise RunnerError(ZERO_READING_ABORT_MESSAGE) from error
 
+    def _settle(self) -> None:
+        """Wait for the light's power draw to stabilize after a change, before reading it.
+
+        `sleep_time` is a fixed wait by default (`settle_tolerance_pct == 0`, opt-in
+        required since not every power meter refreshes fast enough for polling to make
+        sense). When enabled, `sleep_time` instead becomes an upper bound: the run polls
+        the meter and proceeds as soon as its reading has been flat for
+        `settle_window_seconds`, falling back to the full fixed wait if it never
+        stabilizes -- e.g. a meter that doesn't support polling faster than its own
+        reporting interval, or a light whose driver genuinely never settles.
+        """
+        if self.config.settle_tolerance_pct <= 0:
+            self._wait(self.config.sleep_time)
+            return
+        elapsed = self.measure_util.wait_for_plateau(
+            self.config.sleep_time,
+            tolerance_pct=self.config.settle_tolerance_pct,
+            window_seconds=self.config.settle_window_seconds,
+            poll_interval=self.config.settle_poll_interval_seconds,
+        )
+        _LOGGER.debug("Settle wait finished after %.1fs (cap %.1fs)", elapsed, self.config.sleep_time)
+
     def _change_light_with_retry(self, mode: LutMode, variation: Variation) -> None:
         for _ in range(5):
             try:
@@ -324,7 +346,7 @@ class LightRunner(MeasurementRunner[LightMeasurementRequest]):
 
     def wait(self, variation: Variation, previous_variation: Variation | None) -> None:
         """Wait for the light to process the change"""
-        self._wait(self.config.sleep_time)
+        self._settle()
 
         if not previous_variation:
             # Initially wait longer after selecting the first measurement point so
