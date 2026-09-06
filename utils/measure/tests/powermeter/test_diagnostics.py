@@ -30,11 +30,19 @@ class FakeClock:
 
 
 class SampledPowerMeter(PowerMeter):
-    def __init__(self, sample: Callable[[int], PowerMeterDiagnosticSample], *, supports_voltage: bool = False) -> None:
+    def __init__(
+        self,
+        sample: Callable[[int], PowerMeterDiagnosticSample],
+        *,
+        supports_voltage: bool = False,
+        close_error: Exception | None = None,
+    ) -> None:
         self._sample = sample
         self._supports_voltage = supports_voltage
         self.calls = 0
         self.voltage_support_calls = 0
+        self.closed = False
+        self._close_error = close_error
 
     def get_power(self, include_voltage: bool = False) -> PowerMeasurementResult:
         sample = self.diagnostic_sample()
@@ -48,6 +56,11 @@ class SampledPowerMeter(PowerMeter):
         sample = self._sample(self.calls)
         self.calls += 1
         return sample
+
+    def close(self) -> None:
+        self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
 
 
 def diagnose(
@@ -220,6 +233,54 @@ def test_diagnostics_leave_voltage_capability_unknown_when_building_fails() -> N
 
     assert result.success is False
     assert result.supports_voltage is None
+
+
+def test_diagnostics_closes_the_meter_it_built() -> None:
+    """Diagnostics is a throwaway probe distinct from the meter the real run -- and the
+    app's own active-light preflight check, run right after this in the same request --
+    will build for the same spec next. Leaving this one open leaks whatever it holds
+    (for OCR/composite, a bound preview-server port and a capture thread), which then
+    fails *that* next build with a confusing 'Address already in use' far from its
+    actual cause."""
+    meter = SampledPowerMeter(lambda call: PowerMeterDiagnosticSample(power=1.0, raw_value="1.0", reported_at=call))
+
+    PowerMeterDiagnostics(lambda _: meter, duration=0).evaluate(ShellyPowerMeterSpec(device_ip="192.0.2.1"))
+
+    assert meter.closed
+
+
+def test_diagnostics_closes_the_meter_even_after_the_deadline_loop() -> None:
+    diagnostics, meter, spec = diagnose(
+        lambda call: PowerMeterDiagnosticSample(power=1.0, raw_value="1.0", reported_at=float(call)),
+        duration=2,
+    )
+
+    diagnostics.evaluate(spec)
+
+    assert meter.closed
+
+
+def test_diagnostics_closes_the_meter_even_when_sampling_fails() -> None:
+    def fail(_: int) -> PowerMeterDiagnosticSample:
+        raise RuntimeError("Could not read power")
+
+    meter = SampledPowerMeter(fail)
+
+    PowerMeterDiagnostics(lambda _: meter, duration=0).evaluate(ShellyPowerMeterSpec(device_ip="192.0.2.1"))
+
+    assert meter.closed
+
+
+def test_diagnostics_closing_the_meter_does_not_mask_the_result_when_it_fails() -> None:
+    meter = SampledPowerMeter(
+        lambda call: PowerMeterDiagnosticSample(power=1.0, raw_value="1.0", reported_at=call),
+        close_error=OSError("Address already in use"),
+    )
+
+    result = PowerMeterDiagnostics(lambda _: meter, duration=0).evaluate(ShellyPowerMeterSpec(device_ip="192.0.2.1"))
+
+    assert result.success is True
+    assert meter.closed
 
 
 def test_hass_diagnostic_sample_uses_raw_state_and_never_forces_an_update() -> None:

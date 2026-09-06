@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from itertools import pairwise
+import logging
 import math
 from threading import RLock
 import time
@@ -11,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from measure.powermeter.powermeter import PowerMeter, PowerMeterDiagnosticSample
 from measure.powermeter.spec import CompositePowerMeterSpec, DummyPowerMeterSpec, HassPowerMeterSpec, PowerMeterSpec
+
+_LOGGER = logging.getLogger("measure")
 
 
 class DiagnosticStatus(StrEnum):
@@ -103,6 +106,7 @@ class PowerMeterDiagnostics:
         started = self._monotonic()
         samples: list[_ObservedSample] = []
         supports_voltage: bool | None = None
+        meter: PowerMeter | None = None
         try:
             meter = build_power_meter(spec)
             supports_voltage = meter.has_voltage_support()
@@ -137,6 +141,18 @@ class PowerMeterDiagnostics:
                 messages=[message],
                 message=message,
             )
+        finally:
+            # Diagnostics is a throwaway probe distinct from the meter the real run (and
+            # the app's own active-light preflight check, run right after this in the
+            # same request) will build for the same spec next. Leaving this one open
+            # leaks whatever it holds -- for OCR/composite, a bound preview-server port
+            # and a capture thread -- which then fails *that* next build instead of this
+            # one, with a confusing "Address already in use" far from its actual cause.
+            if meter is not None:
+                try:
+                    meter.close()
+                except Exception as error:  # noqa: BLE001 - cleanup must not mask the diagnostic result
+                    _LOGGER.warning("Could not close the power meter after diagnostics: %s", error)
 
 
 @dataclass(frozen=True)
