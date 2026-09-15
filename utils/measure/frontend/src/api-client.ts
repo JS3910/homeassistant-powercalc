@@ -50,7 +50,13 @@ import type {
   MeasureDefinition,
   MeasureDeviceCatalog,
   ManufacturerCatalog,
+  LightEstimate,
+  LightLoadProbeReading,
+  LogEntry,
+  MergePreview,
+  MeterPreviewStart,
   PlotCollection,
+  PlotPointActionDetail,
   PowerMeterDiagnostic,
   PreflightResponse,
   SessionEvent,
@@ -154,6 +160,63 @@ export class MeasureApiClient {
   getShellyDevices(): Promise<ShellyDiscoveryResponse> {
     return this.requestJson("api/power-meters/shelly", decodeShellyDiscovery);
   }
+
+  startMeterPreview(settings: AppSettingsUpdate): Promise<MeterPreviewStart> {
+    return this.requestJson("api/power-meters/ocr-preview", (value) => value as MeterPreviewStart, { method: "POST", body: JSON.stringify(settings) });
+  }
+
+  stopMeterPreview(previewId: string): Promise<void> {
+    return this.requestEmpty(`api/power-meters/ocr-preview/${encodeURIComponent(previewId)}`, { method: "DELETE" });
+  }
+
+  preflightProbe(request: MeasurementRequest, step: string): Promise<LightLoadProbeReading> {
+    return this.requestJson(`api/preflight/probe?step=${encodeURIComponent(step)}`, (value) => value as LightLoadProbeReading, {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  preflightProbeComplete(
+    standbyAggregatePowerW: number,
+    points: NonNullable<PreflightResponse["light_load_probe"]>["points"],
+  ): Promise<NonNullable<PreflightResponse["light_load_probe"]>> {
+    return this.requestJson("api/preflight/probe/complete", (value) => value as NonNullable<PreflightResponse["light_load_probe"]>, {
+      method: "POST",
+      body: JSON.stringify({ standby_aggregate_power_w: standbyAggregatePowerW, points }),
+    });
+  }
+
+  estimate(request: MeasurementRequest): Promise<LightEstimate> {
+    return this.requestJson("api/estimate", (value) => value as LightEstimate, { method: "POST", body: JSON.stringify(request) });
+  }
+
+  getSessionLogs(sessionId: string, after = 0): Promise<LogEntry[]> {
+    const query = after > 0 ? `?after=${after}` : "";
+    return this.requestJson(`api/sessions/${encodeURIComponent(sessionId)}/logs${query}`, (value) => value as LogEntry[]);
+  }
+
+  previewMerge(left: string, right: string): Promise<MergePreview> {
+    return this.requestJson("api/sessions/merge/preview", (value) => value as MergePreview, {
+      method: "POST",
+      body: JSON.stringify({ left, right }),
+    });
+  }
+
+  mergeSessions(left: string, right: string): Promise<SessionSnapshot> {
+    return this.requestJson("api/sessions/merge", decodeSessionSnapshot, { method: "POST", body: JSON.stringify({ left, right }) });
+  }
+
+  editPlotPoint(sessionId: string, detail: PlotPointActionDetail): Promise<PlotCollection> {
+    return this.requestJson(`api/sessions/${encodeURIComponent(sessionId)}/plots/points`, decodePlots, {
+      method: "POST",
+      body: JSON.stringify({ point_id: detail.pointId, action: detail.action, watt: detail.watt }),
+    });
+  }
+
+  getOcrPreviewLabels(sessionId: string): Promise<string[]> {
+    return this.requestJson(`api/sessions/${encodeURIComponent(sessionId)}/ocr`, (value) => value as string[]);
+  }
+
 
   getEntityCatalog(): Promise<EntityCatalog> {
     return this.requestJson("api/entity-catalog", decodeEntityCatalog);

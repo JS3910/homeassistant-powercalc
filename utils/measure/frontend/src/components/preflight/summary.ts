@@ -1,7 +1,7 @@
+import { duration as formatDuration } from "../../utils/format";
 import { requestFieldValue } from "../../measurement/definition";
 import { summarize } from "../../power-meter/registry";
 import type { FormField, MeasureDefinition, MeasurementRequest, PreflightResponse } from "../../types";
-import { duration as formatDuration } from "../../utils/format";
 
 /** One labelled value on the review screen, as a headline metric or a summary row. */
 export interface LabelledValue {
@@ -18,11 +18,11 @@ export function reviewMetrics(
   if (!request || !preflight) return [];
   const { estimated_variations: variations, estimated_duration_seconds: seconds } = preflight;
   const metrics: LabelledValue[] =
-    variations == null && seconds == null
+    variations === undefined && seconds === undefined
       ? []
       : [
           { label: "Variations", value: String(variations ?? "—") },
-          { label: "Estimated time", value: seconds == null ? "—" : formatDuration(seconds) },
+          { label: "Estimated time", value: seconds === undefined ? "—" : formatDuration(seconds) },
         ];
   for (const [field, values] of multiSelections(request, definition)) {
     metrics.push({ label: field.label, value: String(values.length) });
@@ -33,6 +33,12 @@ export function reviewMetrics(
       { label: "Low-load checks", value: String(probe.checked_variations) },
       { label: "Lowest aggregate load", value: `${probe.minimum_aggregate_power_w.toFixed(3)} W` },
     );
+    if (probe.standby_aggregate_power_w != null) {
+      metrics.push({
+        label: "Standby",
+        value: `${probe.standby_aggregate_power_w.toFixed(3)} W`,
+      });
+    }
   }
   return metrics;
 }

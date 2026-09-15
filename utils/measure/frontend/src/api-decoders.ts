@@ -97,10 +97,21 @@ const isPowerMeterSpec: Guard<PowerMeterSpec> = (value): value is PowerMeterSpec
     case "dummy": return true;
     case "hass":
       return isString(value.entity_id) && optionalNullable(isString)(value.voltage_entity_id)
-        && optional(isBoolean)(value.call_update_entity);
+        && optional(isBoolean)(value.call_update_entity) && optionalNullable(isNumber)(value.max_age_seconds);
     case "shelly":
       return isString(value.device_ip) && optional(isString)(value.username) && optional(isNumber)(value.timeout);
     case "kasa": return isString(value.device_ip);
+    case "mystrom":
+    case "tasmota":
+      return isString(value.device_ip);
+    case "tuya":
+      return isString(value.device_id) && isString(value.device_ip) && optional(isString)(value.version);
+    case "owh98xx":
+      return isString(value.port) && isNumber(value.baudrate) && oneOf("1", "2")(value.channel);
+    case "ocr":
+      return true;
+    case "composite":
+      return isPowerMeterSpec(value.primary) && Array.isArray(value.witnesses);
     default: return false;
   }
 };
@@ -125,13 +136,16 @@ const isDummyLoadSpec: Guard<DummyLoadSpec> = (value): value is DummyLoadSpec =>
 
 const parameterNames = [
   "sleep_time", "sample_count", "sleep_time_sample", "max_retries", "max_nudges", "bri_bri_steps",
-  "ct_bri_steps", "ct_mired_steps", "hs_bri_steps", "hs_hue_steps", "hs_sat_steps", "min_brightness",
+  "ct_bri_steps", "hs_bri_steps", "min_brightness",
   "sleep_initial", "sleep_standby", "effect_bri_steps", "measure_time_effect", "measure_time_effect_min",
 ] as const;
 
 const isMeasurementParameters: Guard<Capabilities["defaults"]> = (value): value is Capabilities["defaults"] => {
   if (!recordOf((entry): entry is number | boolean => isNumber(entry) || isBoolean(entry))(value)) return false;
-  return parameterNames.every((name) => isNumber(value[name]));
+  if (!parameterNames.every((name) => isNumber(value[name]))) return false;
+  const hasDivisions = isNumber(value.ct_mired_divisions) && isNumber(value.hs_hue_divisions) && isNumber(value.hs_sat_divisions);
+  const hasSteps = isNumber(value.ct_mired_steps) && isNumber(value.hs_hue_steps) && isNumber(value.hs_sat_steps);
+  return hasDivisions || hasSteps;
 };
 
 export const isMeasurementRequest: Guard<MeasurementRequest> = (value): value is MeasurementRequest => {
@@ -142,9 +156,11 @@ export const isMeasurementRequest: Guard<MeasurementRequest> = (value): value is
     || !isString(value.measure_device)
     || !isBoolean(value.generate_model)
     || !isMeasurementParameters(value.parameters)
-    || !oneOf("new", "resume")(value.resume_policy)
+    || !oneOf("new", "resume", "extend")(value.resume_policy)
     || !isPowerMeterSpec(value.power_meter)
     || !optional(isString)(value.session_name)
+    || !optionalNullable(isString)(value.seed_session_id)
+    || !optional(isBoolean)(value.remeasure_existing)
     || !optionalNullable(isDummyLoadSpec)(value.dummy_load)) {
     return false;
   }
@@ -217,9 +233,14 @@ const isFormField = objectOf({
   same_device_only: optional(isBoolean),
   review: optional(isBoolean),
 });
+const measureParameterNames = [
+  ...parameterNames,
+  "ct_mired_divisions", "hs_hue_divisions", "hs_sat_divisions",
+  "ct_mired_steps", "hs_hue_steps", "hs_sat_steps",
+] as const;
 const isMeasureParameter = objectOf({
-  name: oneOf(...parameterNames), label: isString, hint: optional(isString), step: optional(isString),
-  group: optional(isString), requires_multiple: optionalNullable(oneOf(...parameterNames)),
+  name: oneOf(...measureParameterNames), label: isString, hint: optional(isString), step: optional(isString),
+  group: optional(isString), requires_multiple: optionalNullable(oneOf(...measureParameterNames)),
 });
 const isMeasureDefinition: Guard<MeasureDefinition> = objectOf({
   measure_type: oneOf("light", "speaker", "recorder", "average", "charging", "fan"),
@@ -246,7 +267,7 @@ const isAppSettings: Guard<AppSettings> = objectOf({
   default_contributor_name: optionalNullable(isString),
   default_contributor_github: optionalNullable(isString),
   default_contributor_email: optionalNullable(isString),
-  power_meter: nullable(oneOf("hass", "shelly", "kasa", "dummy")),
+  power_meter: nullable(oneOf("hass", "shelly", "kasa", "dummy", "mystrom", "tasmota", "tuya", "owh98xx", "ocr")),
   shelly_ip: nullable(isString),
   shelly_username: optional(isString),
   shelly_password_configured: optional(isBoolean),
@@ -360,39 +381,57 @@ const isSessionState = oneOf(
   "cancelled", "completed", "failed", "resumable",
 );
 const isSessionProgress = objectOf({
-  completed: isInteger, total: isInteger, skipped: isInteger, percent: isNumber,
-  estimated_remaining_seconds: nullable(isInteger),
+  completed: isInteger, total: isInteger, skipped: optional(isInteger), already_measured: optional(isInteger),
+  percent: optional(isNumber), elapsed_seconds: optionalNullable(isInteger),
+  estimated_remaining_seconds: optionalNullable(isInteger),
 });
 const isSessionSnapshot: Guard<SessionSnapshot> = objectOf({
   session_id: isString,
   state: isSessionState,
   can_analyse: isBoolean,
   created_at: isString, updated_at: isString, phase: nullable(isString),
+  activity_reason: optionalNullable(isString),
   confirmation_message: nullable(isString), confirmation_action: nullable(isString), mode: nullable(isString),
+  run_started_at: optionalNullable(isString), wait_ends_at: optionalNullable(isString), wait_seconds: optionalNullable(isNumber),
   progress: isSessionProgress, warnings: isStringArray, error: nullable(isString),
   summary: nullable(isStringRecord), request: isMeasurementRequest, operating_point: nullable(isOperatingPoint),
   calibration_sample: nullable(objectOf({ power: isNumber, resistance: isNumber, voltage: isNumber })),
   entity_states: isStringRecord,
+  sweep_coverage: optionalNullable(isUnknown),
 });
 const isSessionSummary: Guard<SessionSummary> = objectOf({
   session_id: isString,
   state: isSessionState,
   created_at: isString, updated_at: isString,
   measure_type: oneOf("light", "speaker", "recorder", "average", "charging", "fan"),
-  model_id: isString, product_name: isString, measure_device: isString, completed: isNumber, total: isNumber,
-  percent: isNumber, can_resume: isBoolean, file_count: isNumber, size: isNumber, active: isBoolean,
+  model_id: isString, product_name: isString, manufacturer: optional(isString), measure_device: isString,
+  completed: isNumber, total: isNumber, percent: isNumber, can_resume: isBoolean,
+  can_refine: optional(isBoolean), can_merge: optional(isBoolean), can_analyse: optional(isBoolean),
+  file_count: isNumber, size: isNumber, active: isBoolean,
+  family_key: optional(isString), modes: optional(isStringArray),
+  run_started_at: optionalNullable(isString), duration_seconds: optionalNullable(isInteger),
+  already_measured: optional(isNumber), measured: optional(isNumber), seed_session_id: optionalNullable(isString),
 });
 
 const isPlotCollection: Guard<PlotCollection> = objectOf({
   partial: isBoolean,
   plots: arrayOf(objectOf({
-    id: isString, title: isString, kind: oneOf("scatter", "line"), x_label: isString, y_label: isString,
-    source: isString, series: arrayOf(objectOf({
+    id: isString, title: isString, kind: oneOf("scatter", "line", "cylinder"), x_label: isString, y_label: isString,
+    source: isString,
+    x_min: optionalNullable(isNumber), x_max: optionalNullable(isNumber),
+    markers: optional(arrayOf(objectOf({ x: isNumber, label: isString }))),
+    series: arrayOf(objectOf({
       label: nullable(isString), color: nullable(isString),
-      points: arrayOf(objectOf({ x: isNumber, y: isNumber, color: nullable(isString) })),
+      points: arrayOf(objectOf({
+        x: isNumber, y: isNumber, color: nullable(isString),
+        inherited: optional(isBoolean), id: optionalNullable(isString), rail: optionalNullable(isString),
+        ignored: optional(isBoolean), editable: optional(isBoolean), interest: optionalNullable(isString),
+        z: optionalNullable(isNumber), stats: optional(arrayOf(objectOf({ label: isString, value: isString }))),
+      })),
     })),
   })),
   warnings: isStringArray,
+  editable: optional(isBoolean),
 });
 
 export const decodeCapabilities: Decoder<Capabilities> = decoder("capabilities", (value): value is Capabilities =>

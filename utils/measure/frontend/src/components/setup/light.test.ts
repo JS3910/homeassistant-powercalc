@@ -163,7 +163,7 @@ describe("setup view", () => {
     expect(element.shadowRoot.querySelector<HTMLDetailsElement>(".discovery-help")?.open).toBe(false);
     expect(element.shadowRoot.querySelectorAll('input[name="modes"]')).toHaveLength(1);
     expect(element.shadowRoot.querySelector('input[name="model_id"]')).toBeNull();
-    expect((element.shadowRoot.querySelector('input[name="multiple_light_count"]') as HTMLInputElement).value).toBe("2");
+    expect((element.shadowRoot.querySelector('input[name="multiple_light_count"]') as HTMLInputElement).value).toBe("3");
 
     const submitted = new Promise<MeasurementRequest>((resolve) => {
       element.addEventListener("preflight", (event) => resolve((event as CustomEvent<MeasurementRequest>).detail));
@@ -175,7 +175,7 @@ describe("setup view", () => {
     const request = await submitted;
     const lightRequest = request as Extract<MeasurementRequest, { measure_type: "light" }>;
     expect(lightRequest.controller).toEqual({ type: "hass_multi", entity_ids: ["light.one", "light.two"] });
-    expect(lightRequest.multiple_light_count).toBe(2);
+    expect(lightRequest.multiple_light_count).toBe(3);
     expect(lightRequest.model_id).toBe("LWA017");
   });
 
@@ -203,7 +203,7 @@ describe("setup view", () => {
     await element.updateComplete;
 
     expect(element.shadowRoot.querySelector(".multiple-lights")?.textContent).toContain("very low power use");
-    expect(element.shadowRoot.querySelector(".multiple-lights")?.textContent).toContain("Select up to three individual lights");
+    expect(element.shadowRoot.querySelector(".multiple-lights")?.textContent).toContain("There is no three-light limit");
     const groupGuide = element.shadowRoot.querySelector<HTMLAnchorElement>(
       '.multiple-lights a[href="https://www.home-assistant.io/integrations/group/"]',
     );

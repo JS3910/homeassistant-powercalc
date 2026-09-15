@@ -142,11 +142,11 @@ describe("measure app controller: boot", () => {
     await vi.waitFor(() => expect(appState.deviceEntityErrors.fan).toBe("Entity API failed"));
 
     onEvent?.({ sequence: 1, type: "sample", data: { power: 12.5 }, snapshot: { state: "running" } });
-    expect(appState.samples).toEqual([12.5]);
+    expect(appState.samples).toEqual([{ power: 12.5, at: undefined }]);
 
     const warning = "Discarding measurement: 0 watt was read from the power meter";
     onEvent?.({ sequence: 2, type: "warning", data: { message: warning }, snapshot: { state: "running", warnings: [warning] } });
-    expect(appState.logs).toEqual([warning]);
+    expect(appState.logs.map((entry) => (typeof entry === "string" ? entry : entry.message))).toEqual([warning]);
   });
 
 

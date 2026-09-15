@@ -5,11 +5,43 @@ import { keyed } from "lit/directives/keyed.js";
 import { MeasureApiClient, SessionEventStream } from "../../api-client";
 import { MeasureAppController } from "../../app-controller";
 import type { AppView, MeasureAppState } from "../../app-controller";
+import { createWindowHistory } from "../../app-history";
 
-import { reviewMetrics, reviewSummary } from "../preflight/summary";
 import { isAddressed, specFromRequest, specFromSettings } from "../../power-meter/registry";
 import type { MeterContext } from "../../power-meter/registry";
-import type { AppSettings, AppSettingsUpdate, Capabilities, ContributionAuthDeviceStatus, ContributionAuthState, ContributionDeviceFlow, ContributionFormValues, ContributionPreview, ContributionPreviewRequest, ContributionResult, ContributionSubmitRequest, DeviceSpecificationField, DummyLoadCalibration, EntityDescriptor, ErrorHelp, MeasureDefinition, MeasureType, MeasurementRequest, PlotCollection, PowerMeterSpec, PowerMeterDiagnostic, PreflightResponse, SessionFile, SessionSnapshot, SessionSummary, SettingsSection, ShellyDiscoveryDevice } from "../../types";
+import { reviewMetrics, reviewSummary } from "../preflight/summary";
+import type {
+  AppSettings,
+  AppSettingsUpdate,
+  Capabilities,
+  ContributionAuthDeviceStatus,
+  ContributionAuthState,
+  ContributionDeviceFlow,
+  ContributionFormValues,
+  ContributionPreview,
+  ContributionPreviewRequest,
+  ContributionResult,
+  ContributionSubmitRequest,
+  DeviceSpecificationField,
+  DummyLoadCalibration,
+  EntityDescriptor,
+  ErrorHelp,
+  LogEntry,
+  MeasureDefinition,
+  MeasureType,
+  MeasurementRequest,
+  PlotCollection,
+  PlotPointActionDetail,
+  PowerSample,
+  PowerMeterSpec,
+  PowerMeterDiagnostic,
+  PreflightResponse,
+  SessionFile,
+  SessionSnapshot,
+  SessionSummary,
+  SettingsSection,
+  ShellyDiscoveryDevice,
+} from "../../types";
 import { sharedStyles, themeStyles } from "../../styles";
 import { THEME_CHANGE_EVENT, applyDocumentTheme, nextThemePreference, readThemePreference, saveThemePreference } from "../../theme";
 import type { ThemePreference } from "../../theme";
@@ -43,15 +75,20 @@ const MEASUREMENT_STEPS: readonly { view: AppView; label: string }[] = [
  */
 @customElement("powercalc-measure-app")
 export class AppShell extends LitElement implements MeasureAppState {
+  @state()
+  private themePreference: ThemePreference = readThemePreference();
+  private readonly systemColorScheme = typeof matchMedia === "function"
+    ? matchMedia("(prefers-color-scheme: dark)")
+    : undefined;
   view: AppView = "loading";
   setupDraftVersion = 0;
   lastEventReceivedAt?: string;
+  lastAnalysedSessionId?: string;
   settingsSection?: SettingsSection;
-  loadingMessage = "Connecting to Home Assistant…";
   errorMessage = "";
   errorHelp?: ErrorHelp;
   busy = false;
-  lastAnalysedSessionId?: string;
+  busyDetail = "";
   connectedToEvents = false;
   snapshot?: SessionSnapshot;
   sessions: SessionSummary[] = [];
@@ -60,8 +97,9 @@ export class AppShell extends LitElement implements MeasureAppState {
   preflight?: PreflightResponse;
   files: SessionFile[] = [];
   plotCollection: PlotCollection = { partial: false, plots: [], warnings: [] };
-  logs: string[] = [];
-  samples: number[] = [];
+  ocrPreviewLabels: string[] = [];
+  logs: LogEntry[] = [];
+  samples: PowerSample[] = [];
   capabilities?: Capabilities;
   lights: EntityDescriptor[] = [];
   powers: EntityDescriptor[] = [];
@@ -96,64 +134,282 @@ export class AppShell extends LitElement implements MeasureAppState {
   shellyDiscoveryError = "";
   shellyDiscoveryAvailable?: boolean;
   shellyDiscoveryMessage?: string | null;
+  meterPreviewId: string | null = null;
+  meterPreviewLabels: string[] = [];
 
   private renderedView?: AppView;
-
-  @state()
-  private themePreference: ThemePreference = readThemePreference();
-
-  private readonly systemColorScheme = typeof matchMedia === "function"
-    ? matchMedia("(prefers-color-scheme: dark)")
-    : undefined;
 
   private readonly api: MeasureApiClient = new MeasureApiClient();
   private readonly controller = new MeasureAppController(
     this,
     () => this.api,
-    (sessionId, { onEvent, onConnection, onReconnect }) => new SessionEventStream(this.api.eventsUrl(sessionId), onEvent, onConnection, onReconnect),
+    (sessionId, { onEvent, onConnection, onReconnect }) =>
+      new SessionEventStream(
+        this.api.eventsUrl(sessionId),
+        onEvent,
+        onConnection,
+        onReconnect,
+      ),
     () => this.requestUpdate(),
+    createWindowHistory(),
   );
 
-  static readonly styles = [themeStyles, sharedStyles, css`
-    :host { display: block; min-height: 100vh; background: var(--canvas); }
-    .shell { width: min(1320px, calc(100% - 2rem)); margin: 0 auto; padding: clamp(1rem, 3vw, 2rem) 0 4rem; }
-    header { margin-bottom: clamp(1.5rem, 4vw, 2.5rem); }
-    .topbar { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding-bottom: 1rem; border-bottom: 1px solid var(--line); }
-    .brand { display: flex; align-items: center; gap: 0.7rem; min-height: 36px; padding: 0; border: 0; background: transparent; color: var(--muted); font: 700 0.72rem/1 ui-monospace, monospace; letter-spacing: 0.16em; text-transform: uppercase; }
-    .brand:hover:not(:disabled) { border-color: transparent; background: transparent; color: var(--ink); transform: none; }
-    .brand:active:not(:disabled) { transform: none; }
-    .brand-logo { width: 20px; height: 24px; object-fit: contain; }
-    .version { color: var(--muted); font: 500 0.68rem/1 ui-monospace, monospace; letter-spacing: normal; text-transform: none; white-space: nowrap; }
-    .intro { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 0.78fr); gap: 1.25rem clamp(1.5rem, 5vw, 4rem); align-items: end; padding-top: clamp(1.5rem, 4vw, 2.5rem); }
-    h1 { grid-column: 1 / -1; margin: 0; font-size: clamp(2rem, 3.4vw, 3rem); line-height: 1; letter-spacing: -0.04em; }
-    .subtitle { max-width: 540px; margin: 0.8rem 0 0; color: var(--muted); font-size: 1rem; line-height: 1.6; }
-    .intro.compact { display: block; padding-top: 1rem; }
-    .intro.compact h1, .intro.compact .subtitle { display: none; }
-    .intro.compact .sequence { max-width: 620px; }
-    .topbar-actions { display: flex; align-items: center; gap: 0.55rem; }
-    .topbar-action { min-height: 36px; padding: 0.4rem 0.8rem; border-radius: 999px; font: 700 0.72rem/1 ui-monospace, monospace; letter-spacing: 0.08em; text-transform: uppercase; display: inline-flex; align-items: center; gap: 0.45rem; }
-    .theme-toggle { width: 36px; padding: 0; justify-content: center; font-size: 1rem; letter-spacing: normal; }
-    .settings-toggle::before { content: "⚙"; font-size: 0.95rem; }
-    .sequence { margin: 0; padding: 0; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0.45rem; list-style: none; }
-    .sequence > li { position: relative; display: grid; gap: 0.45rem; min-width: 0; color: var(--muted); font: 700 0.68rem/1.15 ui-monospace, monospace; letter-spacing: 0.08em; text-transform: uppercase; }
-    .sequence > li:not(:last-child)::after { content: ""; position: absolute; top: 10px; left: calc(20px + 0.45rem); width: calc(100% - 40px - 0.45rem); height: 2px; border-radius: 99px; background: var(--line); }
-    .step-number { display: grid; place-items: center; width: 20px; height: 20px; border: 1px solid var(--line); border-radius: 50%; background: var(--canvas); color: var(--muted); font-size: 0.66rem; z-index: 1; }
-    .calibration-warning { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
-    .calibration-warning button { flex: 0 0 auto; }
-    .sequence > li.active { color: var(--ink); } .sequence > li.done { color: var(--signal-strong); }
-    .sequence > li.active .step-number { border-color: var(--signal); box-shadow: 0 0 0 4px color-mix(in srgb, var(--signal) 16%, transparent); color: var(--on-signal); background: var(--signal); }
-    .sequence > li.done .step-number { border-color: var(--signal); color: var(--on-signal); background: var(--signal); }
-    .sequence > li.done:not(:last-child)::after { background: var(--signal); }
-    .sequence > li::after { pointer-events: none; }
-    .step-link { display: grid; align-content: start; justify-items: start; gap: 0.45rem; min-width: 0; padding: 0; border: 0; border-radius: 4px; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; text-align: left; }
-    .step-link:hover:not(:disabled) { background: transparent; color: var(--ink); transform: none; }
-    .step-link:hover:not(:disabled) > span:last-child { text-decoration: underline; text-underline-offset: 0.2em; }
-    .loading { min-height: 260px; display: grid; place-items: center; text-align: center; }
-    .pulse { width: 40px; height: 40px; margin: 0 auto 1rem; border: 2px solid var(--line); border-top-color: var(--signal); border-radius: 50%; animation: spin 850ms linear infinite; }
-    footer { margin-top: 1rem; color: var(--muted); font-size: 0.72rem; text-align: right; }
-    @media (max-width: 700px) { .intro { grid-template-columns: 1fr; } h1 { grid-column: auto; } .sequence { max-width: 560px; } .calibration-warning { align-items: flex-start; flex-direction: column; } }
-    @media (max-width: 460px) { .shell { width: min(100% - 1.25rem, 980px); } .brand .version { display: none; } .topbar-action { padding-inline: 0.65rem; font-size: 0.66rem; } .sequence { gap: 0.3rem; } .sequence > li { font-size: 0.58rem; letter-spacing: 0.04em; } .sequence > li:not(:last-child)::after { left: calc(20px + 0.3rem); width: calc(100% - 40px - 0.3rem); } }
-  `];
+  static readonly styles = [
+    themeStyles,
+    sharedStyles,
+    css`
+      :host {
+        display: block;
+        min-height: 100vh;
+        background: var(--canvas);
+      }
+      .shell {
+        width: min(1320px, calc(100% - 2rem));
+        margin: 0 auto;
+        padding: clamp(1rem, 3vw, 2rem) 0 4rem;
+      }
+      header {
+        margin-bottom: 1rem;
+      }
+      .topbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+        padding-bottom: 1rem;
+        border-bottom: 1px solid var(--line);
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 0.7rem;
+        min-height: 36px;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        font:
+          700 0.72rem/1 ui-monospace,
+          monospace;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+      }
+      .brand:hover:not(:disabled) {
+        border-color: transparent;
+        background: transparent;
+        color: var(--ink);
+        transform: none;
+      }
+      .brand:active:not(:disabled) {
+        transform: none;
+      }
+      .brand-logo {
+        width: 20px;
+        height: 24px;
+        object-fit: contain;
+      }
+      .version {
+        color: var(--muted);
+        font:
+          500 0.68rem/1 ui-monospace,
+          monospace;
+        letter-spacing: normal;
+        text-transform: none;
+        white-space: nowrap;
+      }
+      header nav {
+        padding-top: 1rem;
+      }
+      .topbar-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.55rem;
+      }
+      .theme-toggle {
+        width: 36px;
+        padding: 0;
+        justify-content: center;
+        font-size: 1rem;
+        letter-spacing: normal;
+      }
+      .topbar-action {
+        min-height: 36px;
+        padding: 0.4rem 0.8rem;
+        border-radius: 999px;
+        font:
+          700 0.72rem/1 ui-monospace,
+          monospace;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+      }
+      .sessions-toggle::before {
+        content: "☰";
+        font-size: 0.95rem;
+        font-weight: 400;
+      }
+      .settings-toggle::before {
+        content: "⚙";
+        font-size: 0.95rem;
+      }
+      .sequence {
+        margin: 0;
+        padding: 0;
+        display: grid;
+        grid-auto-flow: column;
+        grid-auto-columns: minmax(0, 1fr);
+        gap: 0.45rem;
+        list-style: none;
+      }
+      .sequence > li {
+        position: relative;
+        display: grid;
+        gap: 0.45rem;
+        min-width: 0;
+        color: var(--muted);
+        font:
+          700 0.68rem/1.15 ui-monospace,
+          monospace;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .sequence > li:not(:last-child)::after {
+        content: "";
+        position: absolute;
+        top: 10px;
+        left: calc(20px + 0.45rem);
+        width: calc(100% - 40px - 0.45rem);
+        height: 2px;
+        border-radius: 99px;
+        background: var(--line);
+      }
+      .step-number {
+        display: grid;
+        place-items: center;
+        width: 20px;
+        height: 20px;
+        border: 1px solid var(--line);
+        border-radius: 50%;
+        background: var(--canvas);
+        color: var(--muted);
+        font-size: 0.66rem;
+        z-index: 1;
+      }
+      .calibration-warning {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        margin-bottom: 1rem;
+      }
+      .calibration-warning button {
+        flex: 0 0 auto;
+      }
+      .sequence > li.active {
+        color: var(--ink);
+      }
+      .sequence > li.done {
+        color: var(--signal-strong);
+      }
+      .sequence > li.active .step-number {
+        border-color: var(--signal);
+        box-shadow: 0 0 0 4px color-mix(in srgb, var(--signal) 16%, transparent);
+        color: var(--on-signal);
+        background: var(--signal);
+      }
+      .sequence > li.done .step-number {
+        border-color: var(--signal);
+        color: var(--on-signal);
+        background: var(--signal);
+      }
+      .sequence > li.done:not(:last-child)::after {
+        background: var(--signal);
+      }
+      .sequence > li::after {
+        pointer-events: none;
+      }
+      .step-link {
+        display: grid;
+        align-content: start;
+        justify-items: start;
+        gap: 0.45rem;
+        min-width: 0;
+        padding: 0;
+        border: 0;
+        border-radius: 4px;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        letter-spacing: inherit;
+        text-transform: inherit;
+        text-align: left;
+      }
+      .step-link:hover:not(:disabled) {
+        background: transparent;
+        color: var(--ink);
+        transform: none;
+      }
+      .step-link:hover:not(:disabled) > span:last-child {
+        text-decoration: underline;
+        text-underline-offset: 0.2em;
+      }
+      .loading {
+        min-height: 260px;
+        display: grid;
+        place-items: center;
+        text-align: center;
+      }
+      .pulse {
+        width: 40px;
+        height: 40px;
+        margin: 0 auto 1rem;
+        border: 2px solid var(--line);
+        border-top-color: var(--signal);
+        border-radius: 50%;
+        animation: spin 850ms linear infinite;
+      }
+      footer {
+        margin-top: 1rem;
+        color: var(--muted);
+        font-size: 0.72rem;
+        text-align: right;
+      }
+      @media (max-width: 700px) {
+        .sequence {
+          max-width: 560px;
+        }
+        .calibration-warning {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+      @media (max-width: 460px) {
+        .shell {
+          width: min(100% - 1.25rem, 980px);
+        }
+        .brand .version {
+          display: none;
+        }
+        .topbar-action {
+          padding-inline: 0.65rem;
+          font-size: 0.66rem;
+        }
+        .sequence {
+          gap: 0.3rem;
+        }
+        .sequence > li {
+          font-size: 0.58rem;
+          letter-spacing: 0.04em;
+        }
+        .sequence > li:not(:last-child)::after {
+          left: calc(20px + 0.3rem);
+          width: calc(100% - 40px - 0.3rem);
+        }
+      }
+    `,
+  ];
 
   connectedCallback(): void {
     super.connectedCallback();
@@ -161,7 +417,6 @@ export class AppShell extends LitElement implements MeasureAppState {
     this.systemColorScheme?.addEventListener("change", this.systemThemeChanged);
     void this.boot();
   }
-
   disconnectedCallback(): void {
     this.systemColorScheme?.removeEventListener("change", this.systemThemeChanged);
     this.controller.dispose();
@@ -184,11 +439,19 @@ export class AppShell extends LitElement implements MeasureAppState {
       <main class="shell">
         <header>
           <div class="topbar">
-            <button class="brand" type="button" aria-label="Open all measurement sessions" @click=${this.showSessions} ?disabled=${this.view === "loading"}>
+            <button
+              class="brand"
+              type="button"
+              aria-label="Open all measurement sessions"
+              @click=${this.showSessions}
+              ?disabled=${this.view === "loading"}
+            >
               <img class="brand-logo" src=${POWERCALC_LOGO_URL} alt="" />
               <span>Powercalc Measure</span>
               ${this.capabilities?.runtime_version
-                ? html`<span class="version">Version ${this.displayVersion()}</span>`
+                ? html`<span class="version"
+                    >Version ${this.displayVersion()}</span
+                  >`
                 : nothing}
             </button>
             <div class="topbar-actions">
@@ -196,34 +459,57 @@ export class AppShell extends LitElement implements MeasureAppState {
                 aria-label=${this.themeButtonLabel()} title=${this.themeButtonTitle()}>
                 <span aria-hidden="true">${themeIcon(this.themePreference)}</span>
               </button>
-              <button class="topbar-action sessions-toggle" type="button" @click=${this.showSessions} ?disabled=${this.view === "loading" || this.view === "sessions"}>All sessions</button>
-              <button class="topbar-action settings-toggle" type="button" @click=${this.openSettings} ?disabled=${this.view === "loading" || this.view === "settings"}>Settings</button>
+              <button
+                class="topbar-action sessions-toggle"
+                type="button"
+                @click=${this.showSessions}
+                ?disabled=${this.view === "loading" || this.view === "sessions"}
+              >
+                All sessions
+              </button>
+              <button
+                class="topbar-action settings-toggle"
+                type="button"
+                @click=${this.openSettings}
+                ?disabled=${this.view === "loading" || this.view === "settings"}
+              >
+                Settings
+              </button>
             </div>
           </div>
-          <div class="intro ${this.view === "sessions" ? "" : "compact"}">
-            <h1>Turn real watts into a precise profile.</h1>
-            <div>
-            <p class="subtitle">Configure, validate, and monitor a power measurement without leaving Home Assistant.</p>
-            </div>
-            ${this.renderProgress()}
-          </div>
+          ${this.renderProgress()}
         </header>
-        ${this.dummyLoadCalibrationError ? html`
-          <div class="notice calibration-warning" role="status">
-            <span>${this.dummyLoadCalibrationError}</span>
-            <button type="button" @click=${() => void this.controller.retryDummyLoadCalibration()}>Retry</button>
-          </div>
-        ` : nothing}
+        ${this.dummyLoadCalibrationError
+          ? html`
+              <div class="notice calibration-warning" role="status">
+                <span>${this.dummyLoadCalibrationError}</span>
+                <button
+                  type="button"
+                  @click=${() =>
+                    void this.controller.retryDummyLoadCalibration()}
+                >
+                  Retry
+                </button>
+              </div>
+            `
+          : nothing}
         ${keyed(this.setupDraftVersion, html`${cache(this.view === "setup" ? this.renderSetup() : nothing)}`)}
         ${this.view === "setup" ? nothing : this.renderView()}
-        <footer>You can close this page during a measurement. Keep the Powercalc Measure app running in Home Assistant.</footer>
+        <footer>
+          You can close this page during a measurement. Keep the Powercalc Measure app running in Home Assistant.
+        </footer>
       </main>
     `;
   }
 
   private renderLoading() {
-    return html`
-      <section class="panel loading" aria-live="polite"><div><div class="pulse" aria-hidden="true"></div><p>${this.loadingMessage}</p>${this.errorMessage ? this.renderRetry() : nothing}</div></section>`;
+    return html` <section class="panel loading" aria-live="polite">
+      <div>
+        <div class="pulse" aria-hidden="true"></div>
+        <p>Connecting to Home Assistant…</p>
+        ${this.errorMessage ? this.renderRetry() : nothing}
+      </div>
+    </section>`;
   }
 
   private displayVersion(): string {
@@ -231,99 +517,205 @@ export class AppShell extends LitElement implements MeasureAppState {
   }
 
   private renderRetry() {
-    return html`<p class="error" role="alert">${this.errorMessage}</p><button @click=${this.boot}>Retry</button>`;
+    return html`<p class="error" role="alert">${this.errorMessage}</p>
+      <button @click=${this.boot}>Retry</button>`;
   }
 
   private renderView() {
     switch (this.view) {
-      case "loading": return this.renderLoading();
-      case "settings": return this.renderSettings();
-      case "sessions": return this.renderSessions();
-      case "review": return this.preflight && this.request ? this.renderReview() : this.renderSetup();
-      case "running": return this.snapshot ? this.renderRunning(this.snapshot) : this.renderSetup();
-      case "result": return this.snapshot ? this.renderResult(this.snapshot) : this.renderSetup();
-      case "profile": return this.snapshot ? this.renderProfile(this.snapshot) : this.renderSetup();
-      case "submit": return this.snapshot ? this.renderSubmit(this.snapshot) : this.renderSetup();
-      default: return this.renderSetup();
+      case "loading":
+        return this.renderLoading();
+      case "settings":
+        return this.renderSettings();
+      case "sessions":
+        return this.renderSessions();
+      case "review":
+        return this.preflight && this.request
+          ? this.renderReview()
+          : this.renderSetup();
+      case "running":
+        return this.snapshot
+          ? this.renderRunning(this.snapshot)
+          : this.renderSetup();
+      case "result":
+        return this.snapshot
+          ? this.renderResult(this.snapshot)
+          : this.renderSetup();
+      case "profile":
+        return this.snapshot
+          ? this.renderProfilePrepare(this.snapshot)
+          : this.renderSetup();
+      case "submit":
+        return this.snapshot
+          ? this.renderProfileSubmit(this.snapshot)
+          : this.renderSetup();
+      default:
+        return this.renderSetup();
     }
   }
 
   private renderSettings() {
-    return html`
-      <measure-settings-view
-        .powers=${this.powers} .settings=${this.settings} .capabilities=${this.capabilities}
-        .measureDevices=${this.measureDevices} .measureDevicesLoading=${this.measureDevicesLoading} .measureDevicesError=${this.measureDevicesError}
-        .busy=${this.busy} .testing=${this.testingPowerMeter} .testResult=${this.powerMeterTestResult} .errorMessage=${this.errorMessage}
-        .shellyDiscoveryDevices=${this.shellyDiscoveryDevices} .discoveringShellys=${this.discoveringShellys}
-        .shellyDiscoveryError=${this.shellyDiscoveryError} .shellyDiscoveryAvailable=${this.shellyDiscoveryAvailable}
-        .shellyDiscoveryMessage=${this.shellyDiscoveryMessage}
-        .contributionAuth=${this.contributionAuth} .contributionDeviceFlow=${this.contributionDeviceFlow}
-        .contributionDeviceStatus=${this.contributionDeviceStatus} .contributionAuthBusy=${this.contributionAuthBusy}
-        .contributionAuthError=${this.contributionAuthError} .initialSection=${this.settingsSection}
-        @back=${() => this.controller.closeSettings()} @save=${(event: CustomEvent<AppSettingsUpdate>) => void this.controller.saveSettings(event.detail)}
-        @test=${(event: CustomEvent<AppSettingsUpdate>) => void this.controller.testPowerMeter(event.detail)} @test-clear=${() => this.controller.clearPowerMeterTestResult()}
-        @shelly-discover=${() => void this.controller.discoverShellys()} @github-device-start=${() => void this.controller.startContributionDeviceAuth()}
-        @github-token-save=${(event: CustomEvent<string>) => void this.controller.saveContributionToken(event.detail)}
-        @github-disconnect=${() => void this.controller.disconnectContributionAuth()}
-      ></measure-settings-view>`;
+    return html` <measure-settings-view
+      .powers=${this.powers}
+      .settings=${this.settings}
+      .capabilities=${this.capabilities}
+      .measureDevices=${this.measureDevices}
+      .measureDevicesLoading=${this.measureDevicesLoading}
+      .measureDevicesError=${this.measureDevicesError}
+      .busy=${this.busy}
+      .testing=${this.testingPowerMeter}
+      .testResult=${this.powerMeterTestResult}
+      .errorMessage=${this.errorMessage}
+      .shellyDiscoveryDevices=${this.shellyDiscoveryDevices}
+      .discoveringShellys=${this.discoveringShellys}
+      .shellyDiscoveryError=${this.shellyDiscoveryError}
+      .shellyDiscoveryAvailable=${this.shellyDiscoveryAvailable}
+      .shellyDiscoveryMessage=${this.shellyDiscoveryMessage}
+      .contributionAuth=${this.contributionAuth}
+      .contributionDeviceFlow=${this.contributionDeviceFlow}
+      .contributionDeviceStatus=${this.contributionDeviceStatus}
+      .contributionAuthBusy=${this.contributionAuthBusy}
+      .contributionAuthError=${this.contributionAuthError}
+      .initialSection=${this.settingsSection}
+      .meterPreviewId=${this.meterPreviewId}
+      .meterPreviewLabels=${this.meterPreviewLabels}
+      @back=${() => this.controller.closeSettings()}
+      @save=${(event: CustomEvent<AppSettingsUpdate>) =>
+        void this.saveSettingsAndSyncDraft(event.detail)}
+      @test=${(event: CustomEvent<AppSettingsUpdate>) =>
+        void this.controller.testPowerMeter(event.detail)}
+      @test-clear=${() => this.controller.clearPowerMeterTestResult()}
+      @ocr-preview-start=${(event: CustomEvent<AppSettingsUpdate>) =>
+        void this.controller.startMeterPreview(event.detail)}
+      @ocr-preview-stop=${() => this.controller.stopMeterPreview()}
+      @ocr-preview-reconnect=${() =>
+        void this.controller.reconnectMeterPreview()}
+      @shelly-discover=${() => void this.controller.discoverShellys()}
+      @github-device-start=${() =>
+        void this.controller.startContributionDeviceAuth()}
+      @github-token-save=${(event: CustomEvent<string>) =>
+        void this.controller.saveContributionToken(event.detail)}
+      @github-disconnect=${() =>
+        void this.controller.disconnectContributionAuth()}
+    ></measure-settings-view>`;
   }
 
   private renderSessions() {
-    return html`
-      <measure-sessions-view
-        .sessions=${this.sessions} .busy=${this.busy} .errorMessage=${this.errorMessage}
-        .diagnosticsUrl=${(sessionId: string) => this.api.diagnosticsUrl(sessionId)}
-        @new=${() => this.controller.newMeasurement()} @open=${(event: CustomEvent<string>) => void this.controller.openSession(event.detail)}
-        @resume=${(event: CustomEvent<string>) => void this.controller.resumeSession(event.detail)}
-        @duplicate=${(event: CustomEvent<string>) => void this.controller.duplicateSession(event.detail)}
-        @delete=${(event: CustomEvent<string>) => void this.controller.deleteSession(event.detail)}
-      ></measure-sessions-view>`;
+    return html` <measure-sessions-view
+      .sessions=${this.sessions}
+      .busy=${this.busy}
+      .errorMessage=${this.errorMessage}
+      .diagnosticsUrl=${(sessionId: string) =>
+        this.api.diagnosticsUrl(sessionId)}
+      @new=${() => this.controller.newMeasurement()}
+      @open=${(event: CustomEvent<string>) =>
+        void this.controller.openSession(event.detail)}
+      @resume=${(event: CustomEvent<string>) =>
+        void this.controller.resumeSession(event.detail)}
+      @duplicate=${(event: CustomEvent<string>) =>
+        void this.controller.duplicateSession(event.detail)}
+      @refine=${(event: CustomEvent<string>) =>
+        void this.controller.refineSession(event.detail)}
+      @delete=${(event: CustomEvent<string>) =>
+        void this.controller.deleteSession(event.detail)}
+    ></measure-sessions-view>`;
   }
 
   private renderReview() {
     const definition = this.activeDefinition();
-    return html`
-      <measure-preflight-view
-        .metrics=${reviewMetrics(this.request, this.preflight, definition)}
-        .summary=${reviewSummary(this.request, this.preflight, definition)}
-        .warnings=${this.preflight?.warnings ?? []} .powerMeterDiagnostic=${this.preflight?.power_meter_diagnostic}
-        .lightLoadProbe=${this.preflight?.light_load_probe}
-        .confirmationAction=${this.confirmationAction()}
-        .busy=${this.busy} .errorMessage=${this.errorMessage} .errorHelp=${this.errorHelp}
-        @back=${() => this.controller.backToSetup()} @start=${() => void this.controller.start()}
-      ></measure-preflight-view>`;
+    return html` <measure-preflight-view
+      .metrics=${reviewMetrics(this.request, this.preflight, definition)}
+      .summary=${reviewSummary(this.request, this.preflight, definition)}
+      .warnings=${this.preflight?.warnings ?? []}
+      .powerMeterDiagnostic=${this.preflight?.power_meter_diagnostic}
+      .lightLoadProbe=${this.preflight?.light_load_probe}
+      .confirmationAction=${this.confirmationAction()}
+      .busy=${this.busy}
+      .errorMessage=${this.errorMessage}
+      .errorHelp=${this.errorHelp}
+      .meterPreviewId=${this.meterPreviewId}
+      .meterPreviewLabels=${this.meterPreviewLabels}
+      @back=${() => this.controller.backToSetup()}
+      @start=${() => void this.controller.start()}
+      @ocr-preview-reconnect=${() =>
+        void this.controller.reconnectMeterPreview()}
+    ></measure-preflight-view>`;
   }
 
   private renderRunning(snapshot: SessionSnapshot) {
-    return html`
-      <measure-running-view
-        .snapshot=${snapshot} .confirmationAction=${this.confirmationAction()} .warningConfirmation=${this.confirmationIsWarning()}
-        .connected=${this.connectedToEvents} .logs=${this.logs} .samples=${this.samples}
-        .lastEventReceivedAt=${this.lastEventReceivedAt}
-        .diagnosticsUrl=${this.api.diagnosticsUrl(snapshot.session_id ?? "")} .busy=${this.busy}
-        @cancel=${() => void this.controller.cancel()} @confirm=${() => void this.controller.confirm()}
-      ></measure-running-view>`;
+    return html` <measure-running-view
+      .snapshot=${snapshot}
+      .confirmationAction=${this.confirmationAction()}
+      .warningConfirmation=${this.confirmationIsWarning()}
+      .connected=${this.connectedToEvents}
+      .lastEventReceivedAt=${this.lastEventReceivedAt}
+      .logs=${this.logs}
+      .samples=${this.samples}
+      .plotCollection=${this.plotCollection}
+      .ocrPreviewLabels=${this.ocrPreviewLabels}
+      .diagnosticsUrl=${this.api.diagnosticsUrl(snapshot.session_id ?? "")}
+      .busy=${this.busy}
+      @cancel=${() => void this.controller.cancel()}
+      @confirm=${() => void this.controller.confirm()}
+      @plot-point-action=${(event: CustomEvent<PlotPointActionDetail>) =>
+        void this.controller.applyPlotPointAction(event.detail)}
+    ></measure-running-view>`;
   }
 
   private renderResult(snapshot: SessionSnapshot) {
     const sessionId = snapshot.session_id ?? "";
-    return html`
-      <measure-result-view
-        .snapshot=${snapshot} .files=${this.files} .plotCollection=${this.plotCollection}
-        .canPrepareProfile=${this.measurementType() !== "average"}
-        .fileUrl=${this.resultFileUrl} .downloadAll=${this.downloadAllFiles}
-        .inspectJsonFile=${this.inspectResultJsonFile}
-        .diagnosticsUrl=${this.api.diagnosticsUrl(sessionId)}
-        .busy=${this.busy} .canResume=${this.canResumeSession()} .canAnalyse=${Boolean(snapshot.can_analyse)}
-        .analysisComplete=${this.lastAnalysedSessionId === sessionId}
-        .errorMessage=${this.errorMessage} .errorHelp=${this.errorHelp}
-        @sessions=${this.showSessions} @new=${() => this.controller.newMeasurement()} @resume=${() => void this.controller.resume()}
-        @analyse=${() => void this.controller.analyseRecording()}
-        @prepare=${() => this.controller.openProfile()}
-      ></measure-result-view>`;
+    return html` <measure-result-view
+      .snapshot=${snapshot}
+      .files=${this.files}
+      .plotCollection=${this.plotCollection}
+      .canPrepareProfile=${this.measurementType() !== "average"}
+      .fileUrl=${this.resultFileUrl}
+      .downloadAll=${this.downloadAllFiles}
+      .inspectJsonFile=${this.inspectResultJsonFile}
+      .diagnosticsUrl=${this.api.diagnosticsUrl(sessionId)}
+      .busy=${this.busy}
+      .canResume=${this.canResumeSession()}
+      .canAnalyse=${Boolean(snapshot.can_analyse)}
+      .analysisComplete=${this.lastAnalysedSessionId === sessionId}
+      .canMerge=${this.currentSession()?.can_merge ?? false}
+      .canRefine=${this.currentSession()?.can_refine ?? false}
+      .measurementActive=${this.sessions.some((session) => session.active)}
+      .sessions=${this.sessions}
+      .previewMerge=${this.previewMerge}
+      .confirmMerge=${this.confirmMerge}
+      .contributionFormValues=${this.contributionFormValues ?? this.emptyContributionForm}
+      .errorMessage=${this.errorMessage}
+      .errorHelp=${this.errorHelp}
+      .contributionAuth=${this.contributionAuth}
+      .contributionDraft=${this.contributionDraft}
+      .contributionPreview=${this.contributionPreview}
+      .contributionResult=${this.contributionResult}
+      .contributionBusy=${this.contributionBusy}
+      .contributionError=${this.contributionError}
+      .contributionErrorField=${this.contributionErrorField}
+      .manufacturers=${this.manufacturers ?? []}
+      .measureDevices=${this.measureDevices}
+      .measureDevicesLoading=${this.measureDevicesLoading}
+      .measureDevicesError=${this.measureDevicesError}
+      .deviceSpecificationFields=${this.deviceSpecificationFields}
+      @sessions=${this.showSessions}
+      @new=${() => this.controller.newMeasurement()}
+      @resume=${() => void this.controller.resume()}
+      @analyse=${() => void this.controller.analyseRecording()}
+      @refine=${() => void this.refineOpenSession()}
+      @prepare=${() => this.controller.openProfile()}
+      @open-settings=${this.openSettings}
+      @contribution-preview=${(
+        event: CustomEvent<ContributionPreviewRequest>,
+      ) => void this.controller.previewContribution(event.detail)}
+      @contribution-submit=${(event: CustomEvent<ContributionSubmitRequest>) =>
+        void this.controller.submitContribution(event.detail)}
+      @plot-point-action=${(event: CustomEvent<PlotPointActionDetail>) =>
+        void this.controller.applyPlotPointAction(event.detail)}
+    ></measure-result-view>`;
   }
 
-  private renderProfile(snapshot: SessionSnapshot) {
+  private renderProfilePrepare(snapshot: SessionSnapshot) {
     return html`
       <measure-profile-prepare-view
         .snapshot=${snapshot}
@@ -342,7 +734,7 @@ export class AppShell extends LitElement implements MeasureAppState {
       ></measure-profile-prepare-view>`;
   }
 
-  private renderSubmit(snapshot: SessionSnapshot) {
+  private renderProfileSubmit(snapshot: SessionSnapshot) {
     return html`
       <measure-profile-submit-view
         .snapshot=${snapshot}
@@ -357,23 +749,43 @@ export class AppShell extends LitElement implements MeasureAppState {
   }
 
   private renderSetup() {
-    return html`
-      <measure-setup-view
-        .capabilities=${this.capabilities} .definitions=${this.definitions}
-        .lights=${this.lights} .powers=${this.powers} .voltages=${this.voltages}
-        .deviceEntities=${this.deviceEntities} .deviceEntityErrors=${this.deviceEntityErrors}
-        .initialType=${this.pendingType()} .initialRequest=${this.request}
-        .dummyLoadCalibration=${this.dummyLoadCalibration}
-        .meter=${this.meterSpec()}
-        .defaultMeasureDevice=${this.request?.measure_device ?? this.settings?.default_measure_device ?? ""}
-        .powerMeterConfigured=${this.powerMeterConfigured()}
-        .busy=${this.busy} .errorMessage=${this.errorMessage} .errorHelp=${this.errorHelp}
-        @preflight=${(event: CustomEvent<MeasurementRequest>) => void this.controller.preflight(event.detail)}
-        @measure-type-selected=${(event: CustomEvent<MeasureType>) => this.controller.selectMeasureType(event.detail)}
-        @entity-domains-requested=${(event: CustomEvent<string[]>) => this.controller.loadEntityDomains(event.detail)}
-        @use-current-settings=${this.useCurrentSettings}
-        @open-settings=${this.openSettings}
-      ></measure-setup-view>`;
+    return html` <measure-setup-view
+      .capabilities=${this.capabilities}
+      .definitions=${this.definitions}
+      .lights=${this.lights}
+      .powers=${this.powers}
+      .voltages=${this.voltages}
+      .deviceEntities=${this.deviceEntities}
+      .deviceEntityErrors=${this.deviceEntityErrors}
+      .initialType=${this.pendingType()}
+      .initialRequest=${this.request}
+      .dummyLoadCalibration=${this.dummyLoadCalibration}
+      .meter=${this.meterSpec()}
+      .defaultMeasureDevice=${this.request?.measure_device ??
+      this.settings?.default_measure_device ??
+      ""}
+      .powerMeterConfigured=${this.powerMeterConfigured()}
+      .busy=${this.busy}
+      .busyDetail=${this.busyDetail}
+      .errorMessage=${this.errorMessage}
+      .errorHelp=${this.errorHelp}
+      .meterPreviewId=${this.meterPreviewId}
+      .meterPreviewLabels=${this.meterPreviewLabels}
+      .loadEstimate=${(request: MeasurementRequest) =>
+        this.api.estimate(request)}
+      @remeasure-change=${(event: CustomEvent<boolean>) =>
+        this.controller.setRemeasureExisting(event.detail)}
+      @preflight=${(event: CustomEvent<MeasurementRequest>) =>
+        void this.controller.preflight(event.detail)}
+      @measure-type-selected=${(event: CustomEvent<MeasureType>) =>
+        this.controller.selectMeasureType(event.detail)}
+      @entity-domains-requested=${(event: CustomEvent<string[]>) =>
+        this.controller.loadEntityDomains(event.detail)}
+      @use-current-settings=${this.useCurrentSettings}
+      @open-settings=${this.openSettings}
+      @ocr-preview-reconnect=${() =>
+        void this.controller.reconnectMeterPreview()}
+    ></measure-setup-view>`;
   }
 
   /** The meter the setup form should start from: the draft's own, else the saved default. */
@@ -386,7 +798,9 @@ export class AppShell extends LitElement implements MeasureAppState {
   }
 
   private powerMeterConfigured(): boolean {
-    const device = this.request ? this.request.measure_device : this.settings?.default_measure_device;
+    const device = this.request
+      ? this.request.measure_device
+      : this.settings?.default_measure_device;
     if (!device) return false;
     if (!this.request && !this.settings?.power_meter) return false;
     return isAddressed(this.meterSpec());
@@ -397,7 +811,31 @@ export class AppShell extends LitElement implements MeasureAppState {
     const settings = this.settings;
     if (!settings) return;
     const spec = specFromSettings(settings, this.meterContext());
-    this.controller.replaceDraftEnvironment(spec, settings.default_measure_device ?? "");
+    this.controller.replaceDraftEnvironment(
+      spec,
+      settings.default_measure_device ?? "",
+    );
+  }
+
+  /**
+   * Saving Defaults from the setup view's own "Change power meter" link -- as opposed to the
+   * top-bar "Settings" button, or any other route into this same view -- only makes sense as an
+   * attempt to change *this* draft's meter: nothing else on that screen offers a way to touch
+   * meter config, and there is no other affordance there hinting that a save might apply to
+   * something other than the measurement currently being set up.
+   *
+   * Saving previously only persisted the app-wide default and left an existing draft's own
+   * `power_meter` (adopted from an earlier session -- see `specFromRequest`) untouched, so the
+   * save appeared to silently do nothing when reached this way. Re-running the same sync
+   * `useCurrentSettings()` already does, right after a save that returns to "setup", closes that
+   * gap without changing what a save does from any other entry point (the setup view isn't shown
+   * afterwards in those cases, so this is a no-op for them).
+   */
+  private async saveSettingsAndSyncDraft(
+    settings: AppSettingsUpdate,
+  ): Promise<void> {
+    await this.controller.saveSettings(settings);
+    if (this.view === "setup" && this.request) this.useCurrentSettings();
   }
 
   private pendingType(): MeasureType | undefined {
@@ -406,22 +844,38 @@ export class AppShell extends LitElement implements MeasureAppState {
   }
 
   private canResumeSession(): boolean {
-    const retained = this.sessions.find((session) => session.session_id === this.snapshot?.session_id);
+    const retained = this.currentSession();
     if (retained) return retained.can_resume;
     return this.activeDefinition()?.supports_resume ?? false;
   }
 
+  private currentSession(): SessionSummary | undefined {
+    return this.sessions.find(
+      (session) => session.session_id === this.snapshot?.session_id,
+    );
+  }
+
+  private refineOpenSession(): void {
+    const sessionId = this.snapshot?.session_id;
+    if (sessionId) void this.controller.refineSession(sessionId);
+  }
+
   /** The definition of the type being measured or configured, whichever the current view is about. */
   private activeDefinition(): MeasureDefinition | undefined {
-    const type = this.snapshot?.request?.measure_type ?? this.request?.measure_type;
-    return this.definitions.find((definition) => definition.measure_type === type);
+    const type =
+      this.snapshot?.request?.measure_type ?? this.request?.measure_type;
+    return this.definitions.find(
+      (definition) => definition.measure_type === type,
+    );
   }
 
   private confirmationAction(): string {
     const request = this.snapshot?.request ?? this.request;
-    return this.snapshot?.confirmation_action
-      ?? this.activeDefinition()?.confirmation_action
-      ?? (request?.dummy_load ? "Start measurement" : "");
+    return (
+      this.snapshot?.confirmation_action ??
+      this.activeDefinition()?.confirmation_action ??
+      (request?.dummy_load ? "Start measurement" : "")
+    );
   }
 
   private confirmationIsWarning(): boolean {
@@ -433,30 +887,109 @@ export class AppShell extends LitElement implements MeasureAppState {
     await this.controller.boot();
   }
 
-  private readonly resultFileUrl = (name: string): string => this.api.fileUrl(this.snapshot?.session_id ?? "", name);
+  private readonly emptyContributionForm: ContributionFormValues = {};
+
+  private readonly previewMerge = (rightId: string) =>
+    this.controller.previewMerge(rightId);
+
+  private readonly confirmMerge = (rightId: string) =>
+    this.controller.confirmMerge(rightId);
+
+  private readonly resultFileUrl = (name: string): string =>
+    this.api.fileUrl(this.snapshot?.session_id ?? "", name);
 
   private readonly inspectResultJsonFile = (name: string): Promise<unknown> =>
     this.api.getJsonFile(this.snapshot?.session_id ?? "", name);
 
-  private readonly preparedProfileUrl = (jobId: string): string => this.api.preparedProfileUrl(this.snapshot?.session_id ?? "", jobId);
+  private readonly preparedProfileUrl = (jobId: string): string =>
+    this.api.preparedProfileUrl(this.snapshot?.session_id ?? "", jobId);
 
   private readonly downloadAllFiles = (): void => {
     const sessionId = this.snapshot?.session_id;
     if (!sessionId) return;
-    for (const file of this.files) {
-      const anchor = document.createElement("a");
-      anchor.href = this.api.fileUrl(sessionId, file.name);
-      anchor.download = file.name.split("/").pop() ?? file.name;
-      anchor.rel = "noopener";
-      anchor.style.display = "none";
-      document.body.append(anchor);
-      anchor.click();
-      anchor.remove();
-    }
-  };
+    // Staggered, not a tight loop: clicking several download anchors back-to-back in the
+    // same tick is exactly what triggers Chrome/Firefox's "this site is trying to
+    // download multiple files" block after the first one or two -- which fails silently,
+    // with no error the app can catch, so a session with several output files (every
+    // color mode's own .csv/.csv.gz/.raw.jsonl) could quietly lose everything after the
+    // first couple to that browser-side throttle rather than any bug in what gets listed.
+    this.files.forEach((file, index) => {
+      setTimeout(() => {
+        const anchor = document.createElement("a");
+        anchor.href = this.api.fileUrl(sessionId, file.name);
+        anchor.download = file.name.split("/").pop() ?? file.name;
+        anchor.rel = "noopener";
+        anchor.style.display = "none";
+        document.body.append(anchor);
+        anchor.click();
+        anchor.remove();
+      }, index * 300);
+    });
+  }
 
   private showSessions(): void {
     void this.controller.showSessions();
+  }
+
+  /** Settings can be opened bare from the top bar, or aimed at a section by a view that links into it. */
+  private openSettings(event?: Event): void {
+    const detail = (event as CustomEvent | undefined)?.detail;
+    const section =
+      detail && typeof detail === "object" && "section" in detail
+        ? (detail as { section?: SettingsSection }).section
+        : undefined;
+    this.controller.openSettings(section);
+  }
+
+  private renderProgress() {
+    const current = this.currentStep();
+    if (current < 0) return nothing;
+    const steps =
+      this.measurementType() === "average"
+        ? MEASUREMENT_STEPS.slice(0, 4)
+        : MEASUREMENT_STEPS;
+    return html` <nav aria-label="Measurement progress">
+      <ol class="sequence">
+        ${steps.map(({ view, label }, index) => {
+          const content = html`<span class="step-number"
+              >${index < current ? "✓" : index + 1}</span
+            ><span>${label}</span>`;
+          const canGoBack =
+            (view === "result" &&
+              (this.view === "profile" || this.view === "submit")) ||
+            (view === "profile" && this.view === "submit");
+          return html` <li
+            class=${stepClass(index, current)}
+            aria-current=${index === current ? "step" : nothing}
+          >
+            ${canGoBack
+              ? html`<button
+                  type="button"
+                  class="step-link"
+                  aria-label=${label}
+                  ?disabled=${this.busy || this.contributionBusy}
+                  @click=${() =>
+                    view === "result"
+                      ? this.controller.backToResult()
+                      : this.controller.backToProfile()}
+                >
+                  ${content}
+                </button>`
+              : content}
+          </li>`;
+        })}
+      </ol>
+    </nav>`;
+  }
+
+  /** Index within the measurement flow, or -1 for a view outside it. */
+  private currentStep(): number {
+    return MEASUREMENT_STEPS.findIndex((step) => step.view === this.view);
+  }
+
+  private measurementType(): MeasureType | undefined {
+    if (this.view === "setup") return this.pendingType();
+    return this.snapshot?.request?.measure_type ?? this.pendingType();
   }
 
   private readonly cycleTheme = (): void => {
@@ -483,62 +1016,18 @@ export class AppShell extends LitElement implements MeasureAppState {
   private themeButtonTitle(): string {
     return `Color theme: ${themeLabel(this.themePreference)}`;
   }
+}
 
-  /** Settings can be opened bare from the top bar, or aimed at a section by a view that links into it. */
-  private openSettings(event?: Event): void {
-    const detail = (event as CustomEvent | undefined)?.detail;
-    const section = detail && typeof detail === "object" && "section" in detail
-      ? (detail as { section?: SettingsSection }).section
-      : undefined;
-    this.controller.openSettings(section);
-  }
+function themeLabel(preference: ThemePreference): string {
+  return preference === "system" ? "System" : preference === "light" ? "Light" : "Dark";
+}
 
-  private renderProgress() {
-    const current = this.currentStep();
-    if (current < 0) return nothing;
-    const steps = this.measurementType() === "average" ? MEASUREMENT_STEPS.slice(0, 4) : MEASUREMENT_STEPS;
-    return html`
-      <nav aria-label="Measurement progress">
-        <ol class="sequence">
-          ${steps.map(({ view, label }, index) => {
-            const content = html`<span class="step-number">${index < current ? "✓" : index + 1}</span><span>${label}</span>`;
-            const canGoBack = (view === "result" && (this.view === "profile" || this.view === "submit"))
-              || (view === "profile" && this.view === "submit");
-            return html`
-            <li class=${stepClass(index, current)} aria-current=${index === current ? "step" : nothing}>
-              ${canGoBack
-                ? html`<button type="button" class="step-link" aria-label=${label} ?disabled=${this.busy || this.contributionBusy}
-                    @click=${() => view === "result" ? this.controller.backToResult() : this.controller.backToProfile()}>${content}</button>`
-                : content}
-            </li>`;
-          })}
-        </ol>
-      </nav>`;
-  }
-
-  /** Index within the measurement flow, or -1 for a view outside it. */
-  private currentStep(): number {
-    return MEASUREMENT_STEPS.findIndex((step) => step.view === this.view);
-  }
-
-  private measurementType(): MeasureType | undefined {
-    if (this.view === "setup") return this.pendingType();
-    return this.snapshot?.request?.measure_type ?? this.pendingType();
-  }
+function themeIcon(preference: ThemePreference): string {
+  return preference === "system" ? "◐" : preference === "light" ? "☀" : "☾";
 }
 
 function stepClass(index: number, current: number): string {
   if (index === current) return "active";
   if (index < current) return "done";
   return "";
-}
-
-function themeLabel(preference: ThemePreference): string {
-  return preference[0]!.toUpperCase() + preference.slice(1);
-}
-
-function themeIcon(preference: ThemePreference): string {
-  if (preference === "light") return "☀";
-  if (preference === "dark") return "☾";
-  return "◐";
 }

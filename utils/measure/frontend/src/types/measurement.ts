@@ -1,9 +1,13 @@
 export type LutMode = "brightness" | "color_temp" | "hs" | "effect";
 export type DeviceClass = "power" | "voltage" | "battery";
 export type ChargingDeviceType = "vacuum_robot" | "lawn_mower_robot";
-export type ResumePolicy = "new" | "resume";
+export type ResumePolicy = "new" | "resume" | "extend";
 /** Derived from the spec union so a new meter variant automatically widens it. */
-export type PowerMeterType = PowerMeterSpec["type"];
+/** Derived from the spec union so a new meter variant automatically widens it. Excludes
+ * `composite`, which is not itself selectable as a meter — it emerges from configuring at
+ * least one witness alongside whichever of these is chosen as the primary. */
+export type PowerMeterType = SingleMeterSpec["type"];
+export type ResolutionAxis = "brightness" | "sat" | "hue" | "mired" | "kelvin";
 
 export type OperatingPoint =
   | { type: "light"; on: boolean; brightness?: number; color_temp_mired?: number; hue?: number; saturation?: number; effect?: string }
@@ -67,16 +71,45 @@ export interface MeasurementParameters {
   max_nudges: number;
   bri_bri_steps: number;
   ct_bri_steps: number;
-  ct_mired_steps: number;
+  ct_mired_divisions: number;
   hs_bri_steps: number;
-  hs_hue_steps: number;
-  hs_sat_steps: number;
+  hs_hue_divisions: number;
+  hs_sat_divisions: number;
   min_brightness: number;
+  max_brightness?: number;
+  min_kelvin?: number;
+  max_kelvin?: number;
+  min_sat?: number;
+  max_sat?: number;
+  min_hue?: number;
+  max_hue?: number;
   sleep_initial: number;
   sleep_standby: number;
+  settle_tolerance_pct?: number;
+  settle_tolerance_w?: number;
+  settle_window_seconds?: number;
+  settle_poll_interval_seconds?: number;
+  settle_min_wait?: number;
   effect_bri_steps: number;
   measure_time_effect: number;
   measure_time_effect_min: number;
+  bri_bri_bisection?: boolean;
+  ct_bri_bisection?: boolean;
+  hs_bri_bisection?: boolean;
+  effect_bri_bisection?: boolean;
+  bri_bri_all?: boolean;
+  ct_bri_all?: boolean;
+  hs_bri_all?: boolean;
+  effect_bri_all?: boolean;
+  ct_mired_all?: boolean;
+  hs_hue_all?: boolean;
+  hs_sat_all?: boolean;
+  brightness_descending?: boolean;
+  smart_sampling?: boolean;
+  smart_delta?: number;
+  smart_border_delta?: number;
+  smart_dart?: boolean;
+  smart_dart_min_delta?: number;
 }
 
 /** Name of a tuning parameter, so a lookup keyed by one cannot name a parameter that does not exist. */
@@ -172,6 +205,9 @@ export interface BaseMeasurementRequest {
   generate_model: boolean;
   parameters: MeasurementParameters;
   resume_policy: ResumePolicy;
+  seed_session_id?: string | null;
+  remeasure_existing?: boolean;
+  derived_from?: string[];
   power_meter: PowerMeterSpec;
   dummy_load?: DummyLoadSpec | null;
 }
@@ -193,11 +229,57 @@ export type AppMeasurementDefaults = Pick<
   "sleep_time" | "sample_count" | "sleep_time_sample" | "max_retries" | "max_nudges"
 >;
 
-export type PowerMeterSpec =
+export type SingleMeterSpec =
   | { type: "dummy" }
-  | { type: "hass"; entity_id: string; voltage_entity_id?: string | null; call_update_entity?: boolean }
+  | {
+      type: "hass";
+      entity_id: string;
+      voltage_entity_id?: string | null;
+      call_update_entity?: boolean;
+      max_age_seconds?: number | null;
+    }
   | { type: "shelly"; device_ip: string; username?: string; timeout?: number }
-  | { type: "kasa"; device_ip: string };
+  | { type: "kasa"; device_ip: string }
+  | { type: "mystrom"; device_ip: string }
+  | { type: "tasmota"; device_ip: string }
+  | { type: "tuya"; device_id: string; device_ip: string; version?: string }
+  | {
+      type: "owh98xx";
+      port: string;
+      baudrate: number;
+      timeout?: number;
+      channel: "1" | "2";
+    }
+  | {
+      type: "ocr";
+      source?: string;
+      layout?: string;
+      preview_host?: string;
+      preview_port?: number | null;
+      window_seconds?: number;
+      stale_after_seconds?: number;
+      crosscheck_tolerance_pct?: number;
+      min_current_for_crosscheck?: number;
+    };
+
+export type WitnessPosition = "none" | "before_primary" | "after_primary";
+
+export interface WitnessSpec {
+  meter: SingleMeterSpec;
+  position?: WitnessPosition;
+  offset_w?: number;
+  tolerance_w?: number;
+  tolerance_pct?: number;
+  required?: boolean;
+}
+
+export type CompositePowerMeterSpec = {
+  type: "composite";
+  primary: SingleMeterSpec;
+  witnesses: WitnessSpec[];
+};
+
+export type PowerMeterSpec = SingleMeterSpec | CompositePowerMeterSpec;
 
 export type LightControllerSpec =
   | { type: "dummy" }
@@ -215,6 +297,7 @@ export interface LightMeasurementRequest extends BaseMeasurementRequest {
   modes: LutMode[];
   gzip?: boolean;
   multiple_light_count: number;
+  rated_power_w?: number | null;
 }
 
 export interface AverageMeasurementRequest extends BaseMeasurementRequest { measure_type: "average"; controller?: null; duration: number; }
@@ -240,3 +323,64 @@ export type MeasurementRequest =
   | SpeakerMeasurementRequest
   | ChargingMeasurementRequest
   | FanMeasurementRequest;
+
+export interface LightModeEstimate {
+  mode: LutMode;
+  axes: Record<string, number>;
+  points: number;
+  summary: string;
+}
+
+export interface LightEstimate {
+  modes: LightModeEstimate[];
+  total_points: number;
+  estimated_duration_seconds: number | null;
+  max_duration_seconds: number | null;
+}
+
+export interface LightLoadProbeStep {
+  id: string;
+  kind: "standby" | "on";
+  label: string;
+  mode?: LutMode | null;
+}
+
+export interface LightLoadProbeReading {
+  id: string;
+  kind: "standby" | "on";
+  label: string;
+  power_w: number;
+  mode?: LutMode | null;
+}
+
+export type SweepTickStatus = "done" | "current" | "partial" | "pending" | "failed" | "inherited";
+
+export interface SweepTick {
+  value: number;
+  status: SweepTickStatus;
+}
+
+export interface SweepCoverage {
+  color_temp?: SweepTick[];
+  hue?: SweepTick[];
+  saturation?: SweepTick[];
+}
+
+export interface MergeModePreview {
+  kept: number;
+  added: number;
+  replaced: number;
+  replaced_reasons: Record<string, number>;
+}
+
+export interface MergePreview {
+  left: string;
+  right: string;
+  model_id_warning: boolean;
+  modes: Record<string, MergeModePreview>;
+}
+
+export interface PowerSample {
+  power: number;
+  at: string;
+}

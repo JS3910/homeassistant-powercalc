@@ -1,5 +1,6 @@
 import { css, html, nothing } from "lit";
-import { calibrationDate, resistance } from "../../utils/format";
+import { calibrationDate } from "../../utils/format";
+import { formText } from "../../utils/form";
 import type { DummyLoadCalibration, DummyLoadSpec } from "../../types";
 import { textField } from "../shared/fields";
 
@@ -58,6 +59,15 @@ export function defaultDummyLoadMode(calibration: DummyLoadCalibration | null): 
   return calibration ? "reuse" : "calibrate";
 }
 
+/** What the submitted form means for this measurement, or undefined when the load is not used. */
+export function dummyLoadSpec(form: FormData, calibration: DummyLoadCalibration | null): DummyLoadSpec | undefined {
+  if (!form.has("use_dummy_load")) return undefined;
+  if (form.get("dummy_load_mode") === "reuse" && calibration) {
+    return { mode: "reuse", description: calibration.description, resistance: calibration.resistance };
+  }
+  return { mode: "calibrate", description: formText(form, "dummy_load_description") };
+}
+
 function renderOptions({ calibration, stored, mode, onModeChange }: DummyLoadOptions) {
   return html`
     <div class="dummy-load-options">
@@ -89,7 +99,7 @@ function renderCalibrationChoice(
     <div class="calibration-card">
       <strong>${calibration.description}</strong>
       <span class="calibration-meta">
-        ${resistance(calibration.resistance)} Ω · calibrated ${calibrationDate(calibration.calibrated_at)}
+        ${calibration.resistance} Ω · calibrated ${calibrationDate(calibration.calibrated_at)}
       </span>
     </div>
     <div class="choice-list" role="radiogroup" aria-label="Dummy-load calibration">

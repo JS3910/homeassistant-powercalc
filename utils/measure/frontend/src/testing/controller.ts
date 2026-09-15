@@ -42,9 +42,10 @@ export function sessionSummary(overrides: Partial<SessionSummary> = {}): Session
 
 export function state(): MeasureAppState {
   return {
-    view: "loading", errorMessage: "", busy: false, connectedToEvents: false,
+    view: "loading", errorMessage: "", busy: false, busyDetail: "", connectedToEvents: false,
     sessions: [],
     files: [], plotCollection: { partial: false, plots: [], warnings: [] },
+    ocrPreviewLabels: [], meterPreviewId: null, meterPreviewLabels: [],
     logs: [], samples: [], lights: [], powers: [], voltages: [], definitions: [],
     dummyLoadCalibration: null, dummyLoadCalibrationError: "",
     measureDevices: [], measureDevicesLoading: false, measureDevicesError: "",
@@ -146,6 +147,16 @@ export function api(overrides: Partial<MeasureAppApi> = {}): MeasureAppApi {
       warnings: [],
     }),
     submitContribution: async () => ({ status: "success", pull_request_url: "https://github.com/pull/1" }),
+    startMeterPreview: async () => ({ preview_id: null, labels: [] }),
+    stopMeterPreview: async () => undefined,
+    preflightProbe: async () => ({ id: "standby", kind: "standby" as const, label: "Standby", power_w: 0 }),
+    preflightProbeComplete: async () => ({ checked_variations: 0, minimum_aggregate_power_w: 0, points: [] }),
+    estimate: async () => ({ modes: [], total_points: 0, estimated_duration_seconds: null, max_duration_seconds: null }),
+    getSessionLogs: async () => [],
+    previewMerge: async () => ({ left: "", right: "", model_id_warning: false, modes: {} }),
+    mergeSessions: async () => ({ state: "completed" as const }),
+    editPlotPoint: async () => ({ partial: false, plots: [], warnings: [] }),
+    getOcrPreviewLabels: async () => [],
     ...overrides,
   };
 }

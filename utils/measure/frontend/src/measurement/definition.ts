@@ -60,6 +60,14 @@ export function gatedParameters(definition: MeasureDefinition): ReadonlySet<stri
   return new Set(definition.fields.flatMap((field) => field.options.flatMap((option) => option.enables ?? [])));
 }
 
+/** Color modes that already sweep 0–100% brightness at every point they measure. */
+const COLOR_MODES_THAT_COVER_BRIGHTNESS = new Set(["color_temp", "hs"]);
+
+/** Whether a standalone brightness pass would be dropped next to these LUT modes. */
+export function colorModesCoverBrightness(selected: readonly string[]): boolean {
+  return selected.some((mode) => COLOR_MODES_THAT_COVER_BRIGHTNESS.has(mode));
+}
+
 /** Measurement parameters the currently selected options activate; the rest stay hidden. */
 export function enabledParameters(field: FormField, selected: readonly string[]): ReadonlySet<string> {
   return new Set(
