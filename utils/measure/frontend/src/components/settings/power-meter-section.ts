@@ -110,6 +110,11 @@ export class SettingsPowerMeterSection extends LitElement {
       shelly: () => this.renderShellyFields(),
       kasa: () => this.renderKasaFields(),
       dummy: () => nothing,
+      mystrom: () => nothing,
+      ocr: () => nothing,
+      owh98xx: () => nothing,
+      tasmota: () => nothing,
+      tuya: () => nothing,
     };
     return fields[type]();
   }

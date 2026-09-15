@@ -1203,69 +1203,6 @@ export class RunningView extends LitElement {
     );
   }
 
-  private renderChart() {
-    const points = this.powerSamples();
-    const watts = points.map((sample) => sample.power);
-    const latest = watts.at(-1) ?? 0;
-    const max = Math.max(...watts);
-    const min = Math.min(...watts);
-    const range = max - min || 1;
-    const times = points
-      .map((sample) => Date.parse(sample.at))
-      .filter((value) => Number.isFinite(value));
-    const start = times[0];
-    const end = times.at(-1);
-    const span = start != null && end != null ? Math.max(end - start, 1) : 0;
-    const point = (watt: number, index: number): [number, number] => {
-      const parsed = Date.parse(points[index]?.at ?? "");
-      const x =
-        span && Number.isFinite(parsed) && start != null
-          ? ((parsed - start) / span) * 100
-          : points.length === 1
-            ? 100
-            : (index / (points.length - 1)) * 100;
-      const y = 30 - ((watt - min) / range) * 28;
-      return [x, y];
-    };
-    const line = watts
-      .map((watt, index) =>
-        point(watt, index)
-          .map((value) => value.toFixed(2))
-          .join(","),
-      )
-      .join(" ");
-    const area = `0,32 ${line} 100,32`;
-    const startLabel =
-      start != null ? logTime(new Date(start).toISOString()) : "Start";
-    const endLabel = end != null ? logTime(new Date(end).toISOString()) : "Now";
-    return html`
-      <div class="chart">
-        <div class="chart-head">
-          <span>Live power</span>
-          <strong>${latest.toFixed(1)}<small>W</small></strong>
-        </div>
-        <div class="spark-wrap">
-          <svg
-            class="spark"
-            viewBox="0 0 100 32"
-            preserveAspectRatio="none"
-            role="img"
-            aria-label="Live power over time, currently ${latest.toFixed(1)} watt"
-          >
-            ${svg`<polygon class="area" points=${area} />`}
-            ${svg`<polyline class="line" points=${line} />`}
-          </svg>
-        </div>
-        <div class="chart-scale">
-          <span>${min.toFixed(1)} W</span><span>peak ${max.toFixed(1)} W</span>
-        </div>
-        <div class="chart-scale time">
-          <span>${startLabel}</span><span>${endLabel}</span>
-        </div>
-      </div>
-    `;
-  }
-
   private renderRunLayout(openEnded: boolean, progress: SessionProgress) {
     const sweeps = hasSweepAxes(this.snapshot.sweep_coverage)
       ? html`<div class="run-sweeps">

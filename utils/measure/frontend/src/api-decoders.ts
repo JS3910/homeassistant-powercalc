@@ -27,6 +27,7 @@ import type {
   SessionSnapshot,
   SessionSummary,
   ShellyDiscoveryResponse,
+  SweepCoverage,
 } from "./types";
 
 export type Decoder<T> = (value: unknown) => T;
@@ -232,6 +233,7 @@ const isFormField = objectOf({
   related_to: optionalNullable(isString),
   same_device_only: optional(isBoolean),
   review: optional(isBoolean),
+  step: optionalNullable(isString),
 });
 const measureParameterNames = [
   ...parameterNames,
@@ -241,6 +243,11 @@ const measureParameterNames = [
 const isMeasureParameter = objectOf({
   name: oneOf(...measureParameterNames), label: isString, hint: optional(isString), step: optional(isString),
   group: optional(isString), requires_multiple: optionalNullable(oneOf(...measureParameterNames)),
+  control: optional(oneOf("number", "boolean")),
+  bisection: optionalNullable(oneOf(...measureParameterNames)),
+  all_values: optionalNullable(oneOf(...measureParameterNames)),
+  sweep_label: optionalNullable(isString),
+  axis: optionalNullable(oneOf("brightness", "sat", "hue", "mired", "kelvin")),
 });
 const isMeasureDefinition: Guard<MeasureDefinition> = objectOf({
   measure_type: oneOf("light", "speaker", "recorder", "average", "charging", "fan"),
@@ -385,6 +392,15 @@ const isSessionProgress = objectOf({
   percent: optional(isNumber), elapsed_seconds: optionalNullable(isInteger),
   estimated_remaining_seconds: optionalNullable(isInteger),
 });
+const isSweepTick = objectOf({
+  value: isNumber,
+  status: oneOf("done", "current", "partial", "pending", "failed", "inherited"),
+});
+const isSweepCoverage: Guard<SweepCoverage> = objectOf({
+  color_temp: optional(arrayOf(isSweepTick)),
+  hue: optional(arrayOf(isSweepTick)),
+  saturation: optional(arrayOf(isSweepTick)),
+});
 const isSessionSnapshot: Guard<SessionSnapshot> = objectOf({
   session_id: isString,
   state: isSessionState,
@@ -397,7 +413,7 @@ const isSessionSnapshot: Guard<SessionSnapshot> = objectOf({
   summary: nullable(isStringRecord), request: isMeasurementRequest, operating_point: nullable(isOperatingPoint),
   calibration_sample: nullable(objectOf({ power: isNumber, resistance: isNumber, voltage: isNumber })),
   entity_states: isStringRecord,
-  sweep_coverage: optionalNullable(isUnknown),
+  sweep_coverage: optionalNullable(isSweepCoverage),
 });
 const isSessionSummary: Guard<SessionSummary> = objectOf({
   session_id: isString,

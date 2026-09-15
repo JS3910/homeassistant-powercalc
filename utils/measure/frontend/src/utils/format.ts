@@ -133,7 +133,7 @@ function formatOperatingActivity(point?: OperatingPoint | null): string | undefi
     : `Battery ${Math.round(point.battery_level)}%`;
 }
 
-function activityStage(phase?: string): string | undefined {
+function activityStage(phase?: string | null): string | undefined {
   if (!phase) return undefined;
   if (SMART_STAGES.has(phase)) return phase;
   if (phase.startsWith("Full-brightness warm-up")) {
@@ -155,7 +155,7 @@ function activityStage(phase?: string): string | undefined {
 
 /** Live running-view topline: sweep / stage and the current rail, not entity waits. */
 export function runningActivityLabel(input: {
-  phase?: string;
+  phase?: string | null;
   mode?: string | null;
   operating_point?: OperatingPoint | null;
 }): string {

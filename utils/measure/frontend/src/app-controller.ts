@@ -1073,7 +1073,7 @@ export class MeasureAppController {
   private consumeEvent(event: SessionEvent): void {
     if ((event.type === "log" || event.type === "warning" || event.type === "checkpoint") && event.data.message) {
       this.state.logs = mergeLogEntries(this.state.logs, [
-        { time: event.created_at, message: event.data.message, sequence: event.sequence },
+        { time: event.created_at ?? "", message: event.data.message, sequence: event.sequence },
       ]);
     }
     if (event.type === "sample" && typeof event.data.power === "number") {

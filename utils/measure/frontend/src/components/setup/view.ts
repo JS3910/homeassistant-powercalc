@@ -1137,7 +1137,9 @@ export class SetupView extends LitElement {
             Estimated time: ${duration(estimate.estimated_duration_seconds)}
           </p>`
         : nothing}
-      <p>Maximum time: ${duration(estimate.max_duration_seconds)}</p>
+      ${estimate.max_duration_seconds != null
+        ? html`<p>Maximum time: ${duration(estimate.max_duration_seconds)}</p>`
+        : nothing}
       ${estimate.estimated_from_runs
         ? html`<small class="field-hint"
             >${`Estimated from ${estimate.estimated_from_runs} previous ${estimate.estimated_from_runs === 1 ? "run" : "runs"} of this light and meter.`}</small

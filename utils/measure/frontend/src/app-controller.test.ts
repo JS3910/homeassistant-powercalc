@@ -170,6 +170,8 @@ function api(overrides: Partial<MeasureAppApi> = {}): MeasureAppApi {
     cancel: async () => ({ state: "cancelled" }),
     confirm: async () => ({ state: "running" }),
     resume: async () => ({ state: "running" }),
+    analyse: async () => ({ state: "completed" }),
+    getJsonFile: async () => ({}),
     previewMerge: async () => ({
       left: "",
       right: "",

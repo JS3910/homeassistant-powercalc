@@ -205,7 +205,6 @@ export class ResultPlot extends LitElement {
   private cylinderBri: number | null = null;
 
   private resizeObserver?: ResizeObserver;
-  private drawQueued = false;
   private displayedPlotCache: PlotSpec | null = null;
   private displayedPlotSource?: PlotSpec;
   private displayedPlotCacheKey = "";
@@ -495,9 +494,7 @@ export class ResultPlot extends LitElement {
     if (!this.isConnected || this.resizeObserver || typeof ResizeObserver === "undefined") return;
     const canvas = this.renderRoot.querySelector("canvas.plot") as HTMLCanvasElement | null;
     if (!canvas) return;
-    let lastWidth = canvas.clientWidth;
     this.resizeObserver = new ResizeObserver(() => {
-      lastWidth = canvas.clientWidth;
       this.draw();
     });
     this.resizeObserver.observe(canvas);
@@ -512,21 +509,6 @@ export class ResultPlot extends LitElement {
       if (key !== "editWatt") return true;
     }
     return false;
-  }
-
-  private scheduleDraw(): void {
-    if (this.drawQueued) return;
-    this.drawQueued = true;
-    const frame =
-      globalThis.requestAnimationFrame ??
-      ((callback: FrameRequestCallback) => {
-        callback(0);
-        return 0;
-      });
-    frame(() => {
-      this.drawQueued = false;
-      this.draw();
-    });
   }
 
   disconnectedCallback(): void {

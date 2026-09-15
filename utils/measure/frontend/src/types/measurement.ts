@@ -71,10 +71,13 @@ export interface MeasurementParameters {
   max_nudges: number;
   bri_bri_steps: number;
   ct_bri_steps: number;
-  ct_mired_divisions: number;
+  ct_mired_divisions?: number;
+  ct_mired_steps?: number;
   hs_bri_steps: number;
-  hs_hue_divisions: number;
-  hs_sat_divisions: number;
+  hs_hue_divisions?: number;
+  hs_hue_steps?: number;
+  hs_sat_divisions?: number;
+  hs_sat_steps?: number;
   min_brightness: number;
   max_brightness?: number;
   min_kelvin?: number;
@@ -154,6 +157,7 @@ export interface FormField {
   default?: PrimitiveValue;
   minimum?: number | null;
   maximum?: number | null;
+  step?: string | null;
   /** Whether several entities can be selected for this field at once. */
   multiple?: boolean;
   /** Label to use while several entities are selected. */
@@ -179,6 +183,11 @@ export interface MeasureParameter {
   group?: string;
   /** Only applies while the named parameter is greater than one. */
   requires_multiple?: MeasureParameterName | null;
+  control?: "number" | "boolean";
+  bisection?: MeasureParameterName | null;
+  all_values?: MeasureParameterName | null;
+  sweep_label?: string | null;
+  axis?: ResolutionAxis | null;
 }
 
 export interface MeasureDefinition {
@@ -334,8 +343,12 @@ export interface LightModeEstimate {
 export interface LightEstimate {
   modes: LightModeEstimate[];
   total_points: number;
-  estimated_duration_seconds: number | null;
+  total_readings?: number | null;
   max_duration_seconds: number | null;
+  used_default_range?: boolean;
+  remaining_points?: number | null;
+  estimated_duration_seconds?: number | null;
+  estimated_from_runs?: number | null;
 }
 
 export interface LightLoadProbeStep {
@@ -382,5 +395,5 @@ export interface MergePreview {
 
 export interface PowerSample {
   power: number;
-  at: string;
+  at?: string;
 }

@@ -30,6 +30,7 @@ export interface NumberFieldOptions {
   max?: number;
   step?: string;
   hint?: string;
+  detail?: string;
   required?: boolean;
   disabled?: boolean;
   onInput?: ((event: Event) => void) | null;
@@ -50,6 +51,49 @@ export function numberField(name: string, label: string, value: string, options:
       ?disabled=${disabled}
       @input=${onInput}
     />
+    ${fieldHint(hint)}
+  </label>`;
+}
+
+export function sliderNumberField(name: string, label: string, value: string, options: NumberFieldOptions = {}) {
+  const { min, max, step = "1", hint = "", detail = "", required = true, disabled = false, onInput = null } = options;
+  const sync = (event: Event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    const wrap = input.closest(".slider-number");
+    const slider = wrap?.querySelector<HTMLInputElement>('input[type="range"]');
+    const number = wrap?.querySelector<HTMLInputElement>('input[type="number"]');
+    if (slider && number && slider.value !== number.value) {
+      if (input === slider) number.value = slider.value;
+      else slider.value = number.value;
+    }
+    if (number && onInput) onInput({ currentTarget: number } as unknown as Event);
+  };
+  return html`<label class="slider-number">
+    <span>${label}</span>
+    <div class="slider-number-controls">
+      <input
+        type="range"
+        min=${min ?? nothing}
+        max=${max ?? nothing}
+        step=${step}
+        .value=${value}
+        ?disabled=${disabled}
+        aria-label=${label}
+        @input=${sync}
+      />
+      <input
+        type="number"
+        name=${name}
+        min=${min ?? nothing}
+        max=${max ?? nothing}
+        step=${step}
+        .value=${value}
+        ?required=${required}
+        ?disabled=${disabled}
+        @input=${sync}
+      />
+      ${detail ? html`<span class="slider-number-detail">${detail}</span>` : nothing}
+    </div>
     ${fieldHint(hint)}
   </label>`;
 }

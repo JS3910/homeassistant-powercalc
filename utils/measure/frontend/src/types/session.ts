@@ -24,8 +24,9 @@ export interface PreflightResponse {
   battery_level_attribute?: string | null;
   light_load_probe?: {
     checked_variations: number;
-    minimum_aggregate_power_w: number;
-    points: {
+      minimum_aggregate_power_w: number;
+      standby_aggregate_power_w?: number | null;
+      points: {
       label: string;
       mode: LutMode;
       power_w: number;

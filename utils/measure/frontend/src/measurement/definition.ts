@@ -202,7 +202,9 @@ function submittedParameters(definition: MeasureDefinition, form: FormData, capa
   const parameters = { ...capabilities.defaults };
   for (const { name } of definition.parameters) {
     const value = form.get(name);
-    if (typeof value === "string" && value !== "") parameters[name] = Number(value);
+    if (typeof value === "string" && value !== "") {
+      (parameters as Record<string, number | boolean | undefined>)[name] = Number(value);
+    }
   }
   return parameters;
 }
