@@ -22,11 +22,38 @@ class PowerMeter(ABC):
             reported_at=reading.updated,
         )
 
+    def close(self) -> None:  # noqa: B027 - optional lifecycle hook
+        """Release any background thread, socket, or connection this meter is holding.
+
+        Most adapters are stateless HTTP/HA calls with nothing to release, hence the
+        no-op default. OCR and any composite wrapping it are the exception: they own a
+        capture thread and an embedded preview HTTP server bound to a real port, which
+        must be freed before the same spec can be built again -- otherwise the next
+        attempt (a retry, or the app's own active-light preflight check followed by the
+        real run) fails with "Address already in use" instead of a fresh preview.
+        """
+
+    def recover(self) -> None:  # noqa: B027 - optional lifecycle hook
+        """Reconnect or refresh a stuck meter before the next retry.
+
+        Called by the measurement retry path after a read fails. Default is a no-op:
+        most adapters are stateless HTTP calls and the next ``get_power`` already
+        talks to the device. OCR reconnects the camera and forgets the display
+        location; Home Assistant pokes ``update_entity``; a composite forwards this
+        to every child.
+        """
+
 
 class PowerMeasurementResult(NamedTuple):
     power: float
     updated: float
     voltage: float | None = None
+    # Only the OCR meter populates these today, read straight off the display alongside
+    # power; every other adapter leaves them None rather than guessing. Additive fields --
+    # nothing reads them yet except the raw-samples diagnostics writer (see
+    # measure.runner.raw_sample_writer), so a meter that doesn't set them changes nothing.
+    current: float | None = None
+    power_factor: float | None = None
 
 
 @dataclass(frozen=True)

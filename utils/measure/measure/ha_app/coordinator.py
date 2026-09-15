@@ -1,5 +1,7 @@
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, replace
+import json
 import logging
 from pathlib import Path
 from threading import Lock, Thread
@@ -9,6 +11,7 @@ from uuid import uuid4
 
 from measure.analyser.execution import RecorderAnalysisExecution
 from measure.clock import utc_now
+from measure.controller.light.const import LutMode
 from measure.execution import MeasurementCancelledError, OperatingPoint
 from measure.ha_app.session import (
     ACTIVE_SESSION_STATES,
@@ -21,7 +24,17 @@ from measure.ha_app.session import (
     SessionState,
 )
 from measure.ha_app.storage import SESSION_LOAD_ERRORS, SessionStorage
-from measure.request import MeasurementRequest, RecorderMeasurementRequest, ResumePolicy
+from measure.model import write_model_json
+from measure.request import LightMeasurementRequest, MeasurementRequest, RecorderMeasurementRequest, ResumePolicy
+from measure.runner.light_plan import CSV_HEADERS
+from measure.runner.lut_csv import (
+    ModeUnionPreview,
+    concatenate_raw_jsonl,
+    load_mode_rows,
+    preview_union,
+    union_rows,
+    write_mode_csv,
+)
 from measure.runner.runner import RunnerResult
 
 _LOGGER = logging.getLogger("measure")
@@ -36,6 +49,10 @@ _ANALYSIS_WARNING_PREFIXES = (
 
 class SessionConflictError(Exception):
     """Raised when an operation conflicts with the active session state."""
+
+
+class MergeEligibilityError(Exception):
+    """Raised when two sessions cannot be merged."""
 
 
 @dataclass(frozen=True)
@@ -132,6 +149,8 @@ class MeasurementCoordinator:
                 raise SessionConflictError("Recording analysis is already active")
             if request.resume_policy == ResumePolicy.RESUME:
                 raise SessionConflictError("Use the resume action for persisted output")
+            if request.resume_policy == ResumePolicy.EXTEND:
+                self._require_extend_seed(request)
             now = utc_now()
             snapshot = SessionSnapshot(
                 id=str(uuid4()),
@@ -140,6 +159,8 @@ class MeasurementCoordinator:
                 updated_at=now,
             )
             self.storage.create(snapshot, request)
+            if request.resume_policy == ResumePolicy.EXTEND and request.seed_session_id:
+                self.storage.copy_lut_artifacts(request.seed_session_id, snapshot.id, request.model_id)
             self._snapshot = snapshot
             self._events = []
             self._last_snapshot_write = 0.0
@@ -162,14 +183,18 @@ class MeasurementCoordinator:
                 raise SessionConflictError("The requested session does not exist") from error
             if snapshot.state not in RESUMABLE_SESSION_STATES:
                 raise SessionConflictError("The requested session cannot be resumed")
-            if not self.storage.can_resume(snapshot.id):
-                raise SessionConflictError("The requested session has no compatible complete row to resume")
+            if not self.storage.can_resume(snapshot.id) and not self.storage.can_relaunch(snapshot.id):
+                raise SessionConflictError("The requested session has no compatible request to resume")
             self._snapshot = snapshot
             self._events = list(self.storage.load_events(snapshot.id))
             self.storage.set_current(snapshot.id)
-            request = self.storage.load_request(snapshot.id).model_copy(
-                update={"resume_policy": ResumePolicy.RESUME},
-            )
+            request = self.storage.load_request(snapshot.id)
+            # A crashed NEW session must become RESUME so the runner continues from
+            # the last cartesian row. EXTEND must stay EXTEND: the copied seed (and
+            # any refine progress) is a union that missing_variations can subtract
+            # from, but variations_after cannot look up.
+            if request.resume_policy != ResumePolicy.EXTEND:
+                request = request.model_copy(update={"resume_policy": ResumePolicy.RESUME})
             self._launch_locked(request)
             current = self._snapshot
         self._notify_listeners()
@@ -192,13 +217,11 @@ class MeasurementCoordinator:
                 snapshot = replace(
                     snapshot,
                     state=SessionState.CANCELLING,
-                    phase=(
-                        "Stopping measurement"
-                        if snapshot.mode in {"Averaging", "Recording"}
-                        else "Cancelling measurement"
-                    ),
+                    phase="Stopping measurement",
                     confirmation_message=None,
                     confirmation_action=None,
+                    wait_ends_at=None,
+                    wait_seconds=None,
                     updated_at=utc_now(),
                 )
                 self._snapshot = snapshot
@@ -223,6 +246,8 @@ class MeasurementCoordinator:
                 phase="Starting measurement",
                 confirmation_message=None,
                 confirmation_action=None,
+                wait_ends_at=None,
+                wait_seconds=None,
                 updated_at=utc_now(),
             )
             self._snapshot = running
@@ -230,6 +255,33 @@ class MeasurementCoordinator:
             self._control.continue_run()
         self._notify_listeners()
         return running
+
+    def request_shutdown_stop(self, timeout: float) -> None:
+        """Best-effort cooperative stop, called from the app's own shutdown hook.
+
+        A measurement is meant to run unattended for hours; the process it runs in can
+        still be stopped out from under it at any moment for reasons that have nothing to
+        do with the measurement -- an add-on update, a Supervisor cold-backup stopping
+        every add-on before it snapshots the filesystem, an OOM kill elsewhere freeing
+        memory. None of those are a reason to lose progress. Stopping cooperatively (the
+        same path the Stop button uses) gives the worker a chance to finish writing its
+        current row and land in the CANCELLED state -- which is always resumable -- instead
+        of being abandoned mid-write when the process actually exits a moment later.
+
+        This is genuinely best-effort: if the platform sends SIGKILL before ``timeout``
+        elapses (some fixed grace period the platform enforces, not this method), nothing
+        here runs at all and the next boot falls back to the ordinary crash-recovery path
+        in ``SessionStorage.load_current``.
+        """
+        with self._lock:
+            snapshot = self._snapshot
+            worker = self._worker
+        if snapshot is None or snapshot.state not in ACTIVE_SESSION_STATES:
+            return
+        with suppress(SessionConflictError):
+            self.cancel(snapshot.id)
+        if worker is not None:
+            worker.join(timeout=timeout)
 
     def delete(self, session_id: str) -> None:
         """Delete a terminal retained session."""
@@ -247,6 +299,212 @@ class MeasurementCoordinator:
                 self._snapshot = None
                 self._events = []
         self._notify_listeners()
+
+    def preview_merge(self, left_id: str, right_id: str) -> dict[str, object]:
+        """Return per-mode kept/added/replaced counts without writing a session."""
+        left_request, right_request, left_rows, right_rows = self._merge_sources(left_id, right_id)
+        modes = {
+            mode.value: {
+                "kept": preview.kept,
+                "added": preview.added,
+                "replaced": preview.replaced,
+                "replaced_reasons": preview.replaced_reasons,
+            }
+            for mode, preview in self._merge_mode_previews(left_rows, right_rows).items()
+        }
+        return {
+            "left": left_id,
+            "right": right_id,
+            "model_id_warning": left_request.model_id != right_request.model_id,
+            "modes": modes,
+        }
+
+    def merge(self, left_id: str, right_id: str) -> SessionSnapshot:
+        """Create a completed union session without taking the measurement slot."""
+        left_request, right_request, left_rows, right_rows = self._merge_sources(left_id, right_id)
+        left_snapshot = self.storage.load_snapshot(left_id)
+        right_snapshot = self.storage.load_snapshot(right_id)
+        later_id = right_id if right_snapshot.updated_at >= left_snapshot.updated_at else left_id
+        later_request = right_request if later_id == right_id else left_request
+        earlier_id = left_id if later_id == right_id else right_id
+        merged_request = later_request.model_copy(
+            update={
+                "modes": left_request.modes | right_request.modes,
+                "derived_from": (left_id, right_id),
+                "resume_policy": ResumePolicy.NEW,
+                "seed_session_id": None,
+                "remeasure_existing": False,
+            },
+        )
+        now = utc_now()
+        snapshot = SessionSnapshot(
+            id=str(uuid4()),
+            state=SessionState.COMPLETED,
+            created_at=now,
+            updated_at=now,
+            phase="Measurement completed",
+        )
+        with self._lock:
+            self.storage.create(snapshot, merged_request, set_current=False)
+        self._write_merge_artifacts(
+            snapshot.id,
+            merged_request,
+            later_id,
+            earlier_id,
+            left_id,
+            right_id,
+            left_rows,
+            right_rows,
+        )
+        files = self.storage.list_files(snapshot.id)
+        total = sum(len(union_rows(left_rows.get(mode, {}), right_rows.get(mode, {}))) for mode in CSV_HEADERS)
+        snapshot = replace(snapshot, files=files, completed=total, total=total, updated_at=utc_now())
+        self.storage.write_snapshot(snapshot)
+        return snapshot
+
+    def _require_extend_seed(self, request: MeasurementRequest) -> None:
+        if not isinstance(request, LightMeasurementRequest) or not request.seed_session_id:
+            raise SessionConflictError("Extend requires a light seed session")
+        try:
+            seed = self.storage.load_request(request.seed_session_id)
+        except SESSION_LOAD_ERRORS as error:
+            raise SessionConflictError("The seed session does not exist") from error
+        if not isinstance(seed, LightMeasurementRequest):
+            raise SessionConflictError("The seed session is not a light measurement")
+        if not self.storage.has_complete_lut_row(request.seed_session_id):
+            raise SessionConflictError("The seed session has no complete LUT row to extend")
+
+    def _merge_sources(
+        self,
+        left_id: str,
+        right_id: str,
+    ) -> tuple[
+        LightMeasurementRequest,
+        LightMeasurementRequest,
+        dict[LutMode, dict],
+        dict[LutMode, dict],
+    ]:
+        if left_id == right_id:
+            raise MergeEligibilityError("A session cannot be merged with itself")
+        left_request = self._require_mergeable_request(left_id)
+        right_request = self._require_mergeable_request(right_id)
+        with self._lock:
+            current = self._snapshot
+        for session_id in (left_id, right_id):
+            if current is not None and current.id == session_id and current.state in ACTIVE_SESSION_STATES:
+                raise SessionConflictError("An active measurement session cannot be merged")
+        left_rows = self._load_session_lut_rows(left_id, left_request)
+        right_rows = self._load_session_lut_rows(right_id, right_request)
+        if not any(left_rows.values()) or not any(right_rows.values()):
+            raise MergeEligibilityError("Each session must have at least one complete LUT row")
+        return left_request, right_request, left_rows, right_rows
+
+    def _require_mergeable_request(self, session_id: str) -> LightMeasurementRequest:
+        try:
+            request = self.storage.load_request(session_id)
+        except SESSION_LOAD_ERRORS as error:
+            raise MergeEligibilityError("The requested session does not exist") from error
+        if not isinstance(request, LightMeasurementRequest):
+            raise MergeEligibilityError("Only light sessions can be merged")
+        return request
+
+    def _load_session_lut_rows(
+        self,
+        session_id: str,
+        request: LightMeasurementRequest,
+    ) -> dict[LutMode, dict]:
+        artifact = self.storage.artifact_directory(session_id, request.model_id)
+        snapshot = self.storage.load_snapshot(session_id)
+        return {
+            mode: load_mode_rows(
+                artifact / f"{mode.value}.csv",
+                mode,
+                session_updated_at=snapshot.updated_at,
+            )
+            for mode in CSV_HEADERS
+        }
+
+    @staticmethod
+    def _merge_mode_previews(
+        left_rows: dict[LutMode, dict],
+        right_rows: dict[LutMode, dict],
+    ) -> dict[LutMode, ModeUnionPreview]:
+        previews: dict[LutMode, ModeUnionPreview] = {}
+        for mode in CSV_HEADERS:
+            left = left_rows.get(mode, {})
+            right = right_rows.get(mode, {})
+            if not left and not right:
+                continue
+            previews[mode] = preview_union(left, right)
+        return previews
+
+    def _write_merge_artifacts(
+        self,
+        session_id: str,
+        request: LightMeasurementRequest,
+        later_id: str,
+        earlier_id: str,
+        left_id: str,
+        right_id: str,
+        left_rows: dict[LutMode, dict],
+        right_rows: dict[LutMode, dict],
+    ) -> None:
+        destination = self.storage.artifact_directory(session_id, request.model_id)
+        destination.mkdir(parents=True, exist_ok=True)
+        later_request = self.storage.load_request(later_id)
+        earlier_request = self.storage.load_request(earlier_id)
+        assert isinstance(later_request, LightMeasurementRequest)
+        assert isinstance(earlier_request, LightMeasurementRequest)
+        later_artifact = self.storage.artifact_directory(later_id, later_request.model_id)
+        earlier_artifact = self.storage.artifact_directory(earlier_id, earlier_request.model_id)
+        for mode in CSV_HEADERS:
+            merged = union_rows(left_rows.get(mode, {}), right_rows.get(mode, {}))
+            if not merged:
+                continue
+            write_mode_csv(destination / f"{mode.value}.csv", mode, merged)
+            concatenate_raw_jsonl(
+                destination / f"{mode.value}.raw.jsonl",
+                earlier_artifact / f"{mode.value}.raw.jsonl",
+                later_artifact / f"{mode.value}.raw.jsonl",
+            )
+        self._write_merge_model_json(destination, request, later_artifact, earlier_artifact, left_id, right_id)
+
+    def _write_merge_model_json(
+        self,
+        destination: Path,
+        request: LightMeasurementRequest,
+        later_artifact: Path,
+        earlier_artifact: Path,
+        left_id: str,
+        right_id: str,
+    ) -> None:
+        source = later_artifact / "model.json"
+        if not source.is_file():
+            source = earlier_artifact / "model.json"
+        if source.is_file():
+            data = json.loads(source.read_text(encoding="utf-8"))
+            data["created_at"] = utc_now()
+            settings = data.get("measure_settings")
+            if not isinstance(settings, dict):
+                settings = {}
+                data["measure_settings"] = settings
+            settings["MERGED_FROM"] = [left_id, right_id]
+            (destination / "model.json").write_text(
+                json.dumps(data, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            return
+        write_model_json(
+            destination,
+            standby_power=0,
+            name=request.model_name or request.model_id,
+            measure_device=request.measure_device,
+            parameters=request.parameters,
+            extra_json_data={"device_type": "light", "calculation_strategy": "lut"},
+            extra_measure_settings={"MERGED_FROM": [left_id, right_id]},
+            num_lights=request.multiple_light_count,
+            power_meter=request.power_meter,
+        )
 
     def analyse(self, session_id: str) -> SessionSnapshot:
         """Rebuild analysis and profile output from a retained raw recording."""
@@ -319,8 +577,12 @@ class MeasurementCoordinator:
             confirmation_message=None,
             confirmation_action=None,
             calibration_sample=None,
+            run_started_at=None,
+            wait_ends_at=None,
+            wait_seconds=None,
             updated_at=utc_now(),
             error=None,
+            warnings=(),
         )
         self.storage.write_snapshot(self._snapshot)
         session_id = self._snapshot.id
@@ -351,8 +613,8 @@ class MeasurementCoordinator:
         except MeasurementCancelledError:
             self._finish(SessionState.CANCELLED)
         except Exception as error:
-            _LOGGER.exception("Measurement session %s failed", session_id)
             self._finish(SessionState.FAILED, error=str(error))
+            _LOGGER.exception("Measurement session %s failed", session_id)
         else:
             self._finish(SessionState.COMPLETED, summary=result.summary)
 
@@ -375,23 +637,28 @@ class MeasurementCoordinator:
                     completed=int(event.data["completed"]),
                     total=int(event.data["total"]),
                     skipped=int(event.data.get("skipped", 0)),
+                    already_measured=int(event.data.get("already_measured", 0)),
                     phase=str(event.data["mode"]),
                     mode=str(event.data["mode"]),
                     estimated_remaining=str(event.data["estimated_remaining"]),
+                    run_started_at=self._snapshot.run_started_at or event.created_at,
+                    wait_ends_at=None,
+                    wait_seconds=None,
+                    # A later accepted sample means whatever was in the banner has
+                    # already been recovered from (or was never blocking). Leaving it
+                    # up trains the operator to ignore the banner; the message itself
+                    # stays in the log feed either way.
+                    warnings=(),
                 )
             elif event.type == SessionEventType.PHASE:
-                self._snapshot = replace(
-                    self._snapshot,
-                    event_sequence=event.sequence,
-                    updated_at=event.created_at,
-                    phase=str(event.data["message"]),
-                )
+                self._snapshot = self._phase_snapshot(event)
             elif event.type == SessionEventType.OPERATING_POINT:
                 self._snapshot = replace(
                     self._snapshot,
                     event_sequence=event.sequence,
                     updated_at=event.created_at,
                     operating_point=cast(OperatingPoint, event.data),
+                    warnings=(),
                 )
             elif event.type == SessionEventType.WARNING:
                 self._snapshot = replace(
@@ -412,6 +679,8 @@ class MeasurementCoordinator:
                     phase="Waiting for confirmation",
                     confirmation_message=str(event.data["message"]),
                     confirmation_action=(str(event.data["action"]) if event.data.get("action") else None),
+                    wait_ends_at=None,
+                    wait_seconds=None,
                 )
             else:
                 self._snapshot = replace(
@@ -433,9 +702,29 @@ class MeasurementCoordinator:
 
     @staticmethod
     def _append_warning(warnings: tuple[str, ...], warning: str) -> tuple[str, ...]:
-        """Append a new user-facing warning while preserving distinct prior warnings."""
+        """Append a user-facing warning, collapsing duplicates and keeping the last 20."""
 
         return tuple(dict.fromkeys((*warnings, warning)))[-20:]
+
+    def _phase_snapshot(self, event: SessionEvent) -> SessionSnapshot:
+        """Apply a PHASE event. ``reason`` is only replaced when the event carries one."""
+
+        assert self._snapshot is not None
+        wait_seconds = event.data.get("wait_seconds")
+        wait_ends_at = event.data.get("wait_ends_at")
+        activity_reason = self._snapshot.activity_reason
+        if "reason" in event.data:
+            raw = event.data.get("reason")
+            activity_reason = str(raw) if raw else None
+        return replace(
+            self._snapshot,
+            event_sequence=event.sequence,
+            updated_at=event.created_at,
+            phase=str(event.data["message"]),
+            wait_seconds=float(wait_seconds) if wait_seconds is not None else None,
+            wait_ends_at=str(wait_ends_at) if wait_ends_at else None,
+            activity_reason=activity_reason,
+        )
 
     def _notify_checkpoint(self, event: SessionEvent) -> None:
         """Publish the state transition caused by an operator checkpoint."""
@@ -492,12 +781,14 @@ class MeasurementCoordinator:
                 self._snapshot,
                 state=state,
                 phase={
-                    SessionState.CANCELLED: "Measurement cancelled",
+                    SessionState.CANCELLED: "Measurement stopped",
                     SessionState.COMPLETED: "Measurement completed",
                     SessionState.FAILED: "Measurement failed",
                 }.get(state, self._snapshot.phase),
                 confirmation_message=None,
                 confirmation_action=None,
+                wait_ends_at=None,
+                wait_seconds=None,
                 updated_at=updated_at,
                 error=error,
                 files=files,

@@ -1,19 +1,36 @@
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from measure.controller.charging.spec import HassChargingControllerSpec
 from measure.controller.fan.spec import HassFanControllerSpec
 from measure.controller.light.const import LutMode
+from measure.controller.light.dummy import DummyLightController
 from measure.controller.light.spec import (
     DummyLightControllerSpec,
     HassLightControllerSpec,
     HassMultiLightControllerSpec,
 )
 from measure.controller.media.spec import HassMediaControllerSpec
-from measure.ha_app.preflight import ActiveSessionError, EntityRecord, MeasurementPreflight, PreflightError
+from measure.ha_app.preflight import (
+    ActiveSessionError,
+    EntityRecord,
+    HistoricalRunTiming,
+    MeasurementPreflight,
+    PreflightError,
+    estimate_light_measurement,
+    historical_seconds_per_point,
+)
 from measure.home_assistant_entities import DeviceClass
 from measure.powermeter.diagnostics import DiagnosticStatus, PowerMeterDiagnostic
-from measure.powermeter.spec import DummyPowerMeterSpec, HassPowerMeterSpec, ShellyPowerMeterSpec
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    DummyPowerMeterSpec,
+    HassPowerMeterSpec,
+    ManualPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    WitnessSpec,
+)
 from measure.request import (
     AverageMeasurementRequest,
     ChargingMeasurementRequest,
@@ -21,8 +38,11 @@ from measure.request import (
     FanMeasurementRequest,
     LightMeasurementRequest,
     RecorderMeasurementRequest,
+    ResumePolicy,
     SpeakerMeasurementRequest,
 )
+from measure.runner.light_plan import Variation
+from measure.runner.smart_envelope import estimate_smart_mode, phase_a_variations
 import pytest
 
 
@@ -49,6 +69,7 @@ def preflight(
     writable: bool = True,
     voltage_supported: bool | None = True,
     developer_mode: bool = True,
+    load_measured_variations: Callable[[str], Mapping[LutMode, Collection[Variation]]] | None = None,
 ) -> MeasurementPreflight:
     def verify() -> None:
         if not writable:
@@ -70,6 +91,7 @@ def preflight(
             message="Could not inspect voltage capability" if voltage_supported is None else None,
         ),
         developer_mode=developer_mode,
+        load_measured_variations=load_measured_variations,
     )
 
 
@@ -117,6 +139,66 @@ def test_preflight_rejects_missing_hass_power_entity_for_non_light_kind() -> Non
         checker.validate(request)
 
 
+def test_preflight_rejects_a_power_meter_type_the_app_cannot_build() -> None:
+    """Manual power meters block on a console prompt the app has no console to answer."""
+    request = AverageMeasurementRequest(power_meter=ManualPowerMeterSpec())
+    checker = preflight(base_entities())
+
+    with pytest.raises(PreflightError, match="not supported by the Home Assistant app"):
+        checker.validate(request)
+
+
+def test_preflight_accepts_a_composite_power_meter_with_a_hass_primary() -> None:
+    """A composite must not be rejected outright -- its primary drives whether it's supported."""
+    request = AverageMeasurementRequest(
+        power_meter=CompositePowerMeterSpec(
+            primary=HassPowerMeterSpec(entity_id="sensor.power"),
+            witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.168.1.50"))],
+        ),
+    )
+
+    assert preflight(base_entities()).validate(request).warnings == ()
+
+
+def test_preflight_rejects_a_composite_power_meter_whose_primary_is_unsupported() -> None:
+    request = AverageMeasurementRequest(
+        power_meter=CompositePowerMeterSpec(
+            primary=ManualPowerMeterSpec(),
+            witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.168.1.50"))],
+        ),
+    )
+    checker = preflight(base_entities())
+
+    with pytest.raises(PreflightError, match="not supported by the Home Assistant app"):
+        checker.validate(request)
+
+
+def test_preflight_rejects_a_missing_hass_power_entity_behind_a_composite_primary() -> None:
+    request = AverageMeasurementRequest(
+        power_meter=CompositePowerMeterSpec(
+            primary=HassPowerMeterSpec(entity_id="sensor.missing"),
+            witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.168.1.50"))],
+        ),
+    )
+    checker = preflight(base_entities())
+
+    with pytest.raises(PreflightError, match="power entity"):
+        checker.validate(request)
+
+
+def test_preflight_rejects_a_missing_hass_power_entity_behind_a_composite_witness() -> None:
+    request = AverageMeasurementRequest(
+        power_meter=CompositePowerMeterSpec(
+            primary=ShellyPowerMeterSpec(device_ip="192.168.1.50"),
+            witnesses=[WitnessSpec(meter=HassPowerMeterSpec(entity_id="sensor.missing"))],
+        ),
+    )
+    checker = preflight(base_entities())
+
+    with pytest.raises(PreflightError, match="power entity"):
+        checker.validate(request)
+
+
 def test_preflight_accepts_vacuum_recorder_with_same_device_battery() -> None:
     entities = base_entities()
     vacuum = Entity("vacuum.test", device_id="robot-device", domain="vacuum")
@@ -157,6 +239,28 @@ def test_preflight_accepts_playbook_recorder_without_entity_catalog() -> None:
     result = checker.validate(RecorderMeasurementRequest(power_meter=DummyPowerMeterSpec()))
 
     assert result.warnings == ()
+
+
+def test_preflight_can_skip_power_meter_diagnostic() -> None:
+    """Resume must not block on a live meter reading — OCR has no frame yet at boot."""
+
+    def fail(_: object) -> PowerMeterDiagnostic:
+        raise AssertionError("resume must not wait on a live meter reading")
+
+    checker = MeasurementPreflight(
+        has_active_session=lambda: False,
+        verify_storage=lambda: None,
+        load_entities=lambda domain, device_class: base_entities().get((domain, device_class), []),
+        diagnose_power_meter=fail,
+        developer_mode=True,
+    )
+
+    result = checker.validate(
+        RecorderMeasurementRequest(power_meter=DummyPowerMeterSpec()),
+        skip_power_meter_diagnostic=True,
+    )
+
+    assert result.power_meter_diagnostic is None
 
 
 def test_preflight_requires_entity_catalog_for_complex_recorder() -> None:
@@ -491,7 +595,7 @@ def test_light_preflight_uses_device_color_temperature_range() -> None:
         power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
         controller=HassLightControllerSpec(entity_id="light.test"),
         modes={LutMode.COLOR_TEMP},
-        parameters={"ct_bri_steps": 10, "ct_mired_steps": 10},
+        parameters={"ct_bri_steps": 10, "ct_mired_divisions": 10},
     )
 
     result = preflight(entities).validate(request)
@@ -520,7 +624,42 @@ def test_light_preflight_uses_default_color_temperature_resolution() -> None:
 
     result = preflight(entities).validate(request)
 
-    assert result.estimated_variations == 1_872
+    assert result.estimated_variations == 884
+
+
+def test_light_preflight_accepts_implied_brightness_when_only_color_temp_is_advertised() -> None:
+    """HA never lists literal brightness next to color_temp; the UI still checks it."""
+
+    entities = base_entities()
+    entities[("light", None)] = [Entity("light.test", [LutMode.COLOR_TEMP])]
+    request = LightMeasurementRequest(
+        model_id="LCT010",
+        product_name="Test light",
+        measure_device="Test meter",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=HassLightControllerSpec(entity_id="light.test"),
+        modes={LutMode.BRIGHTNESS, LutMode.COLOR_TEMP},
+    )
+
+    result = preflight(entities).validate(request)
+
+    assert result.supported_modes == (LutMode.COLOR_TEMP,)
+
+
+def test_light_preflight_names_the_mode_the_light_does_not_advertise() -> None:
+    entities = base_entities()
+    entities[("light", None)] = [Entity("light.test", [LutMode.BRIGHTNESS, LutMode.COLOR_TEMP])]
+    request = LightMeasurementRequest(
+        model_id="LCT010",
+        product_name="Test light",
+        measure_device="Test meter",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=HassLightControllerSpec(entity_id="light.test"),
+        modes={LutMode.COLOR_TEMP, LutMode.EFFECT},
+    )
+
+    with pytest.raises(PreflightError, match="does not advertise effect"):
+        preflight(entities).validate(request)
 
 
 def test_hs_preflight_uses_default_native_resolution() -> None:
@@ -537,7 +676,268 @@ def test_hs_preflight_uses_default_native_resolution() -> None:
 
     result = preflight(entities).validate(request)
 
-    assert result.estimated_variations == 2_025
+    assert result.estimated_variations == 1_080
+
+
+def test_estimate_light_measurement_breaks_down_axes_and_readings() -> None:
+    entities = base_entities()
+    entities[("light", None)] = [
+        Entity("light.test", [LutMode.COLOR_TEMP], min_mired=200, max_mired=300),
+    ]
+    request = LightMeasurementRequest(
+        model_id="LCT010",
+        product_name="Test light",
+        measure_device="Test meter",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=HassLightControllerSpec(entity_id="light.test"),
+        modes={LutMode.COLOR_TEMP},
+        parameters={"ct_bri_steps": 10, "ct_mired_divisions": 10, "sample_count": 2},
+    )
+
+    result = estimate_light_measurement(
+        request,
+        load_entities=lambda domain, device_class: entities.get((domain, device_class), []),
+    )
+
+    assert result.used_default_range is False
+    assert result.modes[0].mode == LutMode.COLOR_TEMP
+    assert result.modes[0].points == result.modes[0].axes["mired"] * result.modes[0].axes["brightness"]
+    assert result.total_points == result.modes[0].points
+    assert result.total_readings == result.total_points * 2
+    assert "kelvin" in result.modes[0].summary
+    assert result.max_duration_seconds > 0
+
+
+def test_estimate_smart_sampling_reports_discovery_and_a_coverage_cap() -> None:
+    request = LightMeasurementRequest(
+        model_id="dummy",
+        product_name="Virtual light",
+        measure_device="Test meter",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=DummyLightControllerSpec(),
+        modes={LutMode.COLOR_TEMP},
+        parameters={"smart_sampling": True, "smart_delta": 8},
+    )
+
+    result = estimate_light_measurement(request)
+
+    assert result.modes[0].axes["discovery"] == result.modes[0].points
+    assert result.modes[0].points > 4
+    assert result.modes[0].axes["coverage_cap"] > 0
+    assert result.total_points == result.modes[0].points + result.modes[0].axes["coverage_cap"]
+    assert "discovery" in result.modes[0].summary
+    assert result.max_duration_seconds > 0
+
+
+def test_estimate_smart_extend_counts_ramps_and_coverage_beyond_the_seed_outline() -> None:
+    request = LightMeasurementRequest(
+        model_id="dummy",
+        product_name="Virtual light",
+        measure_device="Test meter",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=DummyLightControllerSpec(),
+        modes={LutMode.COLOR_TEMP},
+        resume_policy=ResumePolicy.EXTEND,
+        seed_session_id="seed-session",
+        parameters={"smart_sampling": True, "smart_delta": 8},
+    )
+    light = DummyLightController().get_light_info()
+    outline = phase_a_variations(LutMode.COLOR_TEMP, request.parameters, light)
+    estimate = estimate_smart_mode(LutMode.COLOR_TEMP, request.parameters, light)
+    expected = estimate.discovery + estimate.coverage_cap - len(outline)
+
+    result = estimate_light_measurement(
+        request,
+        load_measured_variations=lambda _: {LutMode.COLOR_TEMP: set(outline)},
+        load_historical_runs=lambda: [
+            HistoricalRunTiming(
+                session_id="seed-session",
+                model_id="dummy",
+                measure_device="Test meter",
+                elapsed_seconds=900,
+                completed_points=100,
+                modes=frozenset({LutMode.COLOR_TEMP}),
+            )
+        ],
+    )
+
+    assert expected > 0
+    assert result.remaining_points == expected
+    assert result.total_points == expected
+    assert result.max_duration_seconds > 0
+    assert result.estimated_duration_seconds == expected * 9
+    assert result.estimated_from_runs == 1
+
+
+def test_estimate_smart_extend_remaining_grows_with_discovery_settings() -> None:
+    def remaining_for(ct_bri_steps: int) -> int:
+        request = LightMeasurementRequest(
+            model_id="dummy",
+            product_name="Virtual light",
+            measure_device="Test meter",
+            power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+            controller=DummyLightControllerSpec(),
+            modes={LutMode.COLOR_TEMP},
+            resume_policy=ResumePolicy.EXTEND,
+            seed_session_id="seed-session",
+            parameters={"smart_sampling": True, "ct_bri_steps": ct_bri_steps},
+        )
+        outline = phase_a_variations(
+            LutMode.COLOR_TEMP,
+            request.parameters,
+            DummyLightController().get_light_info(),
+        )
+        result = estimate_light_measurement(
+            request,
+            load_measured_variations=lambda _: {LutMode.COLOR_TEMP: set(outline)},
+        )
+        assert result.remaining_points is not None
+        return result.remaining_points
+
+    assert remaining_for(1) > remaining_for(5)
+
+
+def test_estimate_light_measurement_flags_the_default_range_without_a_light() -> None:
+    request = LightMeasurementRequest(
+        model_id="dummy",
+        product_name="Virtual light",
+        measure_device="Test meter",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=DummyLightControllerSpec(),
+        modes={LutMode.COLOR_TEMP},
+    )
+
+    result = estimate_light_measurement(request)
+
+    assert result.used_default_range is True
+    assert result.total_points > 0
+
+
+def test_estimate_extend_subtracts_seed_keys_without_changing_preflight() -> None:
+    request = LightMeasurementRequest(
+        model_id="dummy",
+        product_name="Virtual light",
+        measure_device="Test meter",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=DummyLightControllerSpec(),
+        modes={LutMode.BRIGHTNESS},
+        resume_policy=ResumePolicy.EXTEND,
+        seed_session_id="seed-session",
+    )
+
+    result = estimate_light_measurement(
+        request,
+        load_measured_variations=lambda _: {LutMode.BRIGHTNESS: {Variation(1)}},
+    )
+
+    assert result.remaining_points == 254
+    assert result.total_points == 254
+    assert result.total_readings is None
+    assert result.estimated_duration_seconds is None
+
+
+def test_historical_seconds_per_point_uses_matching_model_and_meter() -> None:
+    request = LightMeasurementRequest(
+        model_id="36871",
+        product_name="KAJPLATS",
+        measure_device="Zhurui PR10",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=DummyLightControllerSpec(),
+    )
+    matching = HistoricalRunTiming(
+        session_id="seed",
+        model_id="36871",
+        measure_device="Zhurui PR10",
+        elapsed_seconds=1800,
+        completed_points=200,
+        modes=frozenset({LutMode.HS}),
+    )
+    other_meter = HistoricalRunTiming(
+        session_id="other",
+        model_id="36871",
+        measure_device="Shelly",
+        elapsed_seconds=60,
+        completed_points=200,
+        modes=frozenset({LutMode.HS}),
+    )
+
+    rate = historical_seconds_per_point(request, [matching, other_meter])
+
+    assert rate == (9.0, 1)
+
+
+def test_historical_seconds_per_point_keeps_the_refine_seed_even_when_metadata_differs() -> None:
+    request = LightMeasurementRequest(
+        model_id="36871",
+        product_name="KAJPLATS",
+        measure_device="Zhurui PR10",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=DummyLightControllerSpec(),
+        resume_policy=ResumePolicy.EXTEND,
+        seed_session_id="seed",
+    )
+    seed = HistoricalRunTiming(
+        session_id="seed",
+        model_id="old-id",
+        measure_device="Old meter name",
+        elapsed_seconds=900,
+        completed_points=100,
+        modes=frozenset({LutMode.COLOR_TEMP}),
+    )
+
+    assert historical_seconds_per_point(request, [seed]) == (9.0, 1)
+
+
+def test_historical_seconds_per_point_ignores_effect_runs_unless_this_request_measures_effects() -> None:
+    request = LightMeasurementRequest(
+        model_id="36871",
+        product_name="KAJPLATS",
+        measure_device="Zhurui PR10",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=DummyLightControllerSpec(),
+        modes={LutMode.HS},
+    )
+    effect = HistoricalRunTiming(
+        session_id="fx",
+        model_id="36871",
+        measure_device="Zhurui PR10",
+        elapsed_seconds=3600,
+        completed_points=10,
+        modes=frozenset({LutMode.EFFECT}),
+    )
+
+    assert historical_seconds_per_point(request, [effect]) is None
+
+
+def test_estimate_uses_historical_rate_for_remaining_refine_points() -> None:
+    request = LightMeasurementRequest(
+        model_id="dummy",
+        product_name="Virtual light",
+        measure_device="Test meter",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=DummyLightControllerSpec(),
+        modes={LutMode.BRIGHTNESS},
+        resume_policy=ResumePolicy.EXTEND,
+        seed_session_id="seed-session",
+    )
+    history = HistoricalRunTiming(
+        session_id="seed-session",
+        model_id="dummy",
+        measure_device="Test meter",
+        elapsed_seconds=1270,
+        completed_points=254,
+        modes=frozenset({LutMode.BRIGHTNESS}),
+    )
+
+    result = estimate_light_measurement(
+        request,
+        load_measured_variations=lambda _: {LutMode.BRIGHTNESS: {Variation(1)}},
+        load_historical_runs=lambda: [history],
+    )
+
+    assert result.remaining_points == 254
+    assert result.estimated_from_runs == 1
+    assert result.estimated_duration_seconds == 1270
 
 
 def test_multi_light_preflight_uses_common_capabilities_and_models() -> None:
@@ -645,7 +1045,8 @@ def test_light_group_does_not_force_its_discovered_member_count() -> None:
         multiple_light_count=1,
     )
 
-    preflight(entities).validate(request)
+    result = preflight(entities).validate(request)
+    assert any("2 member lights" in warning for warning in result.warnings)
 
 
 def test_preflight_reports_active_session_before_external_checks() -> None:
@@ -670,3 +1071,52 @@ def test_non_hass_power_meter_does_not_require_power_entity() -> None:
     result = preflight({}).validate(request)
 
     assert result.warnings == ()
+
+
+def test_extend_preflight_subtracts_seed_keys_from_the_remaining_count() -> None:
+    request = LightMeasurementRequest(
+        model_id="dummy",
+        product_name="Virtual light",
+        measure_device="Test meter",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=DummyLightControllerSpec(),
+        modes={LutMode.BRIGHTNESS},
+        parameters={"sleep_time": 0.5, "sample_count": 2},
+        resume_policy=ResumePolicy.EXTEND,
+        seed_session_id="seed-session",
+    )
+    full = preflight(base_entities()).validate(
+        request.model_copy(update={"resume_policy": ResumePolicy.NEW, "seed_session_id": None}),
+    )
+    remaining = preflight(
+        base_entities(),
+        load_measured_variations=lambda _: {LutMode.BRIGHTNESS: {Variation(1)}},
+    ).validate(request)
+
+    assert full.estimated_variations == 255
+    assert remaining.estimated_variations == 254
+    assert remaining.estimated_duration_seconds is not None
+    assert full.estimated_duration_seconds is not None
+    assert remaining.estimated_duration_seconds < full.estimated_duration_seconds
+
+
+def test_extend_remeasure_preflight_keeps_the_full_count() -> None:
+    request = LightMeasurementRequest(
+        model_id="dummy",
+        product_name="Virtual light",
+        measure_device="Test meter",
+        power_meter=HassPowerMeterSpec(entity_id="sensor.power"),
+        controller=DummyLightControllerSpec(),
+        modes={LutMode.BRIGHTNESS},
+        parameters={"sleep_time": 0.5, "sample_count": 2},
+        resume_policy=ResumePolicy.EXTEND,
+        seed_session_id="seed-session",
+        remeasure_existing=True,
+    )
+
+    result = preflight(
+        base_entities(),
+        load_measured_variations=lambda _: {LutMode.BRIGHTNESS: {Variation(1)}},
+    ).validate(request)
+
+    assert result.estimated_variations == 255

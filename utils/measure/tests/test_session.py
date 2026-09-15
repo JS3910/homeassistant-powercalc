@@ -1,8 +1,29 @@
 from threading import Event, Thread
 
 from measure.execution import FanOperatingPoint, MeasurementCancelledError
-from measure.ha_app.session import SessionControl, SessionEvent, SessionEventType
+from measure.ha_app.session import (
+    PRE_DATA_SESSION_STATES,
+    SessionControl,
+    SessionEvent,
+    SessionEventType,
+    SessionSnapshot,
+    SessionState,
+    snapshot_progress_timing,
+)
 import pytest
+
+
+def test_pre_data_states_exclude_running_and_cancelling() -> None:
+    # RUNNING and CANCELLING can already have real (if partial) measurement data on disk
+    # -- only the states before the loop starts taking readings have nothing to plot yet.
+    assert SessionState.RUNNING not in PRE_DATA_SESSION_STATES
+    assert SessionState.CANCELLING not in PRE_DATA_SESSION_STATES
+    assert {
+        SessionState.IDLE,
+        SessionState.VALIDATING,
+        SessionState.READY,
+        SessionState.AWAITING_CONFIRMATION,
+    } == PRE_DATA_SESSION_STATES
 
 
 def test_cancel_is_idempotent_and_checkpoint_raises() -> None:
@@ -28,6 +49,21 @@ def test_events_are_sequenced_and_delivered() -> None:
     assert events[0].data == {"message": "Preparing measurement devices"}
     assert events[1].data["completed"] == 1
     assert events[1].data["skipped"] == 0
+
+
+def test_phase_event_includes_reason_only_when_given() -> None:
+    control = SessionControl()
+    events = []
+    control.subscribe(events.append)
+
+    control.phase("Discovering envelope", reason="Hardcoded 100% HS outline.")
+    control.phase("Full-brightness warm-up (1 of 2): sending command")
+
+    assert events[0].data == {
+        "message": "Discovering envelope",
+        "reason": "Hardcoded 100% HS outline.",
+    }
+    assert events[1].data == {"message": "Full-brightness warm-up (1 of 2): sending command"}
 
 
 def test_progress_event_includes_skipped_readings() -> None:
@@ -84,6 +120,59 @@ def test_entity_states_emits_latest_recorder_states() -> None:
 
     assert events[0].type == SessionEventType.ENTITY_STATES
     assert events[0].data == {"states": {"vacuum.robot": "cleaning", "sensor.robot_battery": "42"}}
+
+
+def test_snapshot_progress_timing_is_none_before_the_first_point() -> None:
+    snapshot = SessionSnapshot(
+        id="s",
+        state=SessionState.RUNNING,
+        created_at="2026-09-07T20:00:00Z",
+        updated_at="2026-09-07T20:00:00Z",
+    )
+    assert snapshot_progress_timing(snapshot) == (None, None)
+
+
+def test_snapshot_progress_timing_scales_remaining_from_elapsed_and_points() -> None:
+    snapshot = SessionSnapshot(
+        id="s",
+        state=SessionState.CANCELLED,
+        created_at="2026-09-07T20:00:00Z",
+        updated_at="2026-09-07T20:00:40Z",
+        completed=25,
+        total=100,
+        run_started_at="2026-09-07T20:00:00Z",
+    )
+    # Terminal states freeze elapsed at updated_at: 40s, 25 of 100 done → 40 * 75 / 25 = 120s left.
+    assert snapshot_progress_timing(snapshot) == (40, 120)
+
+
+def test_snapshot_progress_timing_uses_points_taken_this_run() -> None:
+    snapshot = SessionSnapshot(
+        id="s",
+        state=SessionState.CANCELLED,
+        created_at="2026-09-07T20:00:00Z",
+        updated_at="2026-09-07T20:11:00Z",
+        completed=685,
+        total=1500,
+        already_measured=650,
+        run_started_at="2026-09-07T20:00:00Z",
+    )
+    elapsed, remaining = snapshot_progress_timing(snapshot)
+    assert elapsed == 660
+    assert remaining == round(660 * 815 / 35)
+
+
+def test_snapshot_progress_timing_freezes_elapsed_and_zeroes_remaining_when_complete() -> None:
+    snapshot = SessionSnapshot(
+        id="s",
+        state=SessionState.COMPLETED,
+        created_at="2026-09-07T20:00:00Z",
+        updated_at="2026-09-07T20:10:00Z",
+        completed=50,
+        total=50,
+        run_started_at="2026-09-07T20:00:00Z",
+    )
+    assert snapshot_progress_timing(snapshot) == (600, 0)
 
 
 def test_confirmation_emits_checkpoint_and_continues() -> None:

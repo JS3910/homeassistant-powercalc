@@ -1,11 +1,18 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from time import sleep
+from typing import Self
 from unittest.mock import MagicMock
 
 from homeassistant_api.errors import WebsocketError
 from measure.const import HASS_ENTITY_REGISTRY_LIST
-from measure.home_assistant import HomeAssistantManager, HomeAssistantWebsocketClient, normalize_hass_url
+from measure.home_assistant import (
+    HomeAssistantManager,
+    HomeAssistantWebsocketClient,
+    explain_home_assistant_error,
+    normalize_hass_url,
+    rest_api_url,
+)
 import pytest
 from urllib3.exceptions import ProtocolError
 
@@ -81,6 +88,26 @@ def test_entity_registry_normalizes_numeric_unique_id() -> None:
 )
 def test_normalize_hass_url(url: str, expected: str) -> None:
     assert normalize_hass_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("ws://supervisor/core/websocket", "http://supervisor/core/api"),
+        ("ws://127.0.0.1:8123/api/websocket", "http://127.0.0.1:8123/api"),
+        ("https://ha.lan:8123/api", "https://ha.lan:8123/api"),
+    ],
+)
+def test_rest_api_url(url: str, expected: str) -> None:
+    assert rest_api_url(url) == expected
+
+
+def test_explain_supervisor_timeout() -> None:
+    message = explain_home_assistant_error(
+        RuntimeError("HTTPConnectionPool(host='supervisor', port=80): Read timed out.")
+    )
+    assert "Supervisor HTTP proxy" in message
+    assert "not the light" in message
 
 
 def test_manager_normalizes_legacy_rest_url() -> None:
@@ -409,3 +436,76 @@ def test_keepalive_interval_of_zero_starts_no_background_thread() -> None:
 
     assert manager._keepalive_thread is None  # noqa: SLF001
     client.send_ping.assert_not_called()
+
+
+def _json_response(payload: object) -> object:
+    class Response:
+        def read(self) -> bytes:
+            import json
+
+            return json.dumps(payload).encode()
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    return Response()
+
+
+def test_get_state_reads_one_entity_over_rest() -> None:
+    client_factory = MagicMock()
+    manager = HomeAssistantManager(
+        "ws://supervisor/core/websocket",
+        "token",
+        client_factory=client_factory,
+        urlopen=lambda _request, timeout=None: _json_response(
+            {"entity_id": "light.a", "state": "on", "attributes": {"brightness": 12}},
+        ),
+    )
+
+    state = manager.get_state(entity_id="light.a")
+
+    assert state.entity_id == "light.a"
+    assert state.state == "on"
+    client_factory.assert_not_called()
+
+
+def test_isolated_service_uses_rest_and_closes_the_shared_socket() -> None:
+    client = MagicMock(spec=HomeAssistantWebsocketClient)
+    seen: dict[str, str] = {}
+
+    def urlopen(request: object, timeout: float | None = None) -> object:
+        seen["url"] = request.full_url  # type: ignore[attr-defined]
+        return _json_response([])
+
+    manager = HomeAssistantManager(
+        "ws://supervisor/core/websocket",
+        "token",
+        client_factory=MagicMock(return_value=client),
+        urlopen=urlopen,
+    )
+    manager.get_config()
+
+    manager.trigger_service("light", "turn_off", isolated=True, entity_id="light.a")
+
+    assert seen["url"] == "http://supervisor/core/api/services/light/turn_off"
+    client.close.assert_called()
+
+
+def test_call_timeout_closes_the_socket_and_retries_on_a_fresh_client() -> None:
+    hung = MagicMock(spec=HomeAssistantWebsocketClient)
+    hung.get_config.side_effect = lambda: sleep(2)
+    fresh = MagicMock(spec=HomeAssistantWebsocketClient)
+    fresh.get_config.return_value = {"location_name": "Home"}
+    manager = HomeAssistantManager(
+        "ws://supervisor/core/websocket",
+        "token",
+        client_factory=MagicMock(side_effect=(hung, fresh)),
+        call_timeout=0.05,
+    )
+
+    assert manager.get_config() == {"location_name": "Home"}
+    hung.close.assert_called()
+    fresh.get_config.assert_called_once_with()

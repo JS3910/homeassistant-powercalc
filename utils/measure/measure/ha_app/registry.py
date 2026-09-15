@@ -58,6 +58,14 @@ class FormFieldDefinition:
     default: str | int | bool | None = None
     minimum: int | float | None = None
     maximum: int | float | None = None
+    #: HTML `step` for a NUMBER control. `None` renders no `step` attribute, which every
+    #: browser treats as the number-input default of `1` -- fine for an inherently integer
+    #: field (a count of lights, a duration in seconds), wrong for anything that can
+    #: genuinely take a decimal (confirmed 2026-09-06: a fractional watt value was
+    #: rejected outright). Set explicitly per field rather than defaulting to "any" here,
+    #: so a field that really is integer-only keeps native step validation instead of
+    #: silently accepting fractions.
+    step: str | None = None
     #: Whether several entities can be selected for this field at once.
     multiple: bool = False
     #: Label to use while several entities are selected.
@@ -77,13 +85,27 @@ class FormFieldDefinition:
     review: bool = False
 
 
+class ParameterControl(StrEnum):
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+
+
+class ParameterAxis(StrEnum):
+    BRIGHTNESS = "brightness"
+    SAT = "sat"
+    HUE = "hue"
+    MIRED = "mired"
+    KELVIN = "kelvin"
+
+
 @dataclass(frozen=True)
 class ParameterDefinition:
     """A measurement tuning parameter as one measure type presents it.
 
     The same parameter can read differently per type — a light settles, a recorder
     samples — so the wording lives here rather than in the client. Bounds come from
-    ``PARAMETER_LIMITS`` via the capabilities endpoint.
+    ``PARAMETER_LIMITS`` via the capabilities endpoint, then the selected light's
+    live span when ``axis`` is set.
     """
 
     name: str
@@ -94,6 +116,15 @@ class ParameterDefinition:
     group: str = ""
     #: Only applies while the named parameter is greater than one.
     requires_multiple: str | None = None
+    control: ParameterControl = ParameterControl.NUMBER
+    #: Bisect checkbox bound to this parameter name, shown beside the number.
+    bisection: str | None = None
+    #: All checkbox bound to this parameter name, shown beside the number.
+    all_values: str | None = None
+    #: Label used while Bisect or All is on, for brightness fields that switch meaning.
+    sweep_label: str | None = None
+    #: Discrete axis whose live span is this slider's max once a light is selected.
+    axis: ParameterAxis | None = None
 
 
 @dataclass(frozen=True)
@@ -143,8 +174,39 @@ def _controller(
 #: activates. A light only offers the subset its entity reports as supported.
 LIGHT_MODE_OPTIONS = (
     FieldOption(value=LutMode.BRIGHTNESS, label="Brightness", enables=("bri_bri_steps",)),
-    FieldOption(value=LutMode.COLOR_TEMP, label="Color temperature", enables=("ct_bri_steps", "ct_mired_steps")),
-    FieldOption(value=LutMode.HS, label="Hue & saturation", enables=("hs_bri_steps", "hs_hue_steps", "hs_sat_steps")),
+    FieldOption(
+        value=LutMode.COLOR_TEMP,
+        label="Color temperature",
+        enables=(
+            "ct_bri_steps",
+            "ct_mired_divisions",
+            "min_kelvin",
+            "max_kelvin",
+            "smart_sampling",
+            "smart_delta",
+            "smart_border_delta",
+            "smart_dart",
+            "smart_dart_min_delta",
+        ),
+    ),
+    FieldOption(
+        value=LutMode.HS,
+        label="Hue & saturation",
+        enables=(
+            "hs_bri_steps",
+            "hs_hue_divisions",
+            "hs_sat_divisions",
+            "min_sat",
+            "max_sat",
+            "min_hue",
+            "max_hue",
+            "smart_sampling",
+            "smart_delta",
+            "smart_border_delta",
+            "smart_dart",
+            "smart_dart_min_delta",
+        ),
+    ),
     FieldOption(
         value=LutMode.EFFECT,
         label="Effect",
@@ -161,6 +223,7 @@ MODES_FIELD = FormFieldDefinition(
 )
 
 SAMPLING = "Sampling"
+RANGE_BOUNDS = "Range bounds"
 RESOLUTION = "Profile resolution"
 
 
@@ -172,6 +235,7 @@ def _sampling(label: str, hint: str) -> tuple[ParameterDefinition, ...]:
             name="sleep_time_sample",
             label="Time between samples (seconds)",
             hint="Only used when taking more than one sample.",
+            step="0.1",
             group=SAMPLING,
             requires_multiple="sample_count",
         ),
@@ -192,60 +256,296 @@ LIGHT_PARAMETERS = (
     ParameterDefinition(
         name="sleep_time",
         label="Settle time (seconds)",
-        hint="Wait after changing the light before reading power.",
+        hint=(
+            "Wait after changing the light before reading power. Acts as an upper bound, "
+            "not a fixed wait, when settle detection below is enabled."
+        ),
+        step="0.1",
+        group=SAMPLING,
+    ),
+    ParameterDefinition(
+        name="settle_tolerance_pct",
+        label="Settle detection tolerance (%)",
+        hint=(
+            "0 disables this and always waits the full settle time above. Above 0, proceed "
+            "once the reading has held within this tolerance for a second (at least three "
+            "polls in that window), instead of always waiting the full settle time -- "
+            "falls back to the full wait if it never stabilizes. Combined with the watt "
+            "floor below: a track is flat when its spread is within this percentage or "
+            "that many watts, whichever is larger. The minimum wait below still runs "
+            "first so a leftover flat reading cannot be accepted immediately. Requires a "
+            "polled power meter (not manual entry)."
+        ),
+        step="0.01",
+        group=SAMPLING,
+    ),
+    ParameterDefinition(
+        name="settle_tolerance_w",
+        label="Settle detection floor (W)",
+        hint=(
+            "Also treat a track as settled when its spread is within this many watts, even "
+            "if that is more than the percentage above. Covers meters that only report "
+            "0.1 W steps (Shelly) at low load, where one step is already several percent. "
+            "0 uses the percentage only."
+        ),
+        step="0.01",
+        group=SAMPLING,
+    ),
+    ParameterDefinition(
+        name="settle_min_wait",
+        label="Minimum wait before settle (seconds)",
+        hint=(
+            "Blind wait after the light command (and after Home Assistant reports the "
+            "new brightness) before settle detection may accept a plateau. Hardware "
+            "ramps and HA lag often leave the previous power reading flat for a moment "
+            "— without this, settle can record the last point again, including while "
+            "the lamp is still off. Unused when settle detection is off. 0 disables."
+        ),
         step="0.1",
         group=SAMPLING,
     ),
     *_sampling("Samples per point", "More samples reduce noise but increase measurement time."),
     ParameterDefinition(
-        name="min_brightness",
-        label="Minimum brightness",
-        hint="Increase this when the light does not turn on at its lowest level.",
+        name="sleep_initial",
+        label="Initial stabilization (seconds)",
+        hint=(
+            "Extra wait after the first point of a mode, for fixed-sleep runs. Unused "
+            "when settle detection is on — the plateau wait already covers leftover "
+            "max-load readings."
+        ),
+        step="0.1",
         group=SAMPLING,
     ),
-    ParameterDefinition(name="sleep_initial", label="Initial stabilization (seconds)", group=SAMPLING),
-    ParameterDefinition(name="sleep_standby", label="Standby stabilization (seconds)", group=SAMPLING),
+    ParameterDefinition(
+        name="sleep_standby",
+        label="Standby stabilization (seconds)",
+        step="0.1",
+        group=SAMPLING,
+    ),
+    ParameterDefinition(
+        name="min_brightness",
+        label="Minimum brightness",
+        hint=(
+            "Increase this when the light does not turn on at its lowest level. Smart "
+            "sampling stays inside this range; pin min and max to the same value to "
+            "measure only that brightness."
+        ),
+        group=RANGE_BOUNDS,
+        axis=ParameterAxis.BRIGHTNESS,
+    ),
+    ParameterDefinition(
+        name="max_brightness",
+        label="Maximum brightness",
+        hint=(
+            "Lower this when the light's top end is unused or unstable. Smart sampling "
+            "does not invent points above this, even when a seed LUT already has them."
+        ),
+        group=RANGE_BOUNDS,
+        axis=ParameterAxis.BRIGHTNESS,
+    ),
+    ParameterDefinition(
+        name="min_kelvin",
+        label="Minimum color temperature (K)",
+        hint="Warmer end of the range. Lower Kelvin is warmer.",
+        group=RANGE_BOUNDS,
+        axis=ParameterAxis.KELVIN,
+    ),
+    ParameterDefinition(
+        name="max_kelvin",
+        label="Maximum color temperature (K)",
+        hint="Cooler end of the range. Higher Kelvin is cooler.",
+        group=RANGE_BOUNDS,
+        axis=ParameterAxis.KELVIN,
+    ),
+    ParameterDefinition(
+        name="min_sat",
+        label="Minimum saturation",
+        group=RANGE_BOUNDS,
+        axis=ParameterAxis.SAT,
+    ),
+    ParameterDefinition(
+        name="max_sat",
+        label="Maximum saturation",
+        group=RANGE_BOUNDS,
+        axis=ParameterAxis.SAT,
+    ),
+    ParameterDefinition(
+        name="min_hue",
+        label="Minimum hue",
+        group=RANGE_BOUNDS,
+        axis=ParameterAxis.HUE,
+    ),
+    ParameterDefinition(
+        name="max_hue",
+        label="Maximum hue",
+        group=RANGE_BOUNDS,
+        axis=ParameterAxis.HUE,
+    ),
+    ParameterDefinition(
+        name="smart_sampling",
+        label="Smart envelope sampling",
+        hint=(
+            "Discover the light's highest and lowest power curves, then fill the band "
+            "between them at a constant plot spacing. Replaces the cartesian CT/HS "
+            "sweep product while this is on."
+        ),
+        group=RESOLUTION,
+        control=ParameterControl.BOOLEAN,
+    ),
+    ParameterDefinition(
+        name="smart_delta",
+        label="Interior spacing (Δ)",
+        hint=(
+            "Distance in a square whose X is brightness 0–100% and Y is watts as "
+            "0–100% of the measured peak. Δ=8 is 8% of the brightness span "
+            "(~20 steps on 1–255) and 8% of peak watts (~0.4 W on a 5 W lamp). "
+            "Two samples cover each other when the hypotenuse of those two "
+            "percentages is less than Δ. Interior fill walks each color rail "
+            "separately — a dense curve of one color does not fill holes of another. "
+            "Smaller packs more densely."
+        ),
+        step="0.5",
+        group=RESOLUTION,
+    ),
+    ParameterDefinition(
+        name="smart_border_delta",
+        label="Border spacing (Δ)",
+        hint=(
+            "Equidistant spacing along the envelope border: the 100% color sweep "
+            "and the hottest/coldest brightness rails. Smaller traces those 1D "
+            "edges more densely."
+        ),
+        step="0.5",
+        group=RESOLUTION,
+    ),
+    ParameterDefinition(
+        name="smart_dart",
+        label="Dart-throw fill",
+        hint=(
+            "After the 100% outline and brightness rails, throw random interior "
+            "samples biased toward high power. A throw whose guessed plot position "
+            "is too close to an existing point is skipped. Spacing starts at "
+            "interior Δ and shrinks toward the floor so a long run keeps adding "
+            "detail. Cancel when you have enough."
+        ),
+        group=RESOLUTION,
+        control=ParameterControl.BOOLEAN,
+    ),
+    ParameterDefinition(
+        name="smart_dart_min_delta",
+        label="Dart floor (Δ)",
+        hint=(
+            "Smallest dart radius. When a throw round accepts nothing, the radius "
+            "shrinks toward this value. At the floor, an empty round ends the run."
+        ),
+        step="0.5",
+        group=RESOLUTION,
+    ),
     ParameterDefinition(
         name="bri_bri_steps",
         label="Brightness mode step",
-        hint="Native brightness increment (1–255).",  # noqa: RUF001
+        hint="Native brightness increment. Check Bisect to treat this as a sweep count instead.",
         group=RESOLUTION,
+        bisection="bri_bri_bisection",
+        all_values="bri_bri_all",
+        sweep_label="Brightness mode sweeps",
+        axis=ParameterAxis.BRIGHTNESS,
     ),
     ParameterDefinition(
         name="ct_bri_steps",
         label="Color temperature brightness step",
-        hint="Native brightness increment used while measuring color temperature.",
+        hint=(
+            "Native brightness increment while measuring color temperature. Smart: the "
+            "step of the forced 0-100% ramps at the global max, both sides of a "
+            "discontinuity, and prominent local extrema. Bisect turns this into a sweep "
+            "count."
+        ),
         group=RESOLUTION,
+        bisection="ct_bri_bisection",
+        all_values="ct_bri_all",
+        sweep_label="Color temperature brightness sweeps",
+        axis=ParameterAxis.BRIGHTNESS,
     ),
     ParameterDefinition(
-        name="ct_mired_steps",
-        label="Color temperature mired step",
-        hint="Native color-temperature increment in mired.",
+        name="ct_mired_divisions",
+        label="Color temperature sweeps",
+        hint=(
+            "How many color-temperature samples to take. Cartesian: number of brightness "
+            "sweeps (1 = midpoint, 2 = min and max, …). Smart: the linear sweep at 100% "
+            "brightness — this is the CT discovery density, not Interior/Border Δ. "
+            "All walks every supported color temperature in the selected Kelvin range."
+        ),
         group=RESOLUTION,
+        all_values="ct_mired_all",
+        axis=ParameterAxis.MIRED,
     ),
     ParameterDefinition(
         name="hs_bri_steps",
         label="HS brightness step",
-        hint="Native brightness increment used for hue and saturation.",
+        hint=(
+            "Native brightness increment used for hue and saturation. Smart: the step of "
+            "the forced 0-100% ramps at the RGB primaries and the midpoints between "
+            "them, at min and max saturation. Defaults coarser than the CT step (~1/6 as "
+            "many samples) because there are twelve of these ramps. Bisect turns this "
+            "into a sweep count."
+        ),
         group=RESOLUTION,
+        bisection="hs_bri_bisection",
+        all_values="hs_bri_all",
+        sweep_label="HS brightness sweeps",
+        axis=ParameterAxis.BRIGHTNESS,
     ),
     ParameterDefinition(
-        name="hs_hue_steps",
-        label="HS hue step",
-        hint="Native Home Assistant hue increment (0–65535).",  # noqa: RUF001
+        name="hs_hue_divisions",
+        label="HS hue sweeps",
+        hint=(
+            "How many distinct hues to sweep around the wheel. Must be a multiple of 3 "
+            "(minimum 3): seeded at red/green/blue (an RGB(WW) fixture's actual "
+            "emitters), then trisected. A full wheel is a ring, so 3/6/9 are 3/6/9 "
+            "unique positions — the wrap-around red is not measured twice. All walks "
+            "every hue; that is a huge grid."
+        ),
+        step="3",
         group=RESOLUTION,
+        all_values="hs_hue_all",
+        axis=ParameterAxis.HUE,
     ),
     ParameterDefinition(
-        name="hs_sat_steps",
-        label="HS saturation step",
-        hint="Native saturation increment (1–255).",  # noqa: RUF001
+        name="hs_sat_divisions",
+        label="HS saturation sweeps",
+        hint=(
+            "How many saturation samples to take at 100% brightness. Cartesian: sweeps "
+            "across the saturation range (1 = full saturation only, 2 = full then the "
+            "midpoint, …). Smart: the same count on every point-of-interest hue — RGB "
+            "primaries, the midpoints between them, and distant full-sat local maxima. "
+            "Those are the vertical pillars on the hue-at-100% plot. All walks every "
+            "saturation."
+        ),
         group=RESOLUTION,
+        all_values="hs_sat_all",
+        axis=ParameterAxis.SAT,
     ),
     ParameterDefinition(
         name="effect_bri_steps",
         label="Effect brightness step",
-        hint="Native brightness increment between long-running effect samples.",
+        hint="Native brightness increment between long-running effect samples. Bisect turns this into a sweep count.",
         group=RESOLUTION,
+        bisection="effect_bri_bisection",
+        all_values="effect_bri_all",
+        sweep_label="Effect brightness sweeps",
+        axis=ParameterAxis.BRIGHTNESS,
+    ),
+    ParameterDefinition(
+        name="brightness_descending",
+        label="Sweep brightness high to low",
+        hint=(
+            "Walk each brightness rail high → low. Off walks low → high. "
+            "A new run first measures min and max brightness on both color-temp ends "
+            "and on each RGB primary so every LED emitter has a scale; "
+            "resume and refine skip that."
+        ),
+        group=RESOLUTION,
+        control=ParameterControl.BOOLEAN,
     ),
     ParameterDefinition(
         name="measure_time_effect_min",
@@ -288,8 +588,23 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
                 default=1,
                 minimum=1,
                 maximum=100,
+                step="1",
                 derived_from="light_entity_id",
                 hint="Total number of identical physical lights; measured power is divided by this value.",
+            ),
+            FormFieldDefinition(
+                name="rated_power_w",
+                label="Rated power per light (W)",
+                control=FieldControl.NUMBER,
+                required=False,
+                minimum=0,
+                step="0.1",
+                hint=(
+                    "Optional lamp rating. Smart CT sweeps it as one extra guess "
+                    "(weaker white faded in on top of the stronger, up to this budget) "
+                    "— not treated as the real peak. Also bounds OCR meter readings "
+                    "against gross misreads. Leave blank to skip both."
+                ),
             ),
         ),
         supports_resume=True,
@@ -455,6 +770,7 @@ MEASUREMENT_REGISTRY: dict[MeasureType, MeasurementDefinition] = {
                 default=60,
                 minimum=1,
                 maximum=86_400,
+                step="1",
             ),
         ),
         supports_profile=False,

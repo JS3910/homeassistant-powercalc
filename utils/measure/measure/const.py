@@ -92,8 +92,20 @@ MEASUREMENT_SLEEP_TIME_MAX = 120
 MEASUREMENT_SAMPLE_COUNT_MIN = 1
 MEASUREMENT_SAMPLE_COUNT_MAX = 100
 MAX_NUDGES_LIMIT = 20
-# Density guard: automated sessions may not produce ct profiles coarser than step 10.
-CT_STEPS_MAX = 10
+# The brightness-step upper bound while measuring color temperature. 255 matches every
+# other native brightness-step field (`bri_bri_steps`, `hs_bri_steps`, `effect_bri_steps`)
+# -- min and max only -- rather than the 10 this used to be capped at, which had no
+# stated justification and was inconsistent with those siblings.
+CT_STEPS_MAX = 255
+# The mired axis is swept as a sweep *count*, not a native step size (see
+# `_divisions_range` in runner/light_plan.py): 1 sweep is just the midpoint, 2 is min and
+# max, 3 is min/mid/max, and so on -- so unlike a step size, 1 is a legitimate, if very
+# coarse, choice rather than something to guard against.
+CT_MIRED_DIVISIONS_MIN = 1
+# Capabilities / no-light sliders keep the historical 129 cap. Request validation uses
+# the live mired span when a light is known, and this ceiling when it is not -- so a
+# typed sweep count that matches a real device range is not rejected by the old cap.
+CT_MIRED_DIVISIONS_ABSOLUTE_MAX = 2000
 
 # Single source of measurement-parameter bounds. Request validation, persisted app
 # preferences, the capabilities endpoint (which the frontend forms read) and the
@@ -105,28 +117,40 @@ PARAMETER_LIMITS: dict[str, tuple[float, float]] = {
     "max_retries": (0, RETRY_COUNT_LIMIT),
     "max_nudges": (0, MAX_NUDGES_LIMIT),
     "min_brightness": (1, 255),
+    "max_brightness": (1, 255),
+    "min_kelvin": (1500, 10000),
+    "max_kelvin": (1500, 10000),
     "min_sat": (1, 255),
     "max_sat": (1, 255),
     "min_hue": (1, 65535),
     "max_hue": (1, 65535),
+    "settle_tolerance_pct": (0, 50),
+    "settle_tolerance_w": (0, 2),
+    "settle_window_seconds": (0.2, 30),
+    "settle_poll_interval_seconds": (0.05, 5),
+    "settle_min_wait": (0, 3600),
     "bri_bri_steps": (1, 255),
     "ct_bri_steps": (1, CT_STEPS_MAX),
-    "ct_mired_steps": (1, CT_STEPS_MAX),
+    "ct_mired_divisions": (CT_MIRED_DIVISIONS_MIN, 129),
     "hs_bri_steps": (1, 255),
-    "hs_hue_steps": (1, 65535),
-    "hs_sat_steps": (1, 255),
+    "hs_hue_divisions": (3, 360),
+    "hs_sat_divisions": (1, 32),
     "effect_bri_steps": (1, 255),
     "sleep_initial": (0, 3600),
     "sleep_standby": (0, 3600),
     "measure_time_effect": (1, 3600),
     "measure_time_effect_min": (1, 3600),
+    "smart_delta": (2, 40),
+    "smart_border_delta": (2, 40),
+    "smart_dart_min_delta": (1, 20),
 }
 
 CT_BRI_STEPS_MANUAL = 15
-CT_MIRED_STEPS_MANUAL = 50
-# Manual meters get a coarser fixed ct grid than the density guard allows,
-# because hand-reading every step is laborious.
+CT_MIRED_DIVISIONS_MANUAL_MIN = 1
+CT_MIRED_DIVISIONS_MANUAL_MAX = 9
+# Manual meters get a coarser ct grid ceiling than automated ones, because hand-reading
+# every point is laborious.
 MANUAL_PARAMETER_LIMIT_OVERRIDES: dict[str, tuple[float, float]] = {
     "ct_bri_steps": (1, CT_BRI_STEPS_MANUAL),
-    "ct_mired_steps": (1, CT_MIRED_STEPS_MANUAL),
+    "ct_mired_divisions": (CT_MIRED_DIVISIONS_MANUAL_MIN, CT_MIRED_DIVISIONS_MANUAL_MAX),
 }

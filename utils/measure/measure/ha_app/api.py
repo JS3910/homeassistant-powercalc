@@ -1,23 +1,25 @@
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from dataclasses import fields as dataclass_fields
 from dataclasses import replace
 import json
 import logging
 import mimetypes
 import os
-from pathlib import Path
 import re
-from typing import Annotated, Literal, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Literal, cast
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from measure.assembler import MeasurementAssembler
+from measure.clock import elapsed_seconds
 from measure.const import PARAMETER_LIMITS, MeasureType
 from measure.controller.light.const import LutMode
 from measure.dummy_load import DummyLoadCalibration, power_meter_fingerprint
@@ -37,7 +39,7 @@ from measure.ha_app.contribution import (
     DeviceFlowPollResponse,
     DeviceFlowStartResponse,
 )
-from measure.ha_app.coordinator import MeasurementCoordinator, SessionConflictError
+from measure.ha_app.coordinator import MeasurementCoordinator, MergeEligibilityError, SessionConflictError
 from measure.ha_app.diagnostics import DIAGNOSTIC_EVENT_LIMIT, build_session_diagnostics
 from measure.ha_app.library_catalog import (
     DeviceSpecificationCatalog,
@@ -48,19 +50,49 @@ from measure.ha_app.library_catalog import (
 from measure.ha_app.light_probe import (
     LightLoadProbe,
     LightLoadProbeError,
+    LightLoadProbePoint,
+    LightLoadProbeReading,
     LightLoadProbeResult,
+    LightLoadProbeStep,
     app_measurement_assembler,
+    complete_probe_result,
+    light_load_probe_applies,
 )
-from measure.ha_app.preferences import AppPreferences, AppSettingsResponse, AppSettingsUpdate
-from measure.ha_app.preflight import ActiveSessionError, MeasurementPreflight, PreflightError
+from measure.ha_app.meter_preview import MeterPreviewService
+from measure.ha_app.ocr_preview import OcrPreviewRegistry
+
+if TYPE_CHECKING:
+    # Importing this for real would require the optional `ocr` extra (it pulls in
+    # cv2) just to run the app at all; only ever needed here for type annotations.
+    from measure.powermeter.ocr.preview import PreviewServer
+from measure.ha_app.preferences import AppPreferences, AppSettingsResponse, AppSettingsUpdate, WitnessMeterSettings
+from measure.ha_app.preflight import (
+    ActiveSessionError,
+    HistoricalRunTiming,
+    MeasurementPreflight,
+    PreflightError,
+    estimate_light_measurement,
+)
 from measure.ha_app.registry import FieldControl, FieldRole, measurement_definitions
 from measure.ha_app.service import MeasurementService
 from measure.ha_app.session import (
     ACTIVE_SESSION_STATES,
+    PRE_DATA_SESSION_STATES,
     RESUMABLE_SESSION_STATES,
     SessionEvent,
+    SessionEventType,
     SessionSnapshot,
     SessionState,
+    snapshot_progress_timing,
+)
+from measure.ha_app.session_display import (
+    descriptor_for_request,
+    points_this_run,
+    raw_since_timestamp,
+    session_duration_seconds,
+    session_family_key,
+    session_identity,
+    session_modes,
 )
 from measure.ha_app.shelly_credentials import ShellyCredentials
 from measure.ha_app.shelly_discovery import ShellyDiscoveryResponse, ShellyDiscoveryService
@@ -69,6 +101,7 @@ from measure.ha_app.storage import SESSION_LOAD_ERRORS, SessionStorage
 from measure.home_assistant import HomeAssistantManager
 from measure.home_assistant_entities import (
     DeviceClass,
+    EntityCatalogSnapshot,
     EntityDescriptor,
     EntityDomain,
     HomeAssistantEntityCatalog,
@@ -78,13 +111,27 @@ from measure.powermeter.diagnostics import DiagnosticStatus, PowerMeterDiagnosti
 from measure.powermeter.errors import PowerMeterError
 from measure.powermeter.powermeter import PowerMeter
 from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
     DummyPowerMeterSpec,
     HassPowerMeterSpec,
     KasaPowerMeterSpec,
+    MyStromPowerMeterSpec,
+    OcrPowerMeterSpec,
+    OwonOwh98xxPowerMeterSpec,
     PowerMeterSpec,
     ShellyPowerMeterSpec,
+    SinglePowerMeterSpec,
+    TasmotaPowerMeterSpec,
+    TuyaPowerMeterSpec,
+    WitnessSpec,
 )
-from measure.request import LightMeasurementRequest, MeasurementRequest
+from measure.request import LightMeasurementRequest, MeasurementRequest, ResumePolicy
+from measure.runner.errors import RunnerError
+from measure.runner.light_plan import ColorTempVariation, EffectVariation, HsVariation, Variation
+from measure.runner.lut_csv import load_session_measured_rows, load_session_measured_variations
+from measure.runner.plot_edits import PlotEditError, apply_plot_action, load_ignored
+from measure.runner.smart_envelope import MeasuredPoint
+from measure.runner.sweep_coverage import build_sweep_coverage
 from measure.tuning import MeasurementParameters
 from measure.version import measure_version
 from measure.visualization import PlotSpec, build_session_plots
@@ -137,6 +184,12 @@ class PreflightResponse(BaseModel):
     battery_level_entity_id: str | None = None
     battery_level_attribute: str | None = None
     light_load_probe: LightLoadProbeResult | None = None
+    probe_steps: list[LightLoadProbeStep] | None = None
+
+
+class LightLoadProbeCompleteRequest(BaseModel):
+    standby_aggregate_power_w: float
+    points: list[LightLoadProbePoint]
 
 
 class EntityCatalogResponse(BaseModel):
@@ -176,6 +229,36 @@ class SessionPlots(BaseModel):
     partial: bool
     plots: list[PlotSpec]
     warnings: list[str]
+    editable: bool = False
+
+
+class PlotPointActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    point_id: str = Field(min_length=1, max_length=200)
+    action: Literal["edit", "fix_outlier", "ignore", "unignore", "delete"]
+    watt: float | None = Field(default=None, ge=0, le=100_000)
+
+
+class MergePairRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    left: str = Field(min_length=1)
+    right: str = Field(min_length=1)
+
+
+class MergeModePreview(BaseModel):
+    kept: int
+    added: int
+    replaced: int
+    replaced_reasons: dict[str, int]
+
+
+class MergePreviewResponse(BaseModel):
+    left: str
+    right: str
+    model_id_warning: bool
+    modes: dict[str, MergeModePreview]
 
 
 class SessionSummary(BaseModel):
@@ -186,21 +269,34 @@ class SessionSummary(BaseModel):
     measure_type: MeasureType
     model_id: str
     product_name: str
+    manufacturer: str = ""
     measure_device: str
     completed: int
     total: int
     percent: float
     can_resume: bool
+    can_refine: bool = False
+    can_merge: bool = False
     file_count: int
     size: int
     active: bool
+    family_key: str = ""
+    modes: list[str] = Field(default_factory=list)
+    run_started_at: str | None = None
+    duration_seconds: int | None = None
+    already_measured: int = 0
+    measured: int = 0
+    seed_session_id: str | None = None
+    can_analyse: bool = False
 
 
 class SessionProgressResponse(BaseModel):
     completed: int
     total: int
     skipped: int
+    already_measured: int = 0
     percent: float
+    elapsed_seconds: int | None = None
     estimated_remaining_seconds: int | None
 
 
@@ -218,9 +314,13 @@ class SessionSnapshotResponse(BaseModel):
     created_at: str
     updated_at: str
     phase: str | None
+    activity_reason: str | None = None
     confirmation_message: str | None
     confirmation_action: str | None
     mode: str | None
+    run_started_at: str | None = None
+    wait_ends_at: str | None = None
+    wait_seconds: float | None = None
     progress: SessionProgressResponse
     warnings: list[str]
     error: str | None
@@ -230,6 +330,7 @@ class SessionSnapshotResponse(BaseModel):
     entity_states: dict[str, str]
     can_analyse: bool
     request: MeasurementRequest
+    sweep_coverage: object | None = None
 
 
 class SessionEventResponse(BaseModel):
@@ -243,10 +344,28 @@ class SessionEventResponse(BaseModel):
 
 class CapabilitiesResponse(BaseModel):
     runtime_version: str
-    defaults: dict[str, int | float]
+    defaults: dict[str, int | float | bool]
     limits: dict[str, dict[str, int | float]]
     developer_mode: bool = False
     fast_test_mode: bool = False
+
+
+class LightModeEstimateResponse(BaseModel):
+    mode: LutMode
+    axes: dict[str, int]
+    points: int
+    summary: str
+
+
+class LightEstimateResponse(BaseModel):
+    modes: list[LightModeEstimateResponse]
+    total_points: int
+    total_readings: int | None = None
+    max_duration_seconds: int
+    used_default_range: bool
+    remaining_points: int | None = None
+    estimated_duration_seconds: int | None = None
+    estimated_from_runs: int | None = None
 
 
 class FormFieldOption(BaseModel):
@@ -270,6 +389,7 @@ class FormField(BaseModel):
     default: str | int | bool | None = None
     minimum: int | float | None = None
     maximum: int | float | None = None
+    step: str | None = None
     multiple: bool = False
     plural_label: str = ""
     derived_from: str | None = None
@@ -289,6 +409,11 @@ class MeasureParameter(BaseModel):
     step: str = "1"
     group: str = ""
     requires_multiple: str | None = None
+    control: str = "number"
+    bisection: str | None = None
+    all_values: str | None = None
+    sweep_label: str | None = None
+    axis: str | None = None
 
 
 class MeasureDefinition(BaseModel):
@@ -323,12 +448,15 @@ class AppContext:
         self.measure_device_catalog = MeasureDeviceCatalog()
         self.manufacturer_catalog = ManufacturerCatalog()
         self.device_specification_catalog = DeviceSpecificationCatalog()
+        self.ocr_previews = OcrPreviewRegistry()
+        self.meter_previews = MeterPreviewService(self.ocr_previews)
         self.power_meter_diagnostics = PowerMeterDiagnostics(self.build_power_meter)
         self.light_load_probe = LightLoadProbe(
             lambda: app_measurement_assembler(
                 home_assistant=self.home_assistant,
                 shelly_password=self.shelly_password(),
             ),
+            build_power_meter=self.build_power_meter,
         )
         self.contribution = ContributionApiCoordinator(
             self.storage,
@@ -377,22 +505,41 @@ class AppContext:
             return manufacturer
 
     def _measurement_service(self) -> MeasurementService:
+        # A real session must own its meter. The setup-page aiming preview binds the
+        # same OCR preview port, so it has to be gone before assemble() builds another.
+        self.meter_previews.stop_all()
         return MeasurementService(
             self.home_assistant,
             self.storage,
             shelly_password=self.shelly_password(),
+            ocr_previews=self.ocr_previews,
         )
 
     def shelly_password(self) -> str | None:
         credentials = self.storage.load_shelly_credentials()
         return credentials.password if credentials is not None else None
 
-    def build_power_meter(self, spec: PowerMeterSpec) -> PowerMeter:
+    def build_power_meter(self, spec: PowerMeterSpec, *, shelly_password: str | None = None) -> PowerMeter:
+        """Build a meter, reusing a live setup-page OCR preview when it already owns the port.
+
+        Diagnostics and the light-load check each construct their own meter and close
+        it afterwards. If the aiming preview is already bound to ``127.0.0.1:8765``,
+        a second construct fails instantly with ``Address already in use``. Borrow
+        that live meter instead — the wrapper's ``close()`` is a no-op so the preview
+        survives the probe.
+        """
+
+        borrowed = self.meter_previews.borrow(spec)
+        if borrowed is not None:
+            return borrowed
         return MeasurementAssembler(
             ImmediateInteraction(),
             home_assistant=self.home_assistant,
-            shelly_password=self.shelly_password(),
+            shelly_password=self.shelly_password() if shelly_password is None else shelly_password,
         ).build_power_meter(spec)
+
+
+_SHUTDOWN_STOP_TIMEOUT_SECONDS = 8.0
 
 
 @asynccontextmanager
@@ -400,11 +547,74 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     context = cast(AppContext, app.state.context)
     status_publisher = MeasureStatusPublisher(context.home_assistant, context.coordinator)
     await status_publisher.async_start()
+    # Resume in the background so /health can answer. Blocking startup on OCR or
+    # Home Assistant being ready is how Supervisor's watchdog SIGKILLs us (137).
+    resume_task = asyncio.create_task(_auto_resume_until_running(context))
     try:
         yield
     finally:
+        resume_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await resume_task
+        await run_in_threadpool(context.coordinator.request_shutdown_stop, _SHUTDOWN_STOP_TIMEOUT_SECONDS)
         await status_publisher.async_stop()
         context.home_assistant.close()
+
+
+async def _auto_resume_until_running(context: AppContext) -> None:
+    """Retry crash-resume until the session is running or no longer resumable."""
+
+    delay = 2.0
+    attempt = 0
+    while True:
+        snapshot = context.coordinator.current
+        if snapshot is None or snapshot.state != SessionState.RESUMABLE:
+            return
+        try:
+            await run_in_threadpool(_auto_resume_interrupted_session, context)
+            return
+        except Exception:
+            attempt += 1
+            _LOGGER.warning(
+                "Auto-resume attempt %d failed; retrying in %.0fs",
+                attempt,
+                delay,
+                exc_info=attempt == 1,
+            )
+            await asyncio.sleep(delay)
+            delay = min(30.0, 2.0 * (1.5 ** (attempt - 1)))
+
+
+def _auto_resume_interrupted_session(context: AppContext) -> None:
+    """Pick back up a session the app left running when it was last stopped.
+
+    A measurement is meant to run unattended for hours, so a plain process restart --
+    an add-on update, a Supervisor cold-backup stopping every add-on before it snapshots
+    the filesystem, an OOM kill, anything short of losing the actual persisted output --
+    must not need a human to notice and click Resume to keep going.
+
+    `MeasurementCoordinator.__init__` already calls `SessionStorage.load_current()`,
+    which promotes a session that was still active when the process last exited to
+    RESUMABLE (if its last complete row is still usable) or FAILED (if not). Only
+    RESUMABLE is auto-relaunched here: FAILED means there is no compatible resumption
+    point to build on, and blindly starting over would repeat whatever made the row
+    incompatible rather than actually recovering. `skip_light_load_probe` and
+    `skip_power_meter_diagnostic` match `_resume_session` -- the light and meter
+    were already validated. Recoverable boot races (OCR has no frame yet, the
+    websocket is not up) raise so the background loop can try again.
+    """
+    snapshot = context.coordinator.current
+    if snapshot is None or snapshot.state != SessionState.RESUMABLE:
+        return
+    request = context.storage.load_request(snapshot.id)
+    _preflight(
+        context,
+        request,
+        skip_light_load_probe=True,
+        skip_power_meter_diagnostic=True,
+    )
+    context.coordinator.resume(snapshot.id)
+    _LOGGER.info("Automatically resumed session %s after an interrupted run", snapshot.id)
 
 
 def create_app(
@@ -541,6 +751,8 @@ def _router() -> APIRouter:
     _register_measurement_routes(router)
     _register_session_routes(router)
     _register_contribution_routes(router)
+    _register_ocr_preview_routes(router)
+    _register_meter_preview_routes(router)
     return router
 
 
@@ -550,10 +762,15 @@ def _register_measurement_routes(router: APIRouter) -> None:  # noqa: C901
         context = _context(request)
         defaults = MeasurementParameters()
         settings = await run_in_threadpool(context.storage.load_settings)
+        numeric = {name: getattr(defaults, name) for name in PARAMETER_LIMITS}
+        flags = {
+            field.name: getattr(defaults, field.name)
+            for field in dataclass_fields(MeasurementParameters)
+            if isinstance(getattr(defaults, field.name), bool) and field.name != "fast_test_mode"
+        }
         return CapabilitiesResponse(
             runtime_version=measure_version(),
-            defaults={name: getattr(defaults, name) for name in PARAMETER_LIMITS}
-            | settings.measurement_defaults.model_dump(),
+            defaults=numeric | flags | settings.measurement_defaults.model_dump(),
             limits={name: {"min": minimum, "max": maximum} for name, (minimum, maximum) in PARAMETER_LIMITS.items()},
             developer_mode=context.developer_mode,
             fast_test_mode=context.developer_mode and settings.fast_test_mode,
@@ -659,13 +876,73 @@ def _register_measurement_routes(router: APIRouter) -> None:  # noqa: C901
         prepared = await run_in_threadpool(_apply_fast_test_mode, context, payload)
         return await run_in_threadpool(_preflight, context, prepared)
 
+    @router.post("/preflight/probe", responses={422: _ERROR})
+    async def preflight_probe(
+        payload: MeasurementRequestPayload,
+        request: Request,
+        step: Annotated[str, Query()],
+    ) -> LightLoadProbeReading:
+        if not isinstance(payload, LightMeasurementRequest):
+            raise HTTPException(status_code=422, detail="The light check is only available for light measurements")
+        context = _context(request)
+        prepared = await run_in_threadpool(_apply_fast_test_mode, context, payload)
+        if not isinstance(prepared, LightMeasurementRequest):
+            raise HTTPException(status_code=422, detail="The light check is only available for light measurements")
+        try:
+            return await run_in_threadpool(context.light_load_probe.measure_step, prepared, step)
+        except LightLoadProbeError as error:
+            raise _probe_http_error(error) from error
+
+    @router.post("/preflight/probe/complete", responses={422: _ERROR})
+    async def preflight_probe_complete(payload: LightLoadProbeCompleteRequest) -> LightLoadProbeResult:
+        try:
+            return complete_probe_result(payload.standby_aggregate_power_w, payload.points)
+        except LightLoadProbeError as error:
+            raise _probe_http_error(error) from error
+
+    @router.post("/estimate", responses={422: _ERROR})
+    async def estimate(payload: MeasurementRequestPayload, request: Request) -> LightEstimateResponse:
+        if not isinstance(payload, LightMeasurementRequest):
+            raise HTTPException(status_code=422, detail="Estimate is only available for light measurements")
+        context = _context(request)
+        prepared = await run_in_threadpool(_apply_fast_test_mode, context, payload)
+        return await run_in_threadpool(_estimate, context, prepared)
+
 
 def _register_session_routes(router: APIRouter) -> None:  # noqa: C901
+    @router.post("/sessions/merge/preview", responses={404: _ERROR, 409: _ERROR, 422: _ERROR})
+    async def merge_preview(payload: MergePairRequest, request: Request) -> MergePreviewResponse:
+        context = _context(request)
+        try:
+            preview = await run_in_threadpool(context.coordinator.preview_merge, payload.left, payload.right)
+        except MergeEligibilityError as error:
+            status = 404 if "does not exist" in str(error) else 422
+            raise HTTPException(status_code=status, detail=str(error)) from error
+        except SessionConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except SESSION_LOAD_ERRORS as error:
+            raise HTTPException(status_code=404, detail="The requested session does not exist") from error
+        return MergePreviewResponse.model_validate(preview)
+
+    @router.post("/sessions/merge", status_code=201, responses={404: _ERROR, 409: _ERROR, 422: _ERROR})
+    async def merge_sessions(payload: MergePairRequest, request: Request) -> SessionSnapshotResponse:
+        context = _context(request)
+        try:
+            snapshot = await run_in_threadpool(context.coordinator.merge, payload.left, payload.right)
+        except MergeEligibilityError as error:
+            status = 404 if "does not exist" in str(error) else 422
+            raise HTTPException(status_code=status, detail=str(error)) from error
+        except SessionConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except SESSION_LOAD_ERRORS as error:
+            raise HTTPException(status_code=404, detail="The requested session does not exist") from error
+        return _snapshot_response(context, snapshot)
+
     @router.post("/sessions", status_code=201, responses={409: _ERROR, 422: _ERROR})
     async def start_session(payload: MeasurementRequestPayload, request: Request) -> SessionSnapshotResponse:
         context = _context(request)
         prepared = await run_in_threadpool(_apply_fast_test_mode, context, payload)
-        await run_in_threadpool(_preflight, context, prepared)
+        await run_in_threadpool(_preflight, context, prepared, skip_light_load_probe=True)
         try:
             snapshot = context.coordinator.start(prepared)
         except SessionConflictError as error:
@@ -674,10 +951,7 @@ def _register_session_routes(router: APIRouter) -> None:  # noqa: C901
 
     @router.get("/sessions")
     async def sessions(request: Request) -> list[SessionSummary]:
-        context = _context(request)
-        snapshots = await run_in_threadpool(context.coordinator.sessions)
-        summaries = [await run_in_threadpool(_session_summary, context, snapshot) for snapshot in snapshots]
-        return sorted(summaries, key=lambda item: not item.active)
+        return await run_in_threadpool(_session_summaries, _context(request))
 
     @router.get("/sessions/{session_id}", responses={404: _ERROR})
     async def session(session_id: str, request: Request) -> SessionSnapshotResponse:
@@ -727,6 +1001,24 @@ def _register_session_routes(router: APIRouter) -> None:  # noqa: C901
         context = _context(request)
         return await _session_plots(context, _require_session(context, session_id))
 
+    @router.post("/sessions/{session_id}/plots/points", responses={404: _ERROR, 409: _ERROR, 422: _ERROR})
+    async def edit_plot_point(session_id: str, request: Request, body: PlotPointActionRequest) -> SessionPlots:
+        context = _context(request)
+        snapshot = _require_session(context, session_id)
+        if snapshot.state in ACTIVE_SESSION_STATES:
+            raise HTTPException(status_code=409, detail="Wait until the measurement has stopped before editing points")
+        try:
+            apply_plot_action(
+                context.storage.session_directory(snapshot.id),
+                context.storage.load_request(snapshot.id),
+                body.point_id,
+                body.action,
+                watt=body.watt,
+            )
+        except (PlotEditError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return await _session_plots(context, snapshot)
+
     @router.get("/sessions/{session_id}/files/{name:path}", responses={404: _ERROR})
     async def session_download(session_id: str, name: str, request: Request) -> FileResponse:
         context = _context(request)
@@ -737,11 +1029,180 @@ def _register_session_routes(router: APIRouter) -> None:  # noqa: C901
         context = _context(request)
         return _session_diagnostics(context, _require_session(context, session_id))
 
+    @router.get("/sessions/{session_id}/logs", responses={404: _ERROR})
+    async def session_logs(
+        session_id: str,
+        request: Request,
+        after: int = 0,
+    ) -> list[dict[str, str | int]]:
+        context = _context(request)
+        _require_session(context, session_id)
+        return _session_log_entries(context, session_id, after=after)
+
     @router.get("/sessions/{session_id}/events", responses={404: _ERROR})
     async def session_events(session_id: str, request: Request) -> StreamingResponse:
         context = _context(request)
         _require_session(context, session_id)
-        return StreamingResponse(_event_stream(request, context, session_id), media_type="text/event-stream")
+        return StreamingResponse(
+            _event_stream(request, context, session_id),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
+
+def _register_ocr_preview_routes(router: APIRouter) -> None:
+    """In-process access to a running session's OCR camera preview(s), by role label.
+
+    Mirrors the shape `PreviewServer`'s own standalone page already serves
+    (`state.json`/`frame.jpg`/`events`), just reached through the app's own ingress-safe
+    API instead of a second socket, since the meter and this API run in one process.
+    """
+
+    @router.get("/sessions/{session_id}/ocr", responses={404: _ERROR})
+    async def ocr_previews(session_id: str, request: Request) -> list[str]:
+        context = _context(request)
+        _require_session(context, session_id)
+        return list(context.ocr_previews.labels(session_id))
+
+    @router.get("/sessions/{session_id}/ocr/{label}/state", responses={404: _ERROR})
+    async def ocr_state(session_id: str, label: str, request: Request) -> dict[str, object]:
+        context = _context(request)
+        preview = _require_ocr_preview(context, session_id, label)
+        return preview.state()
+
+    @router.get("/sessions/{session_id}/ocr/{label}/frame.jpg", responses={404: _ERROR, 503: _ERROR})
+    async def ocr_frame(session_id: str, label: str, request: Request) -> Response:
+        context = _context(request)
+        preview = _require_ocr_preview(context, session_id, label)
+        jpeg = preview.jpeg()
+        if jpeg is None:
+            raise HTTPException(status_code=503, detail="No camera frame yet")
+        return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @router.get("/sessions/{session_id}/ocr/{label}/events", responses={404: _ERROR})
+    async def ocr_events(session_id: str, label: str, request: Request) -> StreamingResponse:
+        context = _context(request)
+        preview = _require_ocr_preview(context, session_id, label)
+        return StreamingResponse(
+            _ocr_event_stream(request, preview),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
+
+def _require_ocr_preview(context: AppContext, session_id: str, label: str) -> "PreviewServer":  # noqa: UP037
+    _require_session(context, session_id)
+    preview = context.ocr_previews.get(session_id, label)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="No OCR camera preview for that session/label")
+    return preview
+
+
+class MeterPreviewStartResponse(BaseModel):
+    """Nothing to preview (`preview_id` unset) is a normal, successful outcome -- the
+    configured meter simply doesn't include an OCR camera."""
+
+    model_config = ConfigDict(frozen=True)
+
+    preview_id: str | None = None
+    labels: list[str] = Field(default_factory=list)
+
+
+def _register_meter_preview_routes(router: APIRouter) -> None:
+    """Lets the setup/settings UI show a live OCR camera preview -- so the camera can
+    actually be pointed at the meter -- before any real measurement session exists.
+    Same underlying mechanism as `_register_ocr_preview_routes`, just keyed by a
+    throwaway id instead of a session id; see `MeterPreviewService` for the lifecycle.
+    """
+
+    @router.post("/power-meters/ocr-preview")
+    async def start_meter_preview(payload: AppSettingsUpdate, request: Request) -> MeterPreviewStartResponse:
+        context = _context(request)
+        preview_id, labels = await run_in_threadpool(_start_meter_preview, context, payload)
+        return MeterPreviewStartResponse(preview_id=preview_id, labels=list(labels))
+
+    @router.delete("/power-meters/ocr-preview/{preview_id}", status_code=204)
+    async def stop_meter_preview(preview_id: str, request: Request) -> Response:
+        await run_in_threadpool(_context(request).meter_previews.stop, preview_id)
+        return Response(status_code=204)
+
+    @router.get("/power-meters/ocr-preview/{preview_id}/{label}/state", responses={404: _ERROR})
+    async def meter_preview_state(preview_id: str, label: str, request: Request) -> dict[str, object]:
+        preview = _require_meter_preview(_context(request), preview_id, label)
+        return preview.state()
+
+    @router.get("/power-meters/ocr-preview/{preview_id}/{label}/frame.jpg", responses={404: _ERROR, 503: _ERROR})
+    async def meter_preview_frame(preview_id: str, label: str, request: Request) -> Response:
+        preview = _require_meter_preview(_context(request), preview_id, label)
+        jpeg = preview.jpeg()
+        if jpeg is None:
+            raise HTTPException(status_code=503, detail="No camera frame yet")
+        return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @router.get("/power-meters/ocr-preview/{preview_id}/{label}/events", responses={404: _ERROR})
+    async def meter_preview_events(preview_id: str, label: str, request: Request) -> StreamingResponse:
+        context = _context(request)
+        preview = _require_meter_preview(context, preview_id, label)
+        return StreamingResponse(
+            _ocr_event_stream(request, preview, on_tick=lambda: context.meter_previews.touch(preview_id)),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
+
+def _start_meter_preview(context: AppContext, settings: AppSettingsUpdate) -> tuple[str | None, tuple[str, ...]]:
+    try:
+        spec = _power_meter_spec(settings.preferences())
+    except PowerMeterError:
+        # Not addressed enough to build yet (e.g. the IP field is still empty) -- that's
+        # the normal state while the form is being filled in, not a failure to report.
+        return None, ()
+    password = None if settings.clear_shelly_password else settings.shelly_password or context.shelly_password()
+
+    def build(power_meter_spec: PowerMeterSpec) -> PowerMeter:
+        return MeasurementAssembler(
+            ImmediateInteraction(),
+            home_assistant=context.home_assistant,
+            shelly_password=password,
+        ).build_power_meter(power_meter_spec)
+
+    return context.meter_previews.start(spec, build)
+
+
+def _require_meter_preview(context: AppContext, preview_id: str, label: str) -> "PreviewServer":  # noqa: UP037
+    context.meter_previews.touch(preview_id)
+    preview = context.ocr_previews.get(preview_id, label)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="No camera preview for that id/label")
+    return preview
+
+
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+async def _ocr_event_stream(
+    request: Request,
+    preview: "PreviewServer",  # noqa: UP037
+    on_tick: Callable[[], None] | None = None,
+) -> AsyncIterator[str]:
+    """One SSE message per published frame; a comment keeps an idle connection alive.
+
+    ``on_tick`` runs on every wait (frame or keep-alive) so a long-lived aiming preview
+    is not reaped after 60s just because the stream was one HTTP request.
+    """
+
+    version = 0  # a client connecting after frames were published gets the current one at once
+    while not await request.is_disconnected():
+        if preview.closed:
+            return
+        if on_tick is not None:
+            on_tick()
+        update = await run_in_threadpool(preview.wait_for_update, version, 1.0)
+        if update is None:
+            yield ": keep-alive\n\n"
+            continue
+        version, state = update
+        yield f"data: {json.dumps({'version': version, 'state': state})}\n\n"
 
 
 def _register_contribution_routes(router: APIRouter) -> None:  # noqa: C901
@@ -853,7 +1314,19 @@ def _confirm_session(context: AppContext, session_id: str) -> SessionSnapshotRes
 
 async def _resume_session(context: AppContext, session_id: str) -> SessionSnapshotResponse:
     snapshot = _require_session(context, session_id)
-    await run_in_threadpool(_preflight, context, context.storage.load_request(snapshot.id))
+    # Resuming continues a session whose light/power-meter setup was already validated
+    # (and, for real lights, already load-probed at full brightness) the first time it
+    # ran. Re-running that probe here repeats a slow, disruptive step for no new
+    # information, and previously ran long enough to blow past the ingress proxy's
+    # response timeout -- the browser gives up and shows nothing, even though the probe
+    # (and then the resumed session) keeps running to completion server-side regardless.
+    await run_in_threadpool(
+        _preflight,
+        context,
+        context.storage.load_request(snapshot.id),
+        skip_light_load_probe=True,
+        skip_power_meter_diagnostic=True,
+    )
     try:
         snapshot = context.coordinator.resume(snapshot.id)
     except SessionConflictError as error:
@@ -869,19 +1342,23 @@ def _session_files(context: AppContext, snapshot: SessionSnapshot) -> list[Sessi
 
 
 async def _session_plots(context: AppContext, snapshot: SessionSnapshot) -> SessionPlots:
-    if snapshot.state in ACTIVE_SESSION_STATES:
-        raise HTTPException(status_code=409, detail="Plots are available after the measurement stops")
+    if snapshot.state in PRE_DATA_SESSION_STATES:
+        raise HTTPException(status_code=409, detail="Plots are available once the measurement starts taking readings")
     names = context.storage.list_files(snapshot.id)
     paths = {name: context.storage.file_path(snapshot.id, name) for name in names}
     result = await run_in_threadpool(
         build_session_plots,
         context.storage.load_request(snapshot.id),
         paths,
+        inherited_keys=_inherited_plot_keys(context, snapshot),
+        ignored_ids=load_ignored(context.storage.session_directory(snapshot.id)),
+        measured_modes_only=snapshot.state in {SessionState.RUNNING, SessionState.CANCELLING},
     )
     return SessionPlots(
         partial=snapshot.state is not SessionState.COMPLETED,
         plots=list(result.plots),
         warnings=list(result.warnings),
+        editable=snapshot.state not in ACTIVE_SESSION_STATES,
     )
 
 
@@ -950,6 +1427,7 @@ def _measure_definitions() -> list[MeasureDefinition]:
                     default=field.default,
                     minimum=field.minimum,
                     maximum=field.maximum,
+                    step=field.step,
                     multiple=field.multiple,
                     plural_label=field.plural_label,
                     derived_from=field.derived_from,
@@ -1004,28 +1482,125 @@ def _test_power_meter(context: AppContext, settings: AppSettingsUpdate) -> Power
     return context.power_meter_diagnostics.evaluate(
         spec,
         force=True,
-        build_power_meter=lambda power_meter_spec: MeasurementAssembler(
-            ImmediateInteraction(),
-            home_assistant=context.home_assistant,
+        build_power_meter=lambda power_meter_spec: context.build_power_meter(
+            power_meter_spec,
             shelly_password=password,
-        ).build_power_meter(power_meter_spec),
+        ),
     )
 
 
-def _power_meter_spec(settings: AppPreferences) -> PowerMeterSpec:
-    if settings.power_meter == PowerMeterType.DUMMY:
-        return DummyPowerMeterSpec()
-    if settings.power_meter == PowerMeterType.SHELLY:
-        if not settings.shelly_ip:
-            raise PowerMeterError("Enter the Shelly IP address first")
-        return ShellyPowerMeterSpec(device_ip=settings.shelly_ip, username=settings.shelly_username)
-    if settings.power_meter == PowerMeterType.KASA:
-        if not settings.kasa_ip:
-            raise PowerMeterError("Enter the Kasa IP address first")
-        return KasaPowerMeterSpec(device_ip=settings.kasa_ip)
-    if not settings.default_power_entity_id:
+def _dummy_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    return DummyPowerMeterSpec()
+
+
+def _shelly_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.device_ip:
+        raise PowerMeterError("Enter the Shelly IP address first")
+    return ShellyPowerMeterSpec(device_ip=draft.device_ip, username=draft.username)
+
+
+def _kasa_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.device_ip:
+        raise PowerMeterError("Enter the Kasa IP address first")
+    return KasaPowerMeterSpec(device_ip=draft.device_ip)
+
+
+def _mystrom_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.device_ip:
+        raise PowerMeterError("Enter the myStrom IP address first")
+    return MyStromPowerMeterSpec(device_ip=draft.device_ip)
+
+
+def _tasmota_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.device_ip:
+        raise PowerMeterError("Enter the Tasmota IP address first")
+    return TasmotaPowerMeterSpec(device_ip=draft.device_ip)
+
+
+def _tuya_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.device_id or not draft.device_ip:
+        raise PowerMeterError("Enter the Tuya device ID and IP address first")
+    return TuyaPowerMeterSpec(device_id=draft.device_id, device_ip=draft.device_ip, version=draft.version)
+
+
+def _owon_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.port or draft.baudrate is None or draft.channel is None:
+        raise PowerMeterError("Configure the Owon serial port, baud rate, and channel first")
+    return OwonOwh98xxPowerMeterSpec(
+        port=draft.port,
+        baudrate=draft.baudrate,
+        timeout=draft.timeout,
+        channel=draft.channel,
+    )
+
+
+def _ocr_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    return OcrPowerMeterSpec(
+        source=draft.source,
+        layout=draft.layout,
+        preview_host=draft.preview_host,
+        preview_port=draft.preview_port,
+        window_seconds=draft.window_seconds,
+        stale_after_seconds=draft.stale_after_seconds,
+        crosscheck_tolerance_pct=draft.crosscheck_tolerance_pct,
+        min_current_for_crosscheck=draft.min_current_for_crosscheck,
+    )
+
+
+def _hass_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    if not draft.entity_id:
         raise PowerMeterError("Select a power sensor first")
-    return HassPowerMeterSpec(entity_id=settings.default_power_entity_id)
+    return HassPowerMeterSpec(
+        entity_id=draft.entity_id,
+        voltage_entity_id=draft.voltage_entity_id,
+        max_age_seconds=draft.max_age_seconds,
+    )
+
+
+_SINGLE_METER_SPEC_BUILDERS: dict[PowerMeterType, Callable[[WitnessMeterSettings], SinglePowerMeterSpec]] = {
+    PowerMeterType.DUMMY: _dummy_meter_spec,
+    PowerMeterType.SHELLY: _shelly_meter_spec,
+    PowerMeterType.KASA: _kasa_meter_spec,
+    PowerMeterType.MYSTROM: _mystrom_meter_spec,
+    PowerMeterType.TASMOTA: _tasmota_meter_spec,
+    PowerMeterType.TUYA: _tuya_meter_spec,
+    PowerMeterType.OWON_OWH98XX: _owon_meter_spec,
+    PowerMeterType.OCR: _ocr_meter_spec,
+    PowerMeterType.HASS: _hass_meter_spec,
+}
+"""Every meter the app can build from a settings-level draft. Deliberately excludes
+``MANUAL`` (blocks on ``input()``, which has no console to read from inside the app's
+background worker) and ``COMPOSITE`` (a composite wraps these, rather than being one)."""
+
+
+def _single_meter_spec(draft: WitnessMeterSettings) -> SinglePowerMeterSpec:
+    """Convert one settings-level meter draft (the primary's, or a witness's) into a
+    validated spec, raising ``PowerMeterError`` naming whatever is still missing."""
+    builder = _SINGLE_METER_SPEC_BUILDERS.get(draft.type, _hass_meter_spec)
+    return builder(draft)
+
+
+def _power_meter_spec(settings: AppPreferences) -> PowerMeterSpec:
+    """The configured session-default meter: the primary alone, or wrapped as a composite
+    with its witnesses once at least one is configured (matching
+    ``CompositePowerMeterSpec.witnesses``' minimum length of one)."""
+    primary = _single_meter_spec(settings.primary_meter_draft())
+    if not settings.witnesses:
+        return primary
+    return CompositePowerMeterSpec(
+        primary=primary,
+        witnesses=[
+            WitnessSpec(
+                meter=_single_meter_spec(witness.meter),
+                position=witness.position,
+                offset_w=witness.offset_w,
+                tolerance_w=witness.tolerance_w,
+                tolerance_pct=witness.tolerance_pct,
+                required=witness.required,
+            )
+            for witness in settings.witnesses
+        ],
+    )
 
 
 def _matching_dummy_load_calibration(context: AppContext) -> DummyLoadCalibration | None:
@@ -1036,17 +1611,33 @@ def _matching_dummy_load_calibration(context: AppContext) -> DummyLoadCalibratio
         spec = _power_meter_spec(context.storage.load_settings())
     except PowerMeterError:
         return None
-    if isinstance(spec, HassPowerMeterSpec):
-        snapshot = HomeAssistantEntityCatalog(context.home_assistant).load_snapshot()
-        spec = spec.model_copy(
-            update={
-                "voltage_entity_id": snapshot.related_entity_id(spec.entity_id, DeviceClass.VOLTAGE),
-            },
-        )
+    spec = _with_related_voltage(spec, context)
     return calibration if calibration.power_meter_fingerprint == power_meter_fingerprint(spec) else None
 
 
-def _preflight(context: AppContext, payload: MeasurementRequest) -> PreflightResponse:
+def _with_related_voltage(spec: PowerMeterSpec, context: AppContext) -> PowerMeterSpec:
+    """Attach the Home Assistant-associated voltage sensor to a Hass meter, whether it is
+    the whole spec or a composite's primary — the fingerprint must reflect it either way
+    since it changes what the meter actually reads."""
+    if isinstance(spec, HassPowerMeterSpec):
+        snapshot = HomeAssistantEntityCatalog(context.home_assistant).load_snapshot()
+        return spec.model_copy(
+            update={"voltage_entity_id": snapshot.related_entity_id(spec.entity_id, DeviceClass.VOLTAGE)},
+        )
+    if isinstance(spec, CompositePowerMeterSpec) and isinstance(spec.primary, HassPowerMeterSpec):
+        primary = cast(HassPowerMeterSpec, _with_related_voltage(spec.primary, context))
+        return spec.model_copy(update={"primary": primary})
+    return spec
+
+
+def _preflight(
+    context: AppContext,
+    payload: MeasurementRequest,
+    *,
+    skip_light_load_probe: bool = True,
+    include_probe_plan: bool = False,
+    skip_power_meter_diagnostic: bool = False,
+) -> PreflightResponse:
     catalog = HomeAssistantEntityCatalog(context.home_assistant)
     snapshot = None
 
@@ -1067,27 +1658,18 @@ def _preflight(context: AppContext, payload: MeasurementRequest) -> PreflightRes
             load_all_entities=lambda: catalog.load_snapshot().all(),
             diagnose_power_meter=context.power_meter_diagnostics.evaluate,
             developer_mode=context.developer_mode,
-        ).validate(payload)
-        light_load_probe = (
-            context.light_load_probe.evaluate(payload)
-            if isinstance(payload, LightMeasurementRequest)
-            and payload.dummy_load is None
-            and not payload.controller.is_dummy
-            and not isinstance(payload.power_meter, DummyPowerMeterSpec)
-            and bool(payload.modes - {LutMode.EFFECT})
+            load_measured_variations=lambda session_id: _seed_measured_variations(context, session_id),
+        ).validate(payload, skip_power_meter_diagnostic=skip_power_meter_diagnostic)
+        del skip_light_load_probe
+        probe_steps = (
+            list(context.light_load_probe.plan(payload))
+            if include_probe_plan and light_load_probe_applies(payload)
             else None
         )
     except ActiveSessionError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except LightLoadProbeError as error:
-        if error.help_url is None or error.help_label is None:
-            raise HTTPException(status_code=422, detail=str(error)) from error
-        raise DocumentedHTTPException(
-            status_code=422,
-            detail=str(error),
-            help_url=error.help_url,
-            help_label=error.help_label,
-        ) from error
+        raise _probe_http_error(error) from error
     except PreflightError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return PreflightResponse(
@@ -1099,8 +1681,178 @@ def _preflight(context: AppContext, payload: MeasurementRequest) -> PreflightRes
         power_meter_diagnostic=result.power_meter_diagnostic,
         battery_level_entity_id=result.battery_level_entity_id,
         battery_level_attribute=result.battery_level_attribute,
-        light_load_probe=light_load_probe,
+        light_load_probe=None,
+        probe_steps=probe_steps,
     )
+
+
+def _probe_http_error(error: LightLoadProbeError) -> HTTPException:
+    if error.help_url is None or error.help_label is None:
+        return HTTPException(status_code=422, detail=str(error))
+    return DocumentedHTTPException(
+        status_code=422,
+        detail=str(error),
+        help_url=error.help_url,
+        help_label=error.help_label,
+    )
+
+
+def _estimate(context: AppContext, payload: LightMeasurementRequest) -> LightEstimateResponse:
+    catalog = HomeAssistantEntityCatalog(context.home_assistant)
+    snapshot = None
+
+    def load_entities(
+        domain: EntityDomain | None,
+        device_class: DeviceClass | None,
+    ) -> list[EntityDescriptor]:
+        nonlocal snapshot
+        if snapshot is None:
+            snapshot = catalog.load_snapshot()
+        return snapshot.select(domain=domain, device_class=device_class)
+
+    try:
+        result = estimate_light_measurement(
+            payload,
+            load_entities=load_entities,
+            load_measured_variations=lambda session_id: _seed_measured_variations(context, session_id),
+            load_measured_points=lambda session_id: _seed_measured_points(context, session_id),
+            load_historical_runs=lambda: _historical_run_timings(context),
+        )
+    except RunnerError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return LightEstimateResponse(
+        modes=[
+            LightModeEstimateResponse(mode=item.mode, axes=item.axes, points=item.points, summary=item.summary)
+            for item in result.modes
+        ],
+        total_points=result.total_points,
+        total_readings=result.total_readings,
+        max_duration_seconds=result.max_duration_seconds,
+        used_default_range=result.used_default_range,
+        remaining_points=result.remaining_points,
+        estimated_duration_seconds=result.estimated_duration_seconds,
+        estimated_from_runs=result.estimated_from_runs,
+    )
+
+
+def _historical_run_timings(context: AppContext) -> tuple[HistoricalRunTiming, ...]:
+    """Completed light runs with a usable wall-clock rate, newest-first from storage."""
+
+    runs: list[HistoricalRunTiming] = []
+    for snapshot in context.storage.list_sessions():
+        new_points = max(0, snapshot.completed - snapshot.already_measured)
+        if snapshot.state in ACTIVE_SESSION_STATES or new_points < 5 or not snapshot.run_started_at:
+            continue
+        elapsed = elapsed_seconds(snapshot.run_started_at, ended_at=snapshot.updated_at)
+        if elapsed is None or elapsed <= 0:
+            continue
+        try:
+            request = context.storage.load_request(snapshot.id)
+        except SESSION_LOAD_ERRORS:
+            continue
+        if not isinstance(request, LightMeasurementRequest) or request.fast_test_mode:
+            continue
+        runs.append(
+            HistoricalRunTiming(
+                session_id=snapshot.id,
+                model_id=request.model_id,
+                measure_device=request.measure_device,
+                elapsed_seconds=elapsed,
+                completed_points=new_points,
+                modes=frozenset(request.modes),
+                fast_test_mode=request.fast_test_mode,
+            ),
+        )
+    return tuple(runs)
+
+
+def _inherited_plot_keys(context: AppContext, snapshot: SessionSnapshot) -> dict[LutMode, set[Variation]]:
+    """Seed LUT keys that this refine has not rewritten yet."""
+
+    try:
+        request = context.storage.load_request(snapshot.id)
+    except SESSION_LOAD_ERRORS:
+        return {}
+    if not isinstance(request, LightMeasurementRequest):
+        return {}
+    if request.resume_policy != ResumePolicy.EXTEND or not request.seed_session_id:
+        return {}
+    seed = _seed_measured_variations(context, request.seed_session_id)
+    collected = _variations_recorded_since(context, snapshot, request)
+    return {mode: keys - collected.get(mode, set()) for mode, keys in seed.items()}
+
+
+def _variations_recorded_since(
+    context: AppContext,
+    snapshot: SessionSnapshot,
+    request: LightMeasurementRequest,
+) -> dict[LutMode, set[Variation]]:
+    started = raw_since_timestamp(snapshot)
+    artifact = context.storage.artifact_directory(snapshot.id, request.model_id)
+    found: dict[LutMode, set[Variation]] = {}
+    for mode in LutMode:
+        path = artifact / f"{mode.value}.raw.jsonl"
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if float(row.get("timestamp") or 0) < started:
+                continue
+            variation = _variation_from_raw(row.get("variation"), mode)
+            if variation is not None:
+                found.setdefault(mode, set()).add(variation)
+    return found
+
+
+def _variation_from_raw(data: object, mode: LutMode) -> Variation | None:
+    if not isinstance(data, dict):
+        return None
+    try:
+        if mode is LutMode.BRIGHTNESS:
+            return Variation(bri=int(data["bri"]))
+        if mode is LutMode.COLOR_TEMP:
+            return ColorTempVariation(bri=int(data["bri"]), ct=int(data["ct"]))
+        if mode is LutMode.HS:
+            return HsVariation(bri=int(data["bri"]), hue=int(data["hue"]), sat=int(data["sat"]))
+        if mode is LutMode.EFFECT:
+            return EffectVariation(effect=str(data["effect"]), bri=int(data["bri"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _seed_artifact_directory(context: AppContext, session_id: str) -> Path | None:
+    try:
+        request = context.storage.load_request(session_id)
+    except SESSION_LOAD_ERRORS:
+        return None
+    if not isinstance(request, LightMeasurementRequest):
+        return None
+    return context.storage.artifact_directory(session_id, request.model_id)
+
+
+def _seed_measured_variations(context: AppContext, session_id: str) -> dict[LutMode, set[Variation]]:
+    directory = _seed_artifact_directory(context, session_id)
+    return load_session_measured_variations(directory) if directory is not None else {}
+
+
+def _seed_measured_points(context: AppContext, session_id: str) -> dict[LutMode, list[MeasuredPoint]]:
+    directory = _seed_artifact_directory(context, session_id)
+    if directory is None:
+        return {}
+    return {
+        mode: [MeasuredPoint(variation, row.watt) for variation, row in rows.items()]
+        for mode, rows in load_session_measured_rows(directory).items()
+    }
 
 
 def _apply_fast_test_mode(context: AppContext, request: MeasurementRequest) -> MeasurementRequest:
@@ -1137,22 +1889,70 @@ def _is_active(snapshot: SessionSnapshot | None) -> bool:
     return snapshot is not None and snapshot.state in ACTIVE_SESSION_STATES
 
 
+def _measured_variations(context: AppContext, session_id: str, request: MeasurementRequest) -> list:
+    if not isinstance(request, LightMeasurementRequest):
+        return []
+    try:
+        by_mode = load_session_measured_variations(context.storage.artifact_directory(session_id, request.model_id))
+    except OSError:
+        return []
+    return [variation for keys in by_mode.values() for variation in keys]
+
+
+def _has_complete_lut_row(context: AppContext, session_id: str, request: MeasurementRequest) -> bool:
+    return bool(_measured_variations(context, session_id, request))
+
+
+def _can_refine(context: AppContext, snapshot: SessionSnapshot, request: MeasurementRequest) -> bool:
+    return isinstance(request, LightMeasurementRequest) and context.storage.has_lut_csv(snapshot.id)
+
+
+def _can_merge(context: AppContext, snapshot: SessionSnapshot, request: MeasurementRequest) -> bool:
+    return _can_refine(context, snapshot, request) and not _is_active(snapshot)
+
+
+def _sweep_coverage(context: AppContext, snapshot: SessionSnapshot) -> object:
+    try:
+        request = context.storage.load_request(snapshot.id)
+        measured = _measured_variations(context, snapshot.id, request)
+        return build_sweep_coverage(request, measured, snapshot.operating_point)
+    except (SESSION_LOAD_ERRORS, OSError, ValueError):
+        return None
+
+
+def _duration_seconds(value: str | None) -> int | None:
+    if value is None:
+        return None
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([hms])", value)
+    if match is None:
+        return None
+    multiplier = {"h": 3600, "m": 60, "s": 1}[match.group(2)]
+    return round(float(match.group(1)) * multiplier)
+
+
 def _snapshot_response(context: AppContext, snapshot: SessionSnapshot) -> SessionSnapshotResponse:
+    elapsed, remaining = snapshot_progress_timing(snapshot)
     return SessionSnapshotResponse(
         session_id=snapshot.id,
         state=snapshot.state,
         created_at=snapshot.created_at,
         updated_at=snapshot.updated_at,
         phase=snapshot.phase,
+        activity_reason=snapshot.activity_reason,
         confirmation_message=snapshot.confirmation_message,
         confirmation_action=snapshot.confirmation_action,
         mode=snapshot.mode,
+        run_started_at=snapshot.run_started_at,
+        wait_ends_at=snapshot.wait_ends_at,
+        wait_seconds=snapshot.wait_seconds,
         progress=SessionProgressResponse(
             completed=snapshot.completed,
             total=snapshot.total,
             skipped=snapshot.skipped,
+            already_measured=snapshot.already_measured,
             percent=snapshot.progress,
-            estimated_remaining_seconds=_duration_seconds(snapshot.estimated_remaining),
+            elapsed_seconds=elapsed,
+            estimated_remaining_seconds=remaining if remaining is not None else _duration_seconds(snapshot.estimated_remaining),
         ),
         warnings=list(snapshot.warnings),
         error=snapshot.error,
@@ -1166,12 +1966,35 @@ def _snapshot_response(context: AppContext, snapshot: SessionSnapshot) -> Sessio
         entity_states=snapshot.entity_states,
         can_analyse=snapshot.state not in ACTIVE_SESSION_STATES and context.storage.can_analyse(snapshot.id),
         request=context.storage.load_request(snapshot.id),
+        sweep_coverage=_sweep_coverage(context, snapshot),
     )
 
 
-def _session_summary(context: AppContext, snapshot: SessionSnapshot) -> SessionSummary:
+def _optional_entity_catalog(context: AppContext) -> EntityCatalogSnapshot | None:
+    try:
+        return HomeAssistantEntityCatalog(context.home_assistant).load_snapshot()
+    except Exception as error:  # noqa: BLE001 - listing still works without live HA identity
+        _LOGGER.warning("Could not resolve device identity for the session list: %s", error)
+        return None
+
+
+def _session_summaries(context: AppContext) -> list[SessionSummary]:
+    """List cards from state.json + request.json. Do not parse LUT CSVs or raw logs."""
+
+    catalog = _optional_entity_catalog(context)
+    summaries = [_session_summary(context, snapshot, catalog) for snapshot in context.coordinator.sessions()]
+    return sorted(summaries, key=lambda item: not item.active)
+
+
+def _session_summary(
+    context: AppContext,
+    snapshot: SessionSnapshot,
+    catalog: EntityCatalogSnapshot | None = None,
+) -> SessionSummary:
     request = context.storage.load_request(snapshot.id)
     current = context.coordinator.current
+    manufacturer, product, title = session_identity(request, descriptor_for_request(request, catalog))
+    file_count, size = context.storage.session_listing_stats(snapshot.id)
     return SessionSummary(
         session_id=snapshot.id,
         state=snapshot.state,
@@ -1179,28 +2002,54 @@ def _session_summary(context: AppContext, snapshot: SessionSnapshot) -> SessionS
         updated_at=snapshot.updated_at,
         measure_type=request.measure_type,
         model_id=request.model_id,
-        product_name=(
-            request.session_name or request.product_name or ", ".join(request.controlled_entity_ids) or "Measurement"
-        ),
+        product_name=title,
+        manufacturer=manufacturer,
         measure_device=request.measure_device,
         completed=snapshot.completed,
         total=snapshot.total,
         percent=snapshot.progress,
-        can_resume=context.storage.can_resume(snapshot.id) and snapshot.state in RESUMABLE_SESSION_STATES,
-        file_count=len(context.storage.list_files(snapshot.id)),
-        size=context.storage.session_size(snapshot.id),
+        can_resume=(
+            snapshot.state in RESUMABLE_SESSION_STATES
+            and isinstance(request, LightMeasurementRequest)
+        ),
+        can_refine=_can_refine(context, snapshot, request),
+        can_merge=_can_merge(context, snapshot, request),
+        file_count=file_count,
+        size=size,
         active=current is not None and current.id == snapshot.id and _is_active(snapshot),
+        family_key=session_family_key(request, product=product),
+        modes=session_modes(request),
+        run_started_at=snapshot.run_started_at,
+        duration_seconds=session_duration_seconds(snapshot),
+        already_measured=snapshot.already_measured,
+        measured=points_this_run(
+            completed=snapshot.completed,
+            already_measured=snapshot.already_measured,
+            recorded=None,
+        ),
+        seed_session_id=request.seed_session_id,
+        can_analyse=snapshot.state not in ACTIVE_SESSION_STATES and context.storage.can_analyse(snapshot.id),
     )
 
 
-def _duration_seconds(value: str | None) -> int | None:
-    if value is None:
+def _has_raw_log(context: AppContext, snapshot: SessionSnapshot, request: MeasurementRequest) -> bool:
+    if not isinstance(request, LightMeasurementRequest):
+        return False
+    artifact = context.storage.artifact_directory(snapshot.id, request.model_id)
+    return any((artifact / f"{mode.value}.raw.jsonl").is_file() for mode in LutMode)
+
+
+def _recorded_points_this_run(
+    context: AppContext,
+    snapshot: SessionSnapshot,
+    request: MeasurementRequest,
+) -> int | None:
+    """Unique LUT keys written during this run, or None when there is no raw log."""
+
+    if not isinstance(request, LightMeasurementRequest) or not _has_raw_log(context, snapshot, request):
         return None
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)([hms])", value)
-    if match is None:
-        return None
-    multiplier = {"h": 3600, "m": 60, "s": 1}[match.group(2)]
-    return round(float(match.group(1)) * multiplier)
+    recorded = _variations_recorded_since(context, snapshot, request)
+    return sum(len(keys) for keys in recorded.values())
 
 
 def _file_descriptor(path: Path, name: str) -> SessionFile:
@@ -1223,6 +2072,10 @@ async def _event_stream(request: Request, context: AppContext, session_id: str) 
             for event in events:
                 sequence = max(sequence, event.sequence)
                 yield _encode_event(context, event, session_id)
+            # Comment frame so a proxy that was holding the small log/sample
+            # payloads (no snapshot) actually flushes them.
+            yield ": \n\n"
+            await asyncio.sleep(_SSE_BUSY_SLEEP)
         else:
             try:
                 snapshot = context.coordinator.get(session_id)
@@ -1235,19 +2088,66 @@ async def _event_stream(request: Request, context: AppContext, session_id: str) 
                 snapshot=_snapshot_response(context, snapshot),
             )
             yield f"event: heartbeat\ndata: {heartbeat.model_dump_json()}\n\n"
-        await asyncio.sleep(1)
+            await asyncio.sleep(_SSE_IDLE_SLEEP)
+
+
+_SSE_BUSY_SLEEP = 0.05
+_SSE_IDLE_SLEEP = 1.0
+_SSE_SNAPSHOT_TYPES = frozenset(
+    {
+        SessionEventType.STATE,
+        SessionEventType.PHASE,
+        SessionEventType.PROGRESS,
+        SessionEventType.CHECKPOINT,
+        SessionEventType.OPERATING_POINT,
+        SessionEventType.WARNING,
+    }
+)
+_LOG_LINE_TYPES = frozenset({SessionEventType.LOG, SessionEventType.WARNING, SessionEventType.CHECKPOINT})
+
+
+def _session_log_entries(
+    context: AppContext,
+    session_id: str,
+    *,
+    after: int = 0,
+) -> list[dict[str, str | int]]:
+    """The running view's log card. Same lines events.jsonl already stored.
+
+    ``after`` is an event sequence: only newer log lines, served from the live
+    in-memory ring when this session is the active one (no full jsonl scan).
+    """
+
+    events = (
+        context.coordinator.events_since(after, session_id)
+        if after > 0
+        else context.storage.load_events(session_id, limit=5000)
+    )
+    lines: list[dict[str, str | int]] = []
+    for event in events:
+        if event.type not in _LOG_LINE_TYPES:
+            continue
+        message = event.data.get("message")
+        if not isinstance(message, str) or not message:
+            continue
+        lines.append({"time": event.created_at, "message": message, "sequence": event.sequence})
+    return lines
 
 
 def _encode_event(context: AppContext, event: SessionEvent, session_id: str) -> str:
-    try:
-        snapshot = context.coordinator.get(session_id)
-    except SESSION_LOAD_ERRORS:
-        snapshot = None
-    payload = SessionEventResponse(
-        sequence=event.sequence,
-        type=event.type,
-        data=event.data,
-        snapshot=_snapshot_response(context, snapshot) if snapshot is not None else None,
-    )
-    exclude = {"snapshot"} if snapshot is None else None
-    return f"id: {event.sequence}\nevent: {event.type}\ndata: {payload.model_dump_json(exclude=exclude)}\n\n"
+    payload = {
+        "sequence": event.sequence,
+        "type": event.type,
+        "created_at": event.created_at,
+        "data": event.data,
+    }
+    # Log/sample chatter is frequent. Rebuilding sweep coverage on every line
+    # made the stream too heavy to flush, so the running view never saw it.
+    if event.type in _SSE_SNAPSHOT_TYPES:
+        try:
+            snapshot = context.coordinator.get(session_id)
+        except SESSION_LOAD_ERRORS:
+            snapshot = None
+        if snapshot is not None:
+            payload["snapshot"] = _snapshot_response(context, snapshot).model_dump(mode="json")
+    return f"id: {event.sequence}\nevent: {event.type}\ndata: {json.dumps(payload, default=str)}\n\n"

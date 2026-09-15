@@ -13,16 +13,22 @@ class SessionInteraction(RunInteraction):
     def confirm(self, message: str, *, action: str | None = None) -> None:
         self.control.confirm(message, action=action)
 
-    def notify(self, message: str) -> None:
-        self.control.log(message)
+    def notify(self, message: str, *, warning: bool = False) -> None:
+        self.control.log(message, warning=warning)
 
     def choose(self, message: str, *, default: bool) -> bool:
         choice = "yes" if default else "no"
         self.control.log(f"{message} Using the non-interactive default: {choice}.")
         return default
 
-    def phase(self, message: str) -> None:
-        self.control.phase(message)
+    def phase(
+        self,
+        message: str,
+        *,
+        wait_seconds: float | None = None,
+        reason: str | None = None,
+    ) -> None:
+        self.control.phase(message, wait_seconds=wait_seconds, reason=reason)
 
     def progress(
         self,
@@ -32,6 +38,7 @@ class SessionInteraction(RunInteraction):
         phase: str,
         remaining_seconds: float | None = None,
         skipped: int = 0,
+        already_measured: int = 0,
     ) -> None:
         remaining = "" if remaining_seconds is None else f"{int(remaining_seconds)}s"
         self.control.progress(
@@ -40,6 +47,7 @@ class SessionInteraction(RunInteraction):
             mode=phase,
             estimated_remaining=remaining,
             skipped=skipped,
+            already_measured=already_measured,
         )
 
     def wait(self, seconds: float) -> None:

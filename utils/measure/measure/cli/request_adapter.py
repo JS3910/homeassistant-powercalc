@@ -20,6 +20,7 @@ from measure.controller.media.const import MediaControllerType
 from measure.controller.media.spec import DummyMediaControllerSpec, HassMediaControllerSpec
 from measure.powermeter.const import QUESTION_POWERMETER_ENTITY_ID, QUESTION_VOLTAGEMETER_ENTITY_ID, PowerMeterType
 from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
     DummyPowerMeterSpec,
     HassPowerMeterSpec,
     KasaPowerMeterSpec,
@@ -29,8 +30,10 @@ from measure.powermeter.spec import (
     OwonOwh98xxPowerMeterSpec,
     PowerMeterSpec,
     ShellyPowerMeterSpec,
+    SinglePowerMeterSpec,
     TasmotaPowerMeterSpec,
     TuyaPowerMeterSpec,
+    WitnessSpec,
 )
 from measure.request import (
     AverageMeasurementRequest,
@@ -110,9 +113,39 @@ def _parameters_from_environment(environment: CliEnvironment) -> MeasurementPara
     )
 
 
-# Disable function too complex for this, as it is a simple function to read
-def _power_meter_spec(environment: CliEnvironment, answers: dict[str, Any]) -> PowerMeterSpec:  # noqa: C901
+def _power_meter_spec(environment: CliEnvironment, answers: dict[str, Any]) -> PowerMeterSpec:
+    """The primary meter from ``POWER_METER``, wrapped in a composite when ``WITNESS_METERS`` is set."""
     selected = environment.selected_power_meter
+    if selected == PowerMeterType.COMPOSITE:
+        raise ValueError(
+            "POWER_METER=composite is not a meter; set the primary type and list witnesses in WITNESS_METERS",
+        )
+    primary = _single_power_meter_spec(selected, environment, answers)
+    witnesses = environment.witness_meters
+    if not witnesses:
+        return primary
+    return CompositePowerMeterSpec(
+        primary=primary,
+        witnesses=[
+            WitnessSpec(
+                meter=_single_power_meter_spec(meter_type, environment, answers),
+                position=environment.witness_position(meter_type),
+                offset_w=environment.witness_offset_w(meter_type),
+                tolerance_w=environment.witness_tolerance_w(meter_type),
+                tolerance_pct=environment.witness_tolerance_pct(meter_type),
+                required=environment.witness_required(meter_type),
+            )
+            for meter_type in witnesses
+        ],
+    )
+
+
+# Disable function too complex for this, as it is a simple function to read
+def _single_power_meter_spec(  # noqa: C901
+    selected: PowerMeterType,
+    environment: CliEnvironment,
+    answers: dict[str, Any],
+) -> SinglePowerMeterSpec:
     if selected == PowerMeterType.DUMMY:
         return DummyPowerMeterSpec()
     if selected == PowerMeterType.HASS:
@@ -120,6 +153,7 @@ def _power_meter_spec(environment: CliEnvironment, answers: dict[str, Any]) -> P
             entity_id=_required_answer(answers, QUESTION_POWERMETER_ENTITY_ID),
             voltage_entity_id=_optional_answer(answers, QUESTION_VOLTAGEMETER_ENTITY_ID),
             call_update_entity=environment.hass_call_update_entity_service,
+            max_age_seconds=environment.hass_max_age_seconds,
         )
     if selected == PowerMeterType.KASA:
         return KasaPowerMeterSpec(device_ip=environment.kasa_device_ip)
@@ -128,7 +162,15 @@ def _power_meter_spec(environment: CliEnvironment, answers: dict[str, Any]) -> P
     if selected == PowerMeterType.MYSTROM:
         return MyStromPowerMeterSpec(device_ip=environment.mystrom_device_ip)
     if selected == PowerMeterType.OCR:
-        return OcrPowerMeterSpec()
+        return OcrPowerMeterSpec(
+            source=environment.ocr_source,
+            layout=environment.ocr_layout,
+            preview_host=environment.ocr_preview_host,
+            preview_port=environment.ocr_preview_port,
+            window_seconds=environment.ocr_window_seconds,
+            stale_after_seconds=environment.ocr_stale_after_seconds,
+            crosscheck_tolerance_pct=environment.ocr_crosscheck_tolerance_pct,
+        )
     if selected == PowerMeterType.SHELLY:
         return ShellyPowerMeterSpec(
             device_ip=environment.shelly_ip,

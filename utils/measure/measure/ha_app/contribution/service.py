@@ -492,6 +492,23 @@ class _PreviewContent:
     warnings: list[str]
 
 
+def _profile_model_identity(raw_model_id: str, aliases: list[str]) -> tuple[str, list[str]]:
+    """Prefer a manufacturer product identifier over a numeric Home Assistant store SKU.
+
+    Matter/Thread devices often report only a short catalog number (``36867``). Powercalc
+    library folders use the identifier from the manufacturer's page (``LED2408G10``), so a
+    digits-only value is kept as an alias and the model ID is left blank for the operator.
+    """
+
+    value = raw_model_id.strip()
+    if not value:
+        return "", aliases
+    if value.isdigit():
+        extras = [value] if value not in aliases else []
+        return "", extras + aliases
+    return value, aliases
+
+
 def draft_from_request(
     *,
     session_id: str,
@@ -512,17 +529,21 @@ def draft_from_request(
     artifact_model = _artifact_model(artifact_root)
     voltage_range = _voltage_range(artifact_model)
     author = _first_author(artifact_model)
+    model_id, aliases = _profile_model_identity(
+        request.model_id or default_model_id or "",
+        _string_list(artifact_model.get("aliases")),
+    )
     content = _PreviewContent(
         manufacturer_name=manufacturer or "",
         manufacturer_directory="",
         manufacturer_library_url=None,
-        model_id=request.model_id or default_model_id or "",
+        model_id=model_id,
         product_name=request.product_name,
         contributor=str(author.get("name") or default_contributor_name or auth.username or ""),
         contributor_github=str(author.get("github") or default_contributor_github or auth.username or ""),
         contributor_email=str(author.get("email") or default_contributor_email or ""),
-        aliases=_string_list(artifact_model.get("aliases")),
-        gtins=_string_list(artifact_model.get("gtin")),
+        aliases=aliases,
+        gtins=_string_list(artifact_model.get("gtin") or artifact_model.get("ean")),
         product_url=str(artifact_model.get("product_url") or ""),
         mains_voltage=_model_mains_voltage(artifact_model),
         voltage_range=voltage_range,

@@ -1,3 +1,4 @@
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 import math
 from typing import Any
@@ -69,6 +70,31 @@ class EntityDescriptor(BaseModel):
     max_mired: int | None = None
     related_voltage_entity_id: str | None = None
     member_entity_ids: list[str] = Field(default_factory=list)
+
+
+def leaf_light_entity_ids(
+    selected_ids: Sequence[str],
+    members_by_id: Mapping[str, Sequence[str]],
+) -> list[str]:
+    """Flatten selected lights through HA group membership to unique leaf entities."""
+
+    leaves: list[str] = []
+    seen: set[str] = set()
+
+    def walk(entity_id: str) -> None:
+        if entity_id in seen:
+            return
+        seen.add(entity_id)
+        members = [str(member) for member in members_by_id.get(entity_id, ()) if member]
+        if members:
+            for member in members:
+                walk(member)
+            return
+        leaves.append(entity_id)
+
+    for entity_id in selected_ids:
+        walk(entity_id)
+    return leaves
 
 
 class EntityCatalogSnapshot:

@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
 from statistics import mean
 import time
@@ -11,6 +12,7 @@ from measure.cancellation import MeasurementCancelledError as MeasurementCancell
 from measure.const import DUMMY_LOAD_MEASUREMENT_COUNT, DUMMY_LOAD_MEASUREMENTS_DURATION, Trend
 from measure.dummy_load import DummyLoadCalibration
 from measure.model import write_model_json
+from measure.powermeter.powermeter import PowerMeter
 from measure.request import (
     DummyLoadRequest,
     DummyLoadReuseRequest,
@@ -18,9 +20,12 @@ from measure.request import (
     MeasurementRequest,
     RecorderMeasurementRequest,
     RecorderPurpose,
+    ResumePolicy,
 )
 from measure.runner.runner import MeasurementRunner, RunnerResult
 from measure.util.measure_util import DummyLoadMeasurementError, MeasureUtil
+
+_LOGGER = logging.getLogger("measure")
 
 
 class LightOperatingPoint(TypedDict):
@@ -63,11 +68,22 @@ class RunInteraction(Protocol):
     def choose(self, message: str, *, default: bool) -> bool:
         """Request a binary runtime choice."""
 
-    def notify(self, message: str) -> None:
+    def notify(self, message: str, *, warning: bool = False) -> None:
         """Report information which does not represent a measurement phase."""
 
-    def phase(self, message: str) -> None:
-        """Report the current activity when numeric progress is unavailable."""
+    def phase(
+        self,
+        message: str,
+        *,
+        wait_seconds: float | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Report the current activity when numeric progress is unavailable.
+
+        ``wait_seconds`` is the known remaining wait for that activity, so the UI can
+        show what is happening and how long is left instead of an indeterminate throbber.
+        ``reason`` is why this activity was chosen (hardcoded outline, watt gap, …).
+        """
 
     def progress(
         self,
@@ -77,8 +93,14 @@ class RunInteraction(Protocol):
         phase: str,
         remaining_seconds: float | None = None,
         skipped: int = 0,
+        already_measured: int = 0,
     ) -> None:
-        """Report measurement progress. ``total`` of 0 means the run is open-ended."""
+        """Report measurement progress. ``total`` of 0 means the run is open-ended.
+
+        ``already_measured`` is the seed/resume count already on disk when this run
+        started. Remaining-time estimates must use ``completed - already_measured``
+        as the rate denominator, not ``completed``.
+        """
 
     def wait(self, seconds: float) -> None:
         """Wait for a duration, raising if the run is cancelled."""
@@ -99,13 +121,20 @@ class ImmediateInteraction(RunInteraction):
     def confirm(self, _: str, *, action: str | None = None) -> None:
         del action
 
-    def notify(self, _: str) -> None:
+    def notify(self, _: str, *, warning: bool = False) -> None:
+        del warning
         return
 
     def choose(self, _: str, *, default: bool) -> bool:
         return default
 
-    def phase(self, message: str) -> None:
+    def phase(
+        self,
+        message: str,
+        *,
+        wait_seconds: float | None = None,
+        reason: str | None = None,
+    ) -> None:
         return
 
     def progress(
@@ -116,6 +145,7 @@ class ImmediateInteraction(RunInteraction):
         phase: str,
         remaining_seconds: float | None = None,
         skipped: int = 0,
+        already_measured: int = 0,
     ) -> None:
         return
 
@@ -242,6 +272,7 @@ class PreparedMeasurement:
 
     request: MeasurementRequest
     runner: MeasurementRunner[Any]
+    power_meter: PowerMeter | None = None
     preparations: list[MeasurementPreparation] = field(default_factory=list)
     interaction: RunInteraction = field(default_factory=ImmediateInteraction)
 
@@ -305,14 +336,24 @@ class MeasurementExecution:
                     measure_device=request.measure_device,
                     parameters=request.parameters,
                     extra_json_data=result.model_json_data,
+                    extra_measure_settings=(
+                        {"EXTENDED_FROM": request.seed_session_id}
+                        if request.resume_policy == ResumePolicy.EXTEND and request.seed_session_id
+                        else None
+                    ),
                     voltages=voltages,
                     num_lights=request.multiple_light_count if isinstance(request, LightMeasurementRequest) else None,
                     dummy_load=request.dummy_load is not None,
                     dummy_load_resistance=self._dummy_load_resistance(),
+                    power_meter=request.power_meter,
                 )
             return result
         finally:
             runner.cleanup()
+            try:
+                runner.measure_util.power_meter.close()
+            except Exception as error:  # noqa: BLE001 - cleanup must not mask the measurement outcome
+                _LOGGER.warning("Could not close the power meter after measurement cleanup: %s", error)
 
     def _dummy_load_resistance(self) -> float | None:
         if isinstance(self.measurement.request.dummy_load, DummyLoadReuseRequest):

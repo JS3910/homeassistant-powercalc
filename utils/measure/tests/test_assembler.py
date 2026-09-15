@@ -1,4 +1,5 @@
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 from measure.assembler import MeasurementAssembler
@@ -10,7 +11,20 @@ from measure.controller.light.spec import (
 )
 from measure.execution import RunInteraction
 from measure.home_assistant import HomeAssistantManager
-from measure.powermeter.spec import DummyPowerMeterSpec, HassPowerMeterSpec, ShellyPowerMeterSpec, TuyaPowerMeterSpec
+from measure.powermeter.composite import CompositePowerMeter, Witness
+from measure.powermeter.const import OwonOwh98xxChannelType, WitnessPosition
+from measure.powermeter.dummy import DummyPowerMeter
+from measure.powermeter.errors import PowerMeterError
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    DummyPowerMeterSpec,
+    HassPowerMeterSpec,
+    OcrPowerMeterSpec,
+    OwonOwh98xxPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    TuyaPowerMeterSpec,
+    WitnessSpec,
+)
 from measure.request import (
     AverageMeasurementRequest,
     DummyLoadReuseRequest,
@@ -103,6 +117,7 @@ def test_assembler_applies_typed_home_assistant_configuration_at_construction() 
             entity_id="sensor.power",
             voltage_entity_id="sensor.voltage",
             call_update_entity=True,
+            max_age_seconds=30,
         ),
         controller=HassLightControllerSpec(entity_id="light.test", transition_time=2),
     )
@@ -120,6 +135,7 @@ def test_assembler_applies_typed_home_assistant_configuration_at_construction() 
         True,
         entity_id="sensor.power",
         voltage_entity_id="sensor.voltage",
+        max_age_seconds=30,
         wait=ANY,
     )
     light_controller.assert_called_once_with(
@@ -127,6 +143,7 @@ def test_assembler_applies_typed_home_assistant_configuration_at_construction() 
         2,
         entity_ids=["light.test"],
         wait=ANY,
+        phase=ANY,
     )
 
 
@@ -144,7 +161,13 @@ def test_assembler_builds_multi_light_controller() -> None:
     with patch("measure.assembler.HassLightController") as controller:
         _assembler(home_assistant=home_assistant).assemble(request)
 
-    controller.assert_called_once_with(home_assistant, 2, entity_ids=["light.one", "light.two"], wait=ANY)
+    controller.assert_called_once_with(
+        home_assistant,
+        2,
+        entity_ids=["light.one", "light.two"],
+        wait=ANY,
+        phase=ANY,
+    )
 
 
 def test_assembler_reads_tuya_key_from_cli_config_dependency() -> None:
@@ -182,6 +205,108 @@ def test_assembler_reads_shelly_password_from_secret_dependency() -> None:
         username="measurement",
         password="device-password",  # noqa: S106
     )
+
+
+def test_assembler_builds_composite_meter_with_witnesses() -> None:
+    """Also confirms position + magnitude reach the engine as a signed offset: an
+    AFTER_PRIMARY spec (offset_w a positive magnitude) must arrive at `Witness` as the
+    negative `signed_offset_w`, since that's what `CompositePowerMeter` actually uses for
+    both the agreement comparison and, for AFTER_PRIMARY, correcting the primary."""
+
+    request = AverageMeasurementRequest(
+        duration=10,
+        power_meter=CompositePowerMeterSpec(
+            primary=DummyPowerMeterSpec(),
+            witnesses=[
+                WitnessSpec(
+                    meter=ShellyPowerMeterSpec(device_ip="192.0.2.30"),
+                    position=WitnessPosition.AFTER_PRIMARY,
+                    offset_w=2.45,
+                    tolerance_w=0.3,
+                    tolerance_pct=1.5,
+                    required=False,
+                ),
+            ],
+        ),
+    )
+
+    with patch("measure.assembler.ShellyPowerMeter") as shelly:
+        prepared = _assembler(shelly_password="device-password").assemble(request)  # noqa: S106
+
+    meter = prepared.runner.measure_util.power_meter  # type: ignore[attr-defined]
+    assert isinstance(meter, CompositePowerMeter)
+    assert isinstance(meter.primary, DummyPowerMeter)
+    assert meter.witnesses == (
+        Witness(
+            name="shelly",
+            meter=shelly.return_value,
+            position=WitnessPosition.AFTER_PRIMARY,
+            offset_w=-2.45,
+            tolerance_w=0.3,
+            tolerance_pct=1.5,
+            required=False,
+        ),
+    )
+    shelly.assert_called_once_with("192.0.2.30", 5, username="admin", password="device-password")  # noqa: S106
+
+
+def test_assembler_builds_the_ocr_meter_through_its_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = OcrPowerMeterSpec(source="http://camera.local/", preview_port=None)
+    request = AverageMeasurementRequest(duration=10, power_meter=spec)
+    built = MagicMock()
+    ocr_package = ModuleType("measure.powermeter.ocr")
+    ocr_package.build_ocr_power_meter = built  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "measure.powermeter.ocr", ocr_package)
+
+    prepared = _assembler().assemble(request)
+
+    built.assert_called_once_with(spec)
+    assert prepared.runner.measure_util.power_meter is built.return_value  # type: ignore[attr-defined]
+
+
+def test_assembler_explains_the_missing_ocr_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = AverageMeasurementRequest(duration=10, power_meter=OcrPowerMeterSpec())
+    monkeypatch.setitem(sys.modules, "measure.powermeter.ocr", None)  # makes the import raise ImportError
+
+    with pytest.raises(PowerMeterError, match="needs the 'ocr' extra: uv sync --extra cli --extra ocr"):
+        _assembler().assemble(request)
+
+
+def test_assembler_explains_the_missing_tuya_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = AverageMeasurementRequest(
+        duration=10,
+        power_meter=TuyaPowerMeterSpec(device_id="device-id", device_ip="192.0.2.20", version="3.4"),
+    )
+    monkeypatch.setitem(sys.modules, "measure.powermeter.tuya", None)  # makes the import raise ImportError
+
+    with pytest.raises(PowerMeterError, match="needs the 'cli' extra: uv sync --extra cli"):
+        _assembler(tuya_device_key="device-key").assemble(request)
+
+
+def test_assembler_explains_the_missing_owon_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = AverageMeasurementRequest(
+        duration=10,
+        power_meter=OwonOwh98xxPowerMeterSpec(
+            port="/dev/ttyUSB0",
+            baudrate=9600,
+            channel=OwonOwh98xxChannelType.CHANNEL1,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "measure.powermeter.serial_scpi", None)  # makes the import raise ImportError
+
+    with pytest.raises(PowerMeterError, match="needs the 'cli' extra: uv sync --extra cli"):
+        _assembler().assemble(request)
+
+
+def test_composite_spec_needs_a_witness_and_cannot_nest() -> None:
+    with pytest.raises(ValidationError):
+        CompositePowerMeterSpec(primary=DummyPowerMeterSpec(), witnesses=[])
+
+    nested = {"type": "composite", "primary": {"type": "dummy"}, "witnesses": [{"meter": {"type": "dummy"}}]}
+    with pytest.raises(ValidationError):
+        CompositePowerMeterSpec.model_validate({"type": "composite", "primary": nested, "witnesses": []})
+    with pytest.raises(ValidationError):
+        WitnessSpec.model_validate({"meter": nested})
 
 
 def test_assembler_rejects_a_controller_for_the_wrong_measurement_type() -> None:

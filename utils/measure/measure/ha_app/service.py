@@ -8,6 +8,7 @@ from measure.dummy_load import DummyLoadCalibration, power_meter_fingerprint
 from measure.execution import DummyLoadCalibrationStore, MeasurementExecution
 from measure.ha_app.coordinator import SessionExecutionContext, SessionMeasurementService
 from measure.ha_app.interaction import SessionInteraction
+from measure.ha_app.ocr_preview import OcrPreviewRegistry, find_ocr_previews
 from measure.ha_app.session import SessionControl, SessionEventType
 from measure.ha_app.storage import SessionStorage
 from measure.home_assistant import HomeAssistantManager
@@ -32,7 +33,16 @@ class _SessionLogHandler(logging.Handler):
             message = _redact_secrets(record.getMessage(), self.secrets)
             if record.levelno < logging.WARNING and message.startswith(("Changing light to:", "Measured power:")):
                 return
-            self.control.log(message, warning=record.levelno >= logging.WARNING)
+            # A warning that says it's retrying automatically is, by construction,
+            # already "recovered from and requires no user input" until proven otherwise
+            # -- if the retries actually run out the code raises a real error instead,
+            # which surfaces through the normal session-failure path. Promoting every one
+            # of these to a persistent warning banner (a single dropped HA websocket
+            # frame, one flaky meter poll) for something that self-resolved a moment
+            # later just trains the operator to ignore the banner. Still logged, just not
+            # flagged, so it stays visible in the plain log feed for debugging.
+            is_self_recovering_retry = record.levelno >= logging.WARNING and message.rstrip().endswith("Retrying...")
+            self.control.log(message, warning=record.levelno >= logging.WARNING and not is_self_recovering_retry)
         except Exception:  # noqa: BLE001  # pragma: no cover - logging must not break a measurement
             self.handleError(record)
 
@@ -82,10 +92,12 @@ class MeasurementService(SessionMeasurementService):
         storage: SessionStorage | None = None,
         *,
         shelly_password: str | None = None,
+        ocr_previews: OcrPreviewRegistry | None = None,
     ) -> None:
         self.home_assistant = home_assistant
         self.storage = storage
         self.shelly_password = shelly_password
+        self.ocr_previews = ocr_previews
 
     def run(
         self,
@@ -109,6 +121,8 @@ class MeasurementService(SessionMeasurementService):
         finally:
             _SESSION_LOG_CONTROL.reset(context_token)
             _LOGGER.removeHandler(handler)
+            if self.ocr_previews is not None:
+                self.ocr_previews.unregister(context.session_id)
 
     def _run(
         self,
@@ -134,6 +148,8 @@ class MeasurementService(SessionMeasurementService):
             on_calibration_sample=control.calibration_sample,
             dummy_load_calibration_store=calibration_store,
         ).assemble(request)
+        if self.ocr_previews is not None and prepared.power_meter is not None:
+            self.ocr_previews.register(context.session_id, find_ocr_previews(prepared.power_meter))
         control.phase("Starting measurement")
         control.emit(SessionEventType.STATE, {"state": "running"})
 

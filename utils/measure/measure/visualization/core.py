@@ -1,6 +1,6 @@
 """Build frontend-neutral plot specifications from measurement artifacts."""
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 import colorsys
 import csv
 from dataclasses import dataclass, replace
@@ -12,6 +12,15 @@ from pathlib import Path
 from typing import TextIO, TypeGuard
 
 from measure.controller.light.const import LutMode
+from measure.runner.light_plan import (
+    CSV_HEADERS,
+    ColorTempVariation,
+    HsVariation,
+    Variation,
+    variation_from_csv_row,
+)
+from measure.runner.smart_envelope import MeasuredPoint, ct_interest_targets, hs_interest_targets
+from measure.visualization.point_meta import PlotStat, point_stats, variation_point_id, variation_rail_id
 from measure.request import (
     ChargingMeasurementRequest,
     FanMeasurementRequest,
@@ -20,6 +29,7 @@ from measure.request import (
     RecorderMeasurementRequest,
     SpeakerMeasurementRequest,
 )
+from measure.tuning import MeasurementParameters
 
 _DEFAULT_COLOR = "#5488e8"
 _EFFECT_COLORS = (
@@ -41,6 +51,7 @@ _POWER_AXIS_LABEL = "Power (W)"
 class PlotKind(StrEnum):
     SCATTER = "scatter"
     LINE = "line"
+    CYLINDER = "cylinder"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +59,20 @@ class PlotPoint:
     x: float
     y: float
     color: str | None = None
+    inherited: bool = False
+    id: str | None = None
+    rail: str | None = None
+    stats: tuple[PlotStat, ...] = ()
+    ignored: bool = False
+    editable: bool = False
+    interest: str | None = None
+    z: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlotMarker:
+    x: float
+    label: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +91,9 @@ class PlotSpec:
     y_label: str
     source: str
     series: tuple[PlotSeries, ...]
+    x_min: float | None = None
+    x_max: float | None = None
+    markers: tuple[PlotMarker, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,14 +112,28 @@ def build_session_plots(
     *,
     max_scatter_points: int = 10_000,
     max_line_points: int = 4_000,
+    inherited_keys: Mapping[LutMode, Collection[Variation]] | None = None,
+    ignored_ids: Collection[str] | None = None,
+    measured_modes_only: bool = False,
 ) -> PlotBuildResult:
-    """Build every meaningful plot available for a persisted measurement."""
+    """Build every meaningful plot available for a persisted measurement.
+
+    ``inherited_keys`` are LUT points copied from a refine seed. They stay on the
+    plot so the shape is visible. The live running view fades them so this run's
+    new points stand out; a finished session draws every point at full weight.
+
+    By default every LUT CSV on disk is plotted, including modes copied into a
+    refine but not selected for this run. ``measured_modes_only`` restricts that
+    to ``request.modes`` — the in-progress view uses it so the live plots match
+    what this run is measuring.
+    """
 
     candidates = _session_plot_candidates(
         request,
         files,
         max_scatter_points=max_scatter_points,
         max_line_points=max_line_points,
+        measured_modes_only=measured_modes_only,
     )
     plots: list[PlotSpec] = []
     warnings: list[str] = []
@@ -103,9 +145,25 @@ def build_session_plots(
                     source=source,
                     color_mode=mode,
                     max_points=max_points,
+                    inherited_keys=inherited_keys,
+                    ignored_ids=ignored_ids,
+                    request=request,
                 ),
             )
-        except (OSError, PlotDataError, json.JSONDecodeError) as error:
+            plots.extend(
+                _max_bri_color_plot(
+                    path,
+                    source=source,
+                    mode=mode,
+                    inherited_keys=inherited_keys,
+                    ignored_ids=ignored_ids,
+                    request=request,
+                ),
+            )
+        except (OSError, PlotDataError, json.JSONDecodeError, ValueError, csv.Error) as error:
+            # ValueError/csv.Error also cover a row half-written by a still-running
+            # measurement (e.g. a numeric field flushed to disk mid-write) when this is
+            # called for a live preview rather than a finished session.
             warnings.append(f"Could not plot {source}: {error}")
     return PlotBuildResult(plots=tuple(plots), warnings=tuple(warnings))
 
@@ -116,10 +174,17 @@ def _session_plot_candidates(
     *,
     max_scatter_points: int,
     max_line_points: int,
+    measured_modes_only: bool = False,
 ) -> list[tuple[Path, str, LutMode | None, int]]:
     model_root = request.model_id or "measurement"
     if isinstance(request, LightMeasurementRequest):
-        return _light_plot_candidates(request, files, model_root, max_scatter_points)
+        return _light_plot_candidates(
+            request,
+            files,
+            model_root,
+            max_scatter_points,
+            measured_modes_only=measured_modes_only,
+        )
     if isinstance(request, RecorderMeasurementRequest):
         return _single_plot_candidate(files, f"{model_root}/{request.export_filename}", max_line_points)
     if isinstance(request, SpeakerMeasurementRequest | FanMeasurementRequest | ChargingMeasurementRequest):
@@ -132,11 +197,13 @@ def _light_plot_candidates(
     files: Mapping[str, Path],
     model_root: str,
     max_points: int,
+    *,
+    measured_modes_only: bool = False,
 ) -> list[tuple[Path, str, LutMode | None, int]]:
     return [
         (*candidate, mode, max_points)
         for mode in _LIGHT_MODE_ORDER
-        if mode in request.modes
+        if not measured_modes_only or mode in request.modes
         if (candidate := _preferred_file(files, f"{model_root}/{mode.value}.csv")) is not None
     ]
 
@@ -191,16 +258,36 @@ def _build_plot(
     source: str,
     color_mode: LutMode | None,
     max_points: int | None,
+    inherited_keys: Mapping[LutMode, Collection[Variation]] | None = None,
+    ignored_ids: Collection[str] | None = None,
+    request: MeasurementRequest | None = None,
 ) -> PlotSpec:
     if path.name.endswith(".json"):
         return _linear_plot(path, source=source, max_points=max_points)
     mode = color_mode or _mode_from_filename(path)
     if mode is not None:
-        return _light_plot(path, source=source, mode=mode, max_points=max_points)
+        return _light_plot(
+            path,
+            source=source,
+            mode=mode,
+            max_points=max_points,
+            inherited_keys=inherited_keys,
+            ignored_ids=ignored_ids,
+            request=request,
+        )
     return _recorder_plot(path, source=source, max_points=max_points)
 
 
-def _light_plot(path: Path, *, source: str, mode: LutMode, max_points: int | None) -> PlotSpec:
+def _light_plot(
+    path: Path,
+    *,
+    source: str,
+    mode: LutMode,
+    max_points: int | None,
+    inherited_keys: Mapping[LutMode, Collection[Variation]] | None = None,
+    ignored_ids: Collection[str] | None = None,
+    request: MeasurementRequest | None = None,
+) -> PlotSpec:
     expected_fields = {
         LutMode.BRIGHTNESS: {"bri", "watt"},
         LutMode.COLOR_TEMP: {"bri", "mired", "watt"},
@@ -213,10 +300,12 @@ def _light_plot(path: Path, *, source: str, mode: LutMode, max_points: int | Non
             raise PlotDataError(f"expected CSV columns: {', '.join(sorted(expected_fields))}")
         rows = list(reader)
 
+    seed = set(inherited_keys.get(mode, ())) if inherited_keys else set()
+    skipped = set(ignored_ids or ())
     if mode is LutMode.EFFECT:
-        series = _effect_series(rows, max_points)
+        series = _effect_series(rows, max_points, seed, skipped)
     else:
-        series = _single_light_series(rows, mode, max_points)
+        series = _single_light_series(rows, mode, max_points, seed, skipped)
 
     title = {
         LutMode.BRIGHTNESS: "Brightness",
@@ -224,22 +313,58 @@ def _light_plot(path: Path, *, source: str, mode: LutMode, max_points: int | Non
         LutMode.HS: "Hue and saturation",
         LutMode.EFFECT: "Effects",
     }[mode]
+    x_min, x_max = _brightness_axis_domain(request, series)
     return PlotSpec(
         id=mode.value,
         title=title,
         kind=PlotKind.SCATTER,
-        x_label="Brightness",
+        x_label="Brightness (%)",
         y_label=_POWER_AXIS_LABEL,
         source=source,
         series=series,
+        x_min=x_min,
+        x_max=x_max,
     )
 
 
-def _effect_series(rows: list[dict[str, str | None]], max_points: int | None) -> tuple[PlotSeries, ...]:
+def _brightness_pct(bri: int) -> float:
+    return bri / 255 * 100
+
+
+def _brightness_axis_domain(
+    request: MeasurementRequest | None,
+    series: Sequence[PlotSeries],
+) -> tuple[float | None, float | None]:
+    """Span the configured brightness range, or existing points, whichever is wider."""
+
+    xs = [point.x for item in series for point in item.points]
+    data_min = min(xs) if xs else None
+    data_max = max(xs) if xs else None
+    if not isinstance(request, LightMeasurementRequest):
+        return data_min, data_max
+    configured_min = _brightness_pct(request.parameters.min_brightness)
+    configured_max = _brightness_pct(request.parameters.max_brightness)
+    return (
+        configured_min if data_min is None else min(configured_min, data_min),
+        configured_max if data_max is None else max(configured_max, data_max),
+    )
+
+
+def _effect_series(
+    rows: list[dict[str, str | None]],
+    max_points: int | None,
+    inherited: Collection[Variation] = (),
+    ignored_ids: Collection[str] = (),
+) -> tuple[PlotSeries, ...]:
     grouped: dict[str, list[PlotPoint]] = {}
     for row in rows:
         effect = str(row.get("effect", "")).strip()
-        point = _light_point(row, LutMode.EFFECT)
+        point = _light_point(
+            row,
+            LutMode.EFFECT,
+            inherited=_row_is_inherited(row, LutMode.EFFECT, inherited),
+            ignored_ids=ignored_ids,
+        )
         if effect and point is not None:
             grouped.setdefault(effect, []).append(point)
     if not grouped:
@@ -258,8 +383,22 @@ def _single_light_series(
     rows: list[dict[str, str | None]],
     mode: LutMode,
     max_points: int | None,
+    inherited: Collection[Variation] = (),
+    ignored_ids: Collection[str] = (),
 ) -> tuple[PlotSeries, ...]:
-    points = [point for row in rows if (point := _light_point(row, mode)) is not None]
+    points = [
+        point
+        for row in rows
+        if (
+            point := _light_point(
+                row,
+                mode,
+                inherited=_row_is_inherited(row, mode, inherited),
+                ignored_ids=ignored_ids,
+            )
+        )
+        is not None
+    ]
     if not points:
         raise PlotDataError("no valid light measurements found")
     return (
@@ -271,7 +410,24 @@ def _single_light_series(
     )
 
 
-def _light_point(row: Mapping[str, str | None], mode: LutMode) -> PlotPoint | None:
+def _row_is_inherited(
+    row: Mapping[str, str | None],
+    mode: LutMode,
+    inherited: Collection[Variation],
+) -> bool:
+    if not inherited:
+        return False
+    variation = variation_from_csv_row([str(row.get(name) or "") for name in CSV_HEADERS[mode]], mode)
+    return variation is not None and variation in inherited
+
+
+def _light_point(
+    row: Mapping[str, str | None],
+    mode: LutMode,
+    *,
+    inherited: bool = False,
+    ignored_ids: Collection[str] = (),
+) -> PlotPoint | None:
     brightness = _finite_float(row.get("bri"))
     power = _finite_float(row.get("watt"))
     if brightness is None or power is None:
@@ -287,9 +443,315 @@ def _light_point(row: Mapping[str, str | None], mode: LutMode) -> PlotPoint | No
         saturation = _finite_float(row.get("sat"))
         if hue is None or saturation is None:
             return None
-        red, green, blue = colorsys.hls_to_rgb(hue / 65535, brightness / 255, saturation / 255)
+        # HSV, not HLS, and value fixed at 1.0 rather than fed this point's actual
+        # brightness. HSV value=1 is what makes full saturation render as the pure hue
+        # (red, green, ...) and saturation=0 fade to white as it drops -- the picture this
+        # swatch is meant to show, independent of where the point sits on the brightness
+        # sweep, exactly like the CT branch above already is via `_mired_color`. HLS's
+        # equivalent axis is *lightness*, not brightness: lightness=1 is white regardless
+        # of hue or saturation (that was the original bug here), and there's no fixed
+        # lightness that reproduces this fade -- 0.5 gives a pure hue at any saturation
+        # instead of fading toward white as saturation falls.
+        red, green, blue = colorsys.hsv_to_rgb(hue / 65535, saturation / 255, 1.0)
         color = _rgb_color(red * 255, green * 255, blue * 255)
-    return PlotPoint(x=brightness, y=power, color=color)
+    # HA's own light attribute is 1-255; the rest of the UI (and the request parameters
+    # this profile was built from) talks about brightness in %, so the plot should too.
+    return _annotated_point(
+        row,
+        mode,
+        x=brightness / 255 * 100,
+        y=power,
+        color=color,
+        inherited=inherited,
+        ignored_ids=ignored_ids,
+    )
+
+
+def _annotated_point(
+    row: Mapping[str, str | None],
+    mode: LutMode,
+    *,
+    x: float,
+    y: float,
+    color: str | None,
+    inherited: bool,
+    ignored_ids: Collection[str],
+    interest: str | None = None,
+    z: float | None = None,
+) -> PlotPoint:
+    variation = variation_from_csv_row([str(row.get(name) or "") for name in CSV_HEADERS[mode]], mode)
+    point_id = variation_point_id(mode, variation) if variation is not None else None
+    watt = z if z is not None else y
+    stats = point_stats(mode, variation, watt) if variation is not None else ()
+    if interest:
+        stats = (*stats, PlotStat("Interest", interest))
+    return PlotPoint(
+        x=x,
+        y=y,
+        color=color,
+        inherited=inherited,
+        id=point_id,
+        rail=variation_rail_id(mode, variation) if variation is not None else None,
+        stats=stats,
+        ignored=bool(point_id and point_id in ignored_ids),
+        editable=point_id is not None,
+        interest=interest,
+        z=z,
+    )
+
+
+def _max_bri_color_plot(
+    path: Path,
+    *,
+    source: str,
+    mode: LutMode | None,
+    inherited_keys: Mapping[LutMode, Collection[Variation]] | None = None,
+    ignored_ids: Collection[str] | None = None,
+    request: MeasurementRequest | None = None,
+) -> tuple[PlotSpec, ...]:
+    """Power vs color. CT includes every brightness so the UI can slice the rail;
+    HS stays the 100% hue ring the envelope scout walks first, plus a cylinder
+    of every brightness (the UI slices that one)."""
+
+    if mode not in {LutMode.COLOR_TEMP, LutMode.HS}:
+        return ()
+    expected = {"bri", "watt", *(("mired",) if mode is LutMode.COLOR_TEMP else ("hue", "sat"))}
+    with _open_csv(path) as file:
+        reader = csv.DictReader(file)
+        if reader.fieldnames is None or not expected.issubset(reader.fieldnames):
+            return ()
+        rows = [row for row in reader if _finite_float(row.get("bri")) is not None]
+    if not rows:
+        return ()
+    max_bri = max(int(_finite_float(row["bri"]) or 0) for row in rows)
+    top = [row for row in rows if int(_finite_float(row["bri"]) or 0) == max_bri]
+    seed = set(inherited_keys.get(mode, ())) if inherited_keys else set()
+    skipped = set(ignored_ids or ())
+    if mode is LutMode.COLOR_TEMP:
+        interests = _ct_interest_by_mired(rows, request)
+        points = [
+            _annotated_point(
+                row,
+                mode,
+                x=1_000_000.0 / mired,
+                y=power,
+                color=_mired_color(mired),
+                inherited=_row_is_inherited(row, mode, seed),
+                ignored_ids=skipped,
+                interest=interests.get(int(mired)),
+            )
+            for row in rows
+            if (mired := _finite_float(row.get("mired"))) and mired > 0
+            if (power := _finite_float(row.get("watt"))) is not None
+        ]
+        if len(points) < 2:
+            return ()
+        points.sort(key=lambda point: point.x)
+        markers = tuple(
+            PlotMarker(x=1_000_000.0 / ct, label=reason) for ct, reason in sorted(interests.items())
+        )
+        return (
+            PlotSpec(
+                id="color_temp_max_bri",
+                title="Color temperature at 100%",
+                kind=PlotKind.SCATTER,
+                x_label="Color temp (K)",
+                y_label=_POWER_AXIS_LABEL,
+                source=source,
+                series=(PlotSeries(label=None, color=None, points=tuple(points)),),
+                markers=markers,
+            ),
+        )
+    sats = [int(_finite_float(row.get("sat")) or 0) for row in top]
+    if not sats:
+        return ()
+    sat_max = max(sats)
+    sat_min = min(sats)
+    mid_sats = {sat for sat in sats if sat not in {sat_min, sat_max}}
+    interests = _hs_interest_by_hue(rows, request)
+    series: list[PlotSeries] = []
+    vivid = _hs_hue_points(top, {sat_max}, seed, skipped, interests)
+    if vivid:
+        series.append(PlotSeries(label=None, color=None, points=tuple(vivid)))
+    if mid_sats:
+        mid = _hs_hue_points(top, mid_sats, seed, skipped, interests)
+        if mid:
+            series.append(PlotSeries(label=None, color=None, points=tuple(mid)))
+    if sat_min != sat_max:
+        white = _hs_hue_points(top, {sat_min}, seed, skipped, interests)
+        if white:
+            series.append(PlotSeries(label=None, color="#f4f1ea", points=tuple(white)))
+    if sum(len(item.points) for item in series) < 2:
+        return ()
+    markers = tuple(
+        PlotMarker(x=hue / 65535 * 360, label=reason) for hue, reason in sorted(interests.items())
+    )
+    rail = PlotSpec(
+        id="hs_max_bri",
+        title="Hue at 100%",
+        kind=PlotKind.SCATTER,
+        x_label="Hue (°)",
+        y_label=_POWER_AXIS_LABEL,
+        source=source,
+        series=tuple(series),
+        markers=markers,
+    )
+    cylinder = _hs_cylinder_plot(rows, seed, skipped, interests, markers, source)
+    return (rail, cylinder) if cylinder is not None else (rail,)
+
+
+def _interest_parameters(
+    request: MeasurementRequest | None,
+    max_bri: int,
+) -> MeasurementParameters:
+    """Use the brightness the 100% plot actually draws, not the request cap.
+
+    An EXTEND refine can lower ``max_brightness`` (this run walks 1–199) while the
+    CSV still holds the seed's 255-rail. Interest has to look at that rail or the
+    arrows vanish from the plot that shows the cliff.
+    """
+
+    base = (
+        request.parameters
+        if isinstance(request, LightMeasurementRequest)
+        else MeasurementParameters()
+    )
+    if base.max_brightness == max_bri:
+        return base
+    return replace(base, max_brightness=max_bri)
+
+
+def _ct_interest_by_mired(
+    rows: Sequence[Mapping[str, str | None]],
+    request: MeasurementRequest | None,
+) -> dict[int, str]:
+    measured: list[MeasuredPoint] = []
+    for row in rows:
+        brightness = _finite_float(row.get("bri"))
+        mired = _finite_float(row.get("mired"))
+        power = _finite_float(row.get("watt"))
+        if brightness is None or mired is None or mired <= 0 or power is None:
+            continue
+        measured.append(MeasuredPoint(ColorTempVariation(bri=int(brightness), ct=int(mired)), power))
+    if not measured:
+        return {}
+    max_bri = max(point.variation.bri for point in measured)
+    return dict(ct_interest_targets(measured, _interest_parameters(request, max_bri)))
+
+
+def _hs_interest_by_hue(
+    rows: Sequence[Mapping[str, str | None]],
+    request: MeasurementRequest | None,
+) -> dict[int, str]:
+    measured: list[MeasuredPoint] = []
+    for row in rows:
+        brightness = _finite_float(row.get("bri"))
+        hue = _finite_float(row.get("hue"))
+        saturation = _finite_float(row.get("sat"))
+        power = _finite_float(row.get("watt"))
+        if brightness is None or hue is None or saturation is None or power is None:
+            continue
+        measured.append(
+            MeasuredPoint(HsVariation(bri=int(brightness), hue=int(hue), sat=int(saturation)), power)
+        )
+    if not measured:
+        return {}
+    max_bri = max(point.variation.bri for point in measured)
+    return dict(hs_interest_targets(measured, _interest_parameters(request, max_bri)))
+
+
+def _hs_hue_points(
+    rows: Sequence[Mapping[str, str | None]],
+    saturations: Collection[int],
+    inherited: Collection[Variation],
+    ignored_ids: Collection[str] = (),
+    interests: Mapping[int, str] | None = None,
+) -> list[PlotPoint]:
+    allowed = set(saturations)
+    points: list[PlotPoint] = []
+    for row in rows:
+        saturation = int(_finite_float(row.get("sat")) or -1)
+        if saturation not in allowed:
+            continue
+        hue = _finite_float(row.get("hue"))
+        power = _finite_float(row.get("watt"))
+        if hue is None or power is None:
+            continue
+        red, green, blue = colorsys.hsv_to_rgb(hue / 65535, saturation / 255, 1.0)
+        points.append(
+            _annotated_point(
+                row,
+                LutMode.HS,
+                x=hue / 65535 * 360,
+                y=power,
+                color=_rgb_color(red * 255, green * 255, blue * 255),
+                inherited=_row_is_inherited(row, LutMode.HS, inherited),
+                ignored_ids=ignored_ids,
+                interest=(interests or {}).get(int(hue)),
+            )
+        )
+    points.sort(key=lambda point: point.x)
+    return points
+
+
+def _hs_cylinder_plot(
+    rows: Sequence[Mapping[str, str | None]],
+    inherited: Collection[Variation],
+    ignored_ids: Collection[str],
+    interests: Mapping[int, str],
+    markers: tuple[PlotMarker, ...],
+    source: str,
+) -> PlotSpec | None:
+    """Hue as angle, saturation as radius, power as height — every brightness slice."""
+
+    max_bri = max((int(_finite_float(row.get("bri")) or 0) for row in rows), default=0)
+    points = _hs_cylinder_points(rows, inherited, ignored_ids, interests, max_bri)
+    if len(points) < 2:
+        return None
+    return PlotSpec(
+        id="hs_cylinder",
+        title="Hue / saturation at 100%",
+        kind=PlotKind.CYLINDER,
+        x_label="Hue (°)",
+        y_label="Saturation",
+        source=source,
+        series=(PlotSeries(label=None, color=None, points=tuple(points)),),
+        markers=markers,
+    )
+
+
+def _hs_cylinder_points(
+    rows: Sequence[Mapping[str, str | None]],
+    inherited: Collection[Variation],
+    ignored_ids: Collection[str],
+    interests: Mapping[int, str],
+    max_bri: int,
+) -> list[PlotPoint]:
+    points: list[PlotPoint] = []
+    for row in rows:
+        hue = _finite_float(row.get("hue"))
+        saturation = _finite_float(row.get("sat"))
+        power = _finite_float(row.get("watt"))
+        brightness = _finite_float(row.get("bri"))
+        if hue is None or saturation is None or power is None:
+            continue
+        value = 1.0 if brightness is None else max(0.0, min(1.0, brightness / 255))
+        red, green, blue = colorsys.hsv_to_rgb(hue / 65535, saturation / 255, value)
+        bri = int(brightness) if brightness is not None else -1
+        points.append(
+            _annotated_point(
+                row,
+                LutMode.HS,
+                x=hue / 65535 * 360,
+                y=saturation,
+                z=power,
+                color=_rgb_color(red * 255, green * 255, blue * 255),
+                inherited=_row_is_inherited(row, LutMode.HS, inherited),
+                ignored_ids=ignored_ids,
+                interest=interests.get(int(hue)) if bri == max_bri else None,
+            )
+        )
+    return points
 
 
 def _linear_plot(path: Path, *, source: str, max_points: int | None) -> PlotSpec:

@@ -35,15 +35,16 @@ from measure.execution import (
     RunInteraction,
 )
 from measure.home_assistant import HomeAssistantManager
+from measure.powermeter.composite import CompositePowerMeter, Witness
 from measure.powermeter.dummy import DummyPowerMeter
 from measure.powermeter.errors import PowerMeterError
 from measure.powermeter.hass import HassPowerMeter
 from measure.powermeter.manual import ManualPowerMeter
 from measure.powermeter.mystrom import MyStromPowerMeter
-from measure.powermeter.ocr import OcrPowerMeter
 from measure.powermeter.powermeter import PowerMeter
 from measure.powermeter.shelly import ShellyPowerMeter
 from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
     DummyPowerMeterSpec,
     HassPowerMeterSpec,
     KasaPowerMeterSpec,
@@ -130,6 +131,7 @@ class MeasurementAssembler:
         return PreparedMeasurement(
             request=request,
             runner=runner,
+            power_meter=power_meter,
             preparations=preparations,
             interaction=self._interaction,
         )
@@ -137,6 +139,23 @@ class MeasurementAssembler:
     def build_power_meter(self, spec: PowerMeterSpec) -> PowerMeter:  # noqa: C901
         """Build the configured meter for execution or preflight diagnostics."""
 
+        if isinstance(spec, CompositePowerMeterSpec):
+            return CompositePowerMeter(
+                self.build_power_meter(spec.primary),
+                [
+                    Witness(
+                        name=str(witness.meter.type),
+                        meter=self.build_power_meter(witness.meter),
+                        position=witness.position,
+                        offset_w=witness.signed_offset_w,
+                        tolerance_w=witness.tolerance_w,
+                        tolerance_pct=witness.tolerance_pct,
+                        required=witness.required,
+                    )
+                    for witness in spec.witnesses
+                ],
+                primary_name=str(spec.primary.type),
+            )
         if isinstance(spec, DummyPowerMeterSpec):
             return DummyPowerMeter()
         if isinstance(spec, HassPowerMeterSpec):
@@ -146,6 +165,7 @@ class MeasurementAssembler:
                 spec.call_update_entity,
                 entity_id=spec.entity_id,
                 voltage_entity_id=spec.voltage_entity_id,
+                max_age_seconds=spec.max_age_seconds,
                 wait=self._interaction.wait,
             )
         if isinstance(spec, KasaPowerMeterSpec):
@@ -157,7 +177,14 @@ class MeasurementAssembler:
         if isinstance(spec, MyStromPowerMeterSpec):
             return MyStromPowerMeter(spec.device_ip)
         if isinstance(spec, OcrPowerMeterSpec):
-            return OcrPowerMeter()
+            try:
+                from measure.powermeter.ocr import build_ocr_power_meter
+            except ImportError as error:
+                raise PowerMeterError(
+                    "The OCR power meter needs the 'ocr' extra: uv sync --extra cli --extra ocr",
+                ) from error
+
+            return build_ocr_power_meter(spec)
         if isinstance(spec, ShellyPowerMeterSpec):
             return ShellyPowerMeter(
                 spec.device_ip,
@@ -170,11 +197,21 @@ class MeasurementAssembler:
         if isinstance(spec, TuyaPowerMeterSpec):
             if self._tuya_device_key is None:
                 raise PowerMeterError("Tuya device key is required")
-            from measure.powermeter.tuya import TuyaPowerMeter
+            try:
+                from measure.powermeter.tuya import TuyaPowerMeter
+            except ImportError as error:
+                raise PowerMeterError(
+                    "The Tuya power meter needs the 'cli' extra: uv sync --extra cli",
+                ) from error
 
             return TuyaPowerMeter(spec.device_id, spec.device_ip, self._tuya_device_key, spec.version)
         if isinstance(spec, OwonOwh98xxPowerMeterSpec):
-            from measure.powermeter.serial_scpi import OwonOwh98xxPowerMeter
+            try:
+                from measure.powermeter.serial_scpi import OwonOwh98xxPowerMeter
+            except ImportError as error:
+                raise PowerMeterError(
+                    "The OWON OWH98xx power meter needs the 'cli' extra: uv sync --extra cli",
+                ) from error
 
             return OwonOwh98xxPowerMeter(spec.port, spec.baudrate, spec.timeout, spec.channel)
         raise PowerMeterError(f"Unsupported power meter specification: {type(spec).__name__}")

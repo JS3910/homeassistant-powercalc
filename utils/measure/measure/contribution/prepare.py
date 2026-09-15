@@ -10,6 +10,8 @@ from typing import Any
 from measure.contribution.models import ContributionPreparedFile, ContributionPreview
 from measure.model import mains_voltage_from_range
 from measure.profile.models import ProfileMetadata
+from measure.runner.on_off_bounds import ON_OFF_BOUNDS_FILENAME
+from measure.runner.plot_edits import filter_profile_csv_bytes, load_ignored_near
 
 JsonValidator = Callable[[dict[str, Any], dict[str, Any]], None]
 
@@ -18,6 +20,7 @@ MANUFACTURER_JSON = "manufacturer.json"
 LIBRARY_URL = "https://library.powercalc.nl"
 EMPTY_OPTIONAL_MODEL_FIELDS = (
     "aliases",
+    "ean",
     "gtin",
     "product_url",
     "device_specs",
@@ -133,7 +136,12 @@ class ProfilePreparer:
         if MODEL_JSON not in names:
             raise ProfilePreparationError("model.json is required")
         csv_names = {name for name in names if name.endswith((".csv", ".csv.gz"))}
-        unexpected = sorted(names - csv_names - {MODEL_JSON, MANUFACTURER_JSON} - RECORDER_SOURCE_ARTIFACTS)
+        # Session-local diagnostics written next to the LUT CSVs. Not library files.
+        ignored = {name for name in names if name.endswith(".raw.jsonl")}
+        ignored.update({ON_OFF_BOUNDS_FILENAME, "plot_edits.json"})
+        unexpected = sorted(
+            names - csv_names - ignored - {MODEL_JSON, MANUFACTURER_JSON} - RECORDER_SOURCE_ARTIFACTS
+        )
         if unexpected:
             raise ProfilePreparationError(f"Unexpected artifact file(s): {', '.join(unexpected)}")
         return tuple(sorted({f"{name.removesuffix('.gz')}.gz" for name in csv_names}))
@@ -153,6 +161,13 @@ class ProfilePreparer:
             ("measure_description", metadata.measure_description),
         )
         model.update({key: value for key, value in optional_values if value is not None})
+        # Upstream renamed ean → gtin in model_schema.json. Contribution validates
+        # against the live schema; leave no leftover ean key behind.
+        if "ean" in model:
+            if "gtin" not in model:
+                model["gtin"] = model.pop("ean")
+            else:
+                model.pop("ean")
         derived_mains_voltage = mains_voltage_from_range(model.get("voltage_range"))
         if derived_mains_voltage is not None:
             model["mains_voltage"] = derived_mains_voltage
@@ -250,7 +265,9 @@ class ProfilePreparer:
             except OSError, ValueError:
                 continue
             if requested_name in self._known_names(existing, "name"):
-                relative = model_path.relative_to(self.library_root)
+                # .as_posix(), not str() -- relative_to() keeps the OS-native separator,
+                # so on Windows this would otherwise read "profile_library/signify\LCT010\model.json".
+                relative = model_path.relative_to(self.library_root).as_posix()
                 warnings.append(f"Possible duplicate profile: profile_library/{relative}")
         for directory, existing in self._models_in_index():
             if directory == manufacturer_directory and existing.get("id") == model_directory:
@@ -336,10 +353,11 @@ class ProfilePreparer:
             return _dump_json({"name": metadata.manufacturer, "aliases": self._artifact_aliases(artifact_directory)})
         artifact_path = artifact_directory / relative_path.name
         if artifact_path.exists():
-            return artifact_path.read_bytes()
+            return _profile_csv_bytes(artifact_path.read_bytes(), relative_path.name, artifact_directory)
         raw_path = artifact_directory / relative_path.name.removesuffix(".gz")
         if relative_path.name.endswith(".csv.gz") and raw_path.exists():
-            return gzip.compress(raw_path.read_bytes(), mtime=0)
+            compressed = gzip.compress(raw_path.read_bytes(), mtime=0)
+            return _profile_csv_bytes(compressed, relative_path.name, artifact_directory)
         raise ProfilePreparationError(f"Artifact file is missing: {relative_path.name}")
 
     def _artifact_aliases(self, artifact_directory: Path) -> list[Any]:
@@ -372,6 +390,12 @@ class ProfilePreparer:
         if not slug:
             raise ProfilePreparationError("Manufacturer directory cannot be empty")
         return slug
+
+
+def _profile_csv_bytes(payload: bytes, filename: str, artifact_directory: Path) -> bytes:
+    if not filename.endswith((".csv", ".csv.gz")):
+        return payload
+    return filter_profile_csv_bytes(payload, filename, load_ignored_near(artifact_directory))
 
 
 def _is_empty_optional_value(value: object) -> bool:
@@ -415,4 +439,4 @@ def _schema_error_field(path: tuple[str | int, ...]) -> str | None:
         return {"name": "contributor", "github": "contributor_github", "email": "contributor_email"}.get(str(path[2]))
     if root == "device_specs":
         return ".".join(str(part) for part in path[:2])
-    return {"name": "product_name", "gtin": "gtins"}.get(root, root)
+    return {"name": "product_name", "ean": "gtins", "gtin": "gtins"}.get(root, root)

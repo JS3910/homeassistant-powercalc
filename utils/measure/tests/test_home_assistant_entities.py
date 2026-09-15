@@ -3,7 +3,12 @@ from unittest.mock import MagicMock
 
 from measure.controller.light.const import LutMode
 from measure.home_assistant import HomeAssistantEntityData, HomeAssistantManager
-from measure.home_assistant_entities import DeviceClass, EntityDomain, HomeAssistantEntityCatalog
+from measure.home_assistant_entities import (
+    DeviceClass,
+    EntityDomain,
+    HomeAssistantEntityCatalog,
+    leaf_light_entity_ids,
+)
 import pytest
 
 
@@ -216,6 +221,10 @@ def test_catalog_exposes_group_members_and_infers_their_shared_model() -> None:
     lights = HomeAssistantEntityCatalog(home_assistant).load_snapshot().select(domain=EntityDomain.LIGHT)
     group = next(light for light in lights if light.entity_id == "light.group")
 
+    assert leaf_light_entity_ids(
+        ["light.group"],
+        {"light.group": ["light.desk", "light.second"]},
+    ) == ["light.desk", "light.second"]
     assert group.member_entity_ids == ["light.desk", "light.second"]
     assert group.model_id == "LWA017"
     assert group.product_name == "Hue White Ambiance"

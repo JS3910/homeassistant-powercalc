@@ -5,12 +5,18 @@ from typing import Any, cast, overload
 
 from decouple import Choices, UndefinedValueError, config
 
-from measure.const import CT_BRI_STEPS_MANUAL, CT_MIRED_STEPS_MANUAL, PARAMETER_LIMITS, MeasureType, parse_measure_type
+from measure.const import (
+    CT_BRI_STEPS_MANUAL,
+    CT_MIRED_DIVISIONS_MANUAL_MAX,
+    PARAMETER_LIMITS,
+    MeasureType,
+    parse_measure_type,
+)
 from measure.controller.charging.const import ChargingControllerType
 from measure.controller.fan.const import FanControllerType
 from measure.controller.light.const import DEFAULT_LIGHT_TRANSITION_TIME, LightControllerType
 from measure.controller.media.const import MediaControllerType
-from measure.powermeter.const import OwonOwh98xxChannelType, PowerMeterType
+from measure.powermeter.const import OwonOwh98xxChannelType, PowerMeterType, WitnessPosition
 from measure.tuning import MeasurementParameters
 
 _LOGGER = logging.getLogger("measure")
@@ -75,6 +81,16 @@ def _bounded_float(name: str) -> float:
     return _clamp(name, value)
 
 
+def _parse_env_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_bool(name: str) -> bool:
+    return _config_value(name.upper(), default=getattr(_DEFAULTS, name), converter=_parse_env_bool)
+
+
 class CliEnvironment:
     @property
     def min_brightness(self) -> int:
@@ -89,7 +105,83 @@ class CliEnvironment:
 
     @property
     def max_brightness(self) -> int:
-        return _DEFAULTS.max_brightness
+        return _bounded_int("max_brightness")
+
+    @property
+    def bri_bri_bisection(self) -> bool:
+        return _env_bool("bri_bri_bisection")
+
+    @property
+    def ct_bri_bisection(self) -> bool:
+        return _env_bool("ct_bri_bisection")
+
+    @property
+    def hs_bri_bisection(self) -> bool:
+        return _env_bool("hs_bri_bisection")
+
+    @property
+    def effect_bri_bisection(self) -> bool:
+        return _env_bool("effect_bri_bisection")
+
+    @property
+    def bri_bri_all(self) -> bool:
+        return _env_bool("bri_bri_all")
+
+    @property
+    def ct_bri_all(self) -> bool:
+        return _env_bool("ct_bri_all")
+
+    @property
+    def hs_bri_all(self) -> bool:
+        return _env_bool("hs_bri_all")
+
+    @property
+    def effect_bri_all(self) -> bool:
+        return _env_bool("effect_bri_all")
+
+    @property
+    def ct_mired_all(self) -> bool:
+        return _env_bool("ct_mired_all")
+
+    @property
+    def hs_hue_all(self) -> bool:
+        return _env_bool("hs_hue_all")
+
+    @property
+    def hs_sat_all(self) -> bool:
+        return _env_bool("hs_sat_all")
+
+    @property
+    def brightness_descending(self) -> bool:
+        return _env_bool("brightness_descending")
+
+    @property
+    def settle_tolerance_pct(self) -> float:
+        return _bounded_float("settle_tolerance_pct")
+
+    @property
+    def settle_tolerance_w(self) -> float:
+        return _bounded_float("settle_tolerance_w")
+
+    @property
+    def settle_window_seconds(self) -> float:
+        return _bounded_float("settle_window_seconds")
+
+    @property
+    def settle_poll_interval_seconds(self) -> float:
+        return _bounded_float("settle_poll_interval_seconds")
+
+    @property
+    def settle_min_wait(self) -> float:
+        return _bounded_float("settle_min_wait")
+
+    @property
+    def min_kelvin(self) -> int:
+        return _bounded_int("min_kelvin")
+
+    @property
+    def max_kelvin(self) -> int:
+        return _bounded_int("max_kelvin")
 
     @property
     def min_sat(self) -> int:
@@ -114,10 +206,10 @@ class CliEnvironment:
         return _bounded_int("ct_bri_steps")
 
     @property
-    def ct_mired_steps(self) -> int:
+    def ct_mired_divisions(self) -> int:
         if self.selected_power_meter == PowerMeterType.MANUAL:
-            return CT_MIRED_STEPS_MANUAL
-        return _bounded_int("ct_mired_steps")
+            return CT_MIRED_DIVISIONS_MANUAL_MAX
+        return _bounded_int("ct_mired_divisions")
 
     @property
     def bri_bri_steps(self) -> int:
@@ -142,8 +234,11 @@ class CliEnvironment:
         return max(hs_hue_precision, 0.5)
 
     @property
-    def hs_hue_steps(self) -> int:
-        return round(2731 / self.hs_hue_precision)
+    def hs_hue_divisions(self) -> int:
+        # Hue is swept in bisection order (see runner/light_plan.py), not a native step
+        # size, so this is a division count; 24 at the default precision of 1 matches what
+        # the old 2731-step default used to produce.
+        return round(24 * self.hs_hue_precision)
 
     @property
     def hs_sat_precision(self) -> float:
@@ -152,12 +247,38 @@ class CliEnvironment:
         return max(hs_sat_precision, 0.5)
 
     @property
-    def hs_sat_steps(self) -> int:
-        return round(32 / self.hs_sat_precision)
+    def hs_sat_divisions(self) -> int:
+        # Saturation is a sweep count (see runner/light_plan.py); 5 at the default
+        # precision of 1 is full / mid / min plus the two quarter-points.
+        return round(5 * self.hs_sat_precision)
 
     @property
     def effect_bri_steps(self) -> int:
         return _bounded_int("effect_bri_steps")
+
+    @property
+    def smart_delta(self) -> float:
+        return _bounded_float("smart_delta")
+
+    @property
+    def smart_border_delta(self) -> float:
+        return _bounded_float("smart_border_delta")
+
+    @property
+    def smart_sampling(self) -> bool:
+        return _env_bool("smart_sampling")
+
+    @property
+    def smart_dart(self) -> bool:
+        return _env_bool("smart_dart")
+
+    @property
+    def smart_dart_min_delta(self) -> float:
+        return _bounded_float("smart_dart_min_delta")
+
+    @property
+    def rated_power(self) -> float:
+        return 0.0
 
     @property
     def selected_light_controller(self) -> LightControllerType:
@@ -180,36 +301,76 @@ class CliEnvironment:
         return _enum_value("POWER_METER", PowerMeterType, PowerMeterType.HASS)
 
     @property
+    def witness_meters(self) -> list[PowerMeterType]:
+        """Meters read alongside the primary that must agree with it, from ``WITNESS_METERS``.
+
+        A comma-separated list of meter types, each configured through the same variables
+        as when it is the primary (``SHELLY_IP`` and so on), so each type can appear once.
+        """
+        raw = _config_value("WITNESS_METERS", default="", converter=str)
+        witnesses: list[PowerMeterType] = []
+        for item in (part.strip() for part in raw.split(",")):
+            if not item:
+                continue
+            try:
+                meter_type = PowerMeterType(item)
+            except ValueError as error:
+                raise ValueError(f"WITNESS_METERS: unknown power meter type {item!r}") from error
+            if meter_type in {PowerMeterType.COMPOSITE, PowerMeterType.MANUAL}:
+                raise ValueError(f"WITNESS_METERS: {item} cannot be used as a witness")
+            if meter_type == self.selected_power_meter:
+                raise ValueError(f"WITNESS_METERS: {item} is already the primary meter (POWER_METER)")
+            if meter_type in witnesses:
+                raise ValueError(f"WITNESS_METERS: {item} is listed twice")
+            witnesses.append(meter_type)
+        return witnesses
+
+    def witness_position(self, meter_type: PowerMeterType) -> WitnessPosition:
+        return _enum_value(f"WITNESS_{meter_type.name}_POSITION", WitnessPosition, WitnessPosition.NONE)
+
+    def witness_offset_w(self, meter_type: PowerMeterType) -> float:
+        return _config_value(f"WITNESS_{meter_type.name}_OFFSET_W", default=0.0, converter=float)
+
+    def witness_tolerance_w(self, meter_type: PowerMeterType) -> float:
+        return _config_value(f"WITNESS_{meter_type.name}_TOLERANCE_W", default=0.5, converter=float)
+
+    def witness_tolerance_pct(self, meter_type: PowerMeterType) -> float:
+        return _config_value(f"WITNESS_{meter_type.name}_TOLERANCE_PCT", default=2.0, converter=float)
+
+    def witness_required(self, meter_type: PowerMeterType) -> bool:
+        return _config_value(f"WITNESS_{meter_type.name}_REQUIRED", default=True, converter=bool)
+
+    @property
     def log_level(self) -> str:
         return _config_value("LOG_LEVEL", default=logging.getLevelName(logging.INFO), converter=str)
 
     @property
-    def sleep_initial(self) -> int:
-        return _bounded_int("sleep_initial")
+    def sleep_initial(self) -> float:
+        return _bounded_float("sleep_initial")
 
     @property
-    def sleep_standby(self) -> int:
-        return _bounded_int("sleep_standby")
+    def sleep_standby(self) -> float:
+        return _bounded_float("sleep_standby")
 
     @property
     def sleep_time(self) -> float:
         return _bounded_float("sleep_time")
 
     @property
-    def sleep_time_sample(self) -> int:
-        return _bounded_int("sleep_time_sample")
+    def sleep_time_sample(self) -> float:
+        return _bounded_float("sleep_time_sample")
 
     @property
-    def sleep_time_hue(self) -> int:
-        return _config_value("SLEEP_TIME_HUE", default=_DEFAULTS.sleep_time_hue, converter=int)
+    def sleep_time_hue(self) -> float:
+        return _config_value("SLEEP_TIME_HUE", default=_DEFAULTS.sleep_time_hue, converter=float)
 
     @property
-    def sleep_time_sat(self) -> int:
-        return _config_value("SLEEP_TIME_SAT", default=_DEFAULTS.sleep_time_sat, converter=int)
+    def sleep_time_sat(self) -> float:
+        return _config_value("SLEEP_TIME_SAT", default=_DEFAULTS.sleep_time_sat, converter=float)
 
     @property
-    def sleep_time_ct(self) -> int:
-        return _config_value("SLEEP_TIME_CT", default=_DEFAULTS.sleep_time_ct, converter=int)
+    def sleep_time_ct(self) -> float:
+        return _config_value("SLEEP_TIME_CT", default=_DEFAULTS.sleep_time_ct, converter=float)
 
     @property
     def measure_time_effect(self) -> int:
@@ -356,6 +517,15 @@ class CliEnvironment:
         )
 
     @property
+    def hass_max_age_seconds(self) -> float | None:
+        """Reject Home Assistant power readings whose last report is older than this; unset disables."""
+        try:
+            value = _config_value("HASS_MAX_AGE_SECONDS", converter=float)
+        except UndefinedValueError:
+            return None
+        return value if value > 0 else None
+
+    @property
     def light_transition_time(self) -> int:
         return _config_value(
             "LIGHT_TRANSITION_TIME",
@@ -374,6 +544,37 @@ class CliEnvironment:
     @property
     def mystrom_device_ip(self) -> str:
         return _config_value("MYSTROM_DEVICE_IP", converter=str)
+
+    @property
+    def ocr_source(self) -> str:
+        """Camera index, stream URL or video file for the OCR power meter."""
+        return _config_value("OCR_SOURCE", default="0", converter=str)
+
+    @property
+    def ocr_layout(self) -> str:
+        return _config_value("OCR_LAYOUT", default="pr10", converter=str)
+
+    @property
+    def ocr_preview_host(self) -> str:
+        return _config_value("OCR_PREVIEW_HOST", default="127.0.0.1", converter=str)
+
+    @property
+    def ocr_preview_port(self) -> int | None:
+        """Port of the browser preview; 0 disables it."""
+        port = _config_value("OCR_PREVIEW_PORT", default=8765, converter=int)
+        return port if port > 0 else None
+
+    @property
+    def ocr_window_seconds(self) -> float:
+        return _config_value("OCR_WINDOW_SECONDS", default=1.5, converter=float)
+
+    @property
+    def ocr_stale_after_seconds(self) -> float:
+        return _config_value("OCR_STALE_AFTER_SECONDS", default=5.0, converter=float)
+
+    @property
+    def ocr_crosscheck_tolerance_pct(self) -> float:
+        return _config_value("OCR_CROSSCHECK_TOLERANCE_PCT", default=3.0, converter=float)
 
     @property
     def csv_add_datetime_column(self) -> bool:
@@ -399,3 +600,8 @@ class CliEnvironment:
     def get_conf_value(key: str) -> str | None:
         """Get configuration value from environment variable"""
         return cast(str | None, config(key, default=None))
+
+
+def uses_power_meter(environment: CliEnvironment, meter_type: PowerMeterType) -> bool:
+    """Whether a meter type is the primary meter or one of the witnesses."""
+    return environment.selected_power_meter == meter_type or meter_type in environment.witness_meters

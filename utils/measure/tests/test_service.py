@@ -6,7 +6,13 @@ from unittest.mock import MagicMock, patch
 from measure.controller.light.dummy import DummyLightController
 from measure.controller.light.spec import HassLightControllerSpec
 from measure.ha_app.coordinator import SessionExecutionContext
-from measure.ha_app.service import MeasurementService, SessionDummyLoadCalibrationStore, _redact_secrets
+from measure.ha_app.service import (
+    _SESSION_LOG_CONTROL,
+    MeasurementService,
+    SessionDummyLoadCalibrationStore,
+    _redact_secrets,
+    _SessionLogHandler,
+)
 from measure.ha_app.session import (
     SessionControl,
     SessionEvent,
@@ -68,8 +74,37 @@ def test_service_runs_light_measurement_without_terminal(tmp_path: Path) -> None
     assert progress_events[-1].data["completed"] == progress_events[-1].data["total"]
     phases = [event.data["message"] for event in progress if event.type == SessionEventType.PHASE]
     assert phases[:2] == ["Preparing measurement devices", "Starting measurement"]
-    assert any(message.startswith("Stabilizing light") for message in phases)
+    assert not any(message.startswith("Stabilizing light") for message in phases)
     assert any(event.type == SessionEventType.LOG for event in progress)
+
+
+def test_a_warning_that_says_it_is_retrying_is_logged_but_not_flagged_as_a_ui_warning() -> None:
+    """ "Failed to change light state: ...  Retrying..." (and anything else that follows
+    the same convention) says, in the message itself, that it's a self-recovering
+    transient -- no user input needed unless the retries actually run out, in which case
+    the code raises a real error instead. Blowing every one of these up into a persistent
+    warning banner (see SessionEventType.WARNING / snapshot.warnings) trained the operator
+    to ignore the banner entirely, which is the opposite of what a warning is for.
+    """
+    control = SessionControl()
+    events: list[SessionEvent] = []
+    control.subscribe(events.append)
+    handler = _SessionLogHandler(control, secrets=())
+    token = _SESSION_LOG_CONTROL.set(control)
+    logger = logging.getLogger("measure.test_retry_warning")
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    try:
+        logger.warning("Failed to change light state: boom. Retrying...")
+        logger.warning("Discarding measurement: something actually wrong")
+    finally:
+        logger.removeHandler(handler)
+        _SESSION_LOG_CONTROL.reset(token)
+
+    assert [event.type for event in events] == [SessionEventType.LOG, SessionEventType.WARNING]
+    assert events[0].data["message"] == "Failed to change light state: boom. Retrying..."
+    assert events[1].data["message"] == "Discarding measurement: something actually wrong"
 
 
 def test_sensitive_values_are_redacted_from_session_messages() -> None:

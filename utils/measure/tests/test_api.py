@@ -1,4 +1,6 @@
+import asyncio
 from collections.abc import Callable, Sequence
+from dataclasses import fields as dataclass_fields
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
@@ -6,15 +8,22 @@ from pathlib import Path
 import time
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
-from measure.const import MeasureType
+from measure.const import PARAMETER_LIMITS, MeasureType
 from measure.contribution.github import GitHubUser
 from measure.controller.light.const import LutMode
 from measure.dummy_load import DummyLoadCalibration, power_meter_fingerprint
 from measure.execution import LightOperatingPoint
-from measure.ha_app.api import _power_meter_spec, create_app
+from measure.ha_app import api as api_module
+from measure.ha_app.api import (
+    _auto_resume_interrupted_session,
+    _auto_resume_until_running,
+    _power_meter_spec,
+    _preflight,
+    create_app,
+)
 from measure.ha_app.contribution import (
     ContributionApiCoordinator,
     ContributionApiError,
@@ -31,14 +40,38 @@ from measure.ha_app.contribution import (
 )
 from measure.ha_app.coordinator import MeasurementCoordinator, SessionExecutionContext, SessionMeasurementService
 from measure.ha_app.library_catalog import DeviceSpecificationCatalog, ManufacturerCatalog, MeasureDeviceCatalog
-from measure.ha_app.light_probe import LightLoadProbeError, LightLoadProbePoint, LightLoadProbeResult
+from measure.ha_app.light_probe import (
+    LightLoadProbeError,
+    LightLoadProbePoint,
+    LightLoadProbeReading,
+    LightLoadProbeResult,
+    LightLoadProbeStep,
+)
 from measure.ha_app.session import SessionControl, SessionEvent, SessionEventType, SessionSnapshot, SessionState
 from measure.ha_app.storage import SessionStorage
 from measure.home_assistant import HomeAssistantEntityData, HomeAssistantManager
 from measure.powermeter.diagnostics import PowerMeterDiagnostics
 from measure.powermeter.powermeter import PowerMeter, PowerMeterDiagnosticSample
-from measure.powermeter.spec import DummyPowerMeterSpec, HassPowerMeterSpec, KasaPowerMeterSpec
-from measure.request import MeasurementRequest, RecorderMeasurementRequest, RecorderProfileRecipe, RecorderPurpose
+from measure.powermeter.spec import (
+    CompositePowerMeterSpec,
+    DummyPowerMeterSpec,
+    HassPowerMeterSpec,
+    KasaPowerMeterSpec,
+    MyStromPowerMeterSpec,
+    OcrPowerMeterSpec,
+    OwonOwh98xxPowerMeterSpec,
+    ShellyPowerMeterSpec,
+    TasmotaPowerMeterSpec,
+    TuyaPowerMeterSpec,
+    WitnessSpec,
+)
+from measure.request import (
+    MeasurementRequest,
+    RecorderMeasurementRequest,
+    RecorderProfileRecipe,
+    RecorderPurpose,
+    parse_measurement_request,
+)
 from measure.runner.runner import RunnerResult
 from measure.tuning import MeasurementParameters
 from measure.version import measure_version
@@ -328,10 +361,10 @@ def payload() -> dict[str, object]:
             "sample_count": 1,
             "bri_bri_steps": 1,
             "ct_bri_steps": 5,
-            "ct_mired_steps": 10,
+            "ct_mired_divisions": 10,
             "hs_bri_steps": 32,
-            "hs_hue_steps": 2731,
-            "hs_sat_steps": 32,
+            "hs_hue_divisions": 24,
+            "hs_sat_divisions": 5,
         },
         "resume_policy": "new",
     }
@@ -350,6 +383,16 @@ def client(tmp_path: Path, *, trusted_ingress_only: bool = False, developer_mode
         duration=0,
     )
     app.state.context.light_load_probe = MagicMock()
+    app.state.context.light_load_probe.plan.return_value = (
+        LightLoadProbeStep(id="standby", kind="standby", label="Standby"),
+        LightLoadProbeStep(id="0", kind="on", label="Brightness 1", mode=LutMode.BRIGHTNESS),
+    )
+    app.state.context.light_load_probe.measure_step.return_value = LightLoadProbeReading(
+        id="standby",
+        kind="standby",
+        label="Standby",
+        power_w=0.2,
+    )
     app.state.context.light_load_probe.evaluate.return_value = LightLoadProbeResult(
         checked_variations=1,
         minimum_aggregate_power_w=1.25,
@@ -514,30 +557,17 @@ def test_capabilities_and_entity_filters(tmp_path: Path) -> None:
 
     assert capabilities.status_code == 200
     defaults = MeasurementParameters()
-    assert capabilities.json()["defaults"] == {
-        "sleep_time": defaults.sleep_time,
-        "sample_count": defaults.sample_count,
-        "sleep_time_sample": defaults.sleep_time_sample,
-        "max_retries": defaults.max_retries,
-        "max_nudges": defaults.max_nudges,
-        "bri_bri_steps": defaults.bri_bri_steps,
-        "ct_bri_steps": defaults.ct_bri_steps,
-        "ct_mired_steps": defaults.ct_mired_steps,
-        "hs_bri_steps": defaults.hs_bri_steps,
-        "hs_hue_steps": defaults.hs_hue_steps,
-        "hs_sat_steps": defaults.hs_sat_steps,
-        "min_brightness": defaults.min_brightness,
-        "min_sat": defaults.min_sat,
-        "max_sat": defaults.max_sat,
-        "min_hue": defaults.min_hue,
-        "max_hue": defaults.max_hue,
-        "sleep_initial": defaults.sleep_initial,
-        "sleep_standby": defaults.sleep_standby,
-        "effect_bri_steps": defaults.effect_bri_steps,
-        "measure_time_effect": defaults.measure_time_effect,
-        "measure_time_effect_min": defaults.measure_time_effect_min,
+    numeric = {name: getattr(defaults, name) for name in PARAMETER_LIMITS}
+    flags = {
+        field.name: getattr(defaults, field.name)
+        for field in dataclass_fields(MeasurementParameters)
+        if isinstance(getattr(defaults, field.name), bool) and field.name != "fast_test_mode"
     }
-    assert capabilities.json()["limits"]["ct_bri_steps"] == {"min": 1, "max": 10}
+    assert capabilities.json()["defaults"] == numeric | flags
+    assert capabilities.json()["defaults"]["max_brightness"] == 255
+    assert capabilities.json()["defaults"]["brightness_descending"] is False
+    assert capabilities.json()["limits"]["max_brightness"] == {"min": 1, "max": 255}
+    assert capabilities.json()["limits"]["ct_bri_steps"] == {"min": 1, "max": 255}
     assert capabilities.json()["limits"]["min_sat"] == {"min": 1, "max": 255}
     assert capabilities.json()["developer_mode"] is False
     assert client(tmp_path, developer_mode=True).get("/api/capabilities").json()["developer_mode"] is True
@@ -561,6 +591,81 @@ def test_capabilities_and_entity_filters(tmp_path: Path) -> None:
         response = test_client.get(f"/api/entities?domain={domain}")
         assert response.status_code == 200, domain
         assert [item["entity_id"] for item in response.json()] == [expected]
+
+
+def test_estimate_returns_brightness_product_and_catalog_ct_range(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    brightness = test_client.post("/api/estimate", json=payload())
+    assert brightness.status_code == 200
+    body = brightness.json()
+    assert body["modes"] == [
+        {"mode": "brightness", "axes": {"brightness": 255}, "points": 255, "summary": "255 brightness = 255"},
+    ]
+    assert body["total_points"] == 255
+    assert body["total_readings"] is None
+    assert body["used_default_range"] is False
+    assert body["max_duration_seconds"] >= 0
+
+    color_temp = test_client.post("/api/estimate", json=payload() | {"modes": ["color_temp"]})
+    assert color_temp.status_code == 200
+    ct = color_temp.json()
+    assert ct["used_default_range"] is False
+    assert ct["modes"][0]["mode"] == "color_temp"
+    assert "mired" in ct["modes"][0]["axes"]
+    assert "brightness" in ct["modes"][0]["axes"]
+    assert ct["modes"][0]["points"] == ct["modes"][0]["axes"]["mired"] * ct["modes"][0]["axes"]["brightness"]
+    assert ct["total_points"] == ct["modes"][0]["points"]
+
+
+def test_estimate_reports_readings_when_sample_count_is_above_one(tmp_path: Path) -> None:
+    response = client(tmp_path).post(
+        "/api/estimate",
+        json=payload() | {"parameters": payload()["parameters"] | {"sample_count": 3}},  # type: ignore[operator]
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total_points"] == 255
+    assert response.json()["total_readings"] == 765
+
+
+def test_estimate_uses_the_default_range_for_a_dummy_light(tmp_path: Path) -> None:
+    response = client(tmp_path).post(
+        "/api/estimate",
+        json=payload() | {"controller": {"type": "dummy"}, "modes": ["color_temp"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["used_default_range"] is True
+
+
+def test_estimate_does_not_treat_hs_bri_steps_as_sweeps_unless_bisect_is_on(tmp_path: Path) -> None:
+    response = client(tmp_path).post("/api/estimate", json=payload() | {"modes": ["hs"]})
+
+    assert response.status_code == 200
+    assert response.json()["modes"][0]["axes"]["brightness"] == 9
+    assert response.json()["total_points"] == 1_080
+
+    bisect = client(tmp_path).post(
+        "/api/estimate",
+        json=payload()
+        | {
+            "modes": ["hs"],
+            "parameters": payload()["parameters"] | {"hs_bri_bisection": True},  # type: ignore[operator]
+        },
+    )
+    assert bisect.status_code == 200
+    assert bisect.json()["modes"][0]["axes"]["brightness"] != 9
+
+
+def test_estimate_rejects_non_light_requests(tmp_path: Path) -> None:
+    response = client(tmp_path).post(
+        "/api/estimate",
+        json={"measure_type": "average", "power_meter": {"type": "dummy"}, "duration": 60},
+    )
+
+    assert response.status_code == 422
+    assert "light" in response.json()["message"].lower()
 
 
 def test_entity_catalog_categorizes_one_fresh_snapshot(tmp_path: Path) -> None:
@@ -618,6 +723,35 @@ def test_dummy_load_calibration_is_returned_only_for_the_configured_meter(tmp_pa
     settings["default_power_entity_id"] = "sensor.other_power"
     assert test_client.put("/api/settings", json=settings).status_code == 200
     assert test_client.get("/api/dummy-load/calibration").json() is None
+
+
+def test_dummy_load_calibration_fingerprint_follows_a_composite_primarys_voltage(tmp_path: Path) -> None:
+    """The related-voltage lookup must reach through a composite wrapper to its Hass
+    primary, since that is what changes the fingerprint, not the witnesses."""
+    test_client = client(tmp_path)
+    settings = {
+        "default_power_entity_id": "sensor.test_power",
+        "power_meter": "hass",
+        "witnesses": [{"meter": {"type": "shelly", "device_ip": "192.0.2.50"}}],
+    }
+    assert test_client.put("/api/settings", json=settings).status_code == 200
+    calibration = DummyLoadCalibration(
+        description="40 W incandescent bulb",
+        resistance=1322.5,
+        calibrated_at="2026-07-16T12:00:00Z",
+        power_meter_fingerprint=power_meter_fingerprint(
+            CompositePowerMeterSpec(
+                primary=HassPowerMeterSpec(entity_id="sensor.test_power", voltage_entity_id="sensor.test_voltage"),
+                witnesses=[WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.0.2.50"))],
+            ),
+        ),
+    )
+    test_client.app.state.context.storage.save_dummy_load_calibration(calibration)
+
+    response = test_client.get("/api/dummy-load/calibration")
+
+    assert response.status_code == 200
+    assert response.json()["resistance"] == pytest.approx(1322.5)
 
 
 def test_dummy_load_preflight_requires_voltage_and_includes_calibration_time(tmp_path: Path) -> None:
@@ -691,6 +825,110 @@ def test_kasa_settings_round_trip_into_a_power_meter_spec(tmp_path: Path) -> Non
     assert stored.status_code == 200
     assert test_client.get("/api/settings").json()["kasa_ip"] == "192.0.2.30"
     settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == KasaPowerMeterSpec(device_ip="192.0.2.30")
+
+
+def test_new_single_meter_types_round_trip_into_power_meter_specs(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    mystrom = test_client.put("/api/settings", json={"power_meter": "mystrom", "mystrom_ip": "192.0.2.40"})
+    assert mystrom.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == MyStromPowerMeterSpec(device_ip="192.0.2.40")
+
+    tasmota = test_client.put("/api/settings", json={"power_meter": "tasmota", "tasmota_ip": "192.0.2.41"})
+    assert tasmota.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == TasmotaPowerMeterSpec(device_ip="192.0.2.41")
+
+    tuya = test_client.put(
+        "/api/settings",
+        json={"power_meter": "tuya", "tuya_device_id": "abc123", "tuya_device_ip": "192.0.2.42", "tuya_version": "3.4"},
+    )
+    assert tuya.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == TuyaPowerMeterSpec(device_id="abc123", device_ip="192.0.2.42", version="3.4")
+
+    owon = test_client.put(
+        "/api/settings",
+        json={"power_meter": "owh98xx", "owon_port": "/dev/ttyUSB0", "owon_baudrate": 9600, "owon_channel": "1"},
+    )
+    assert owon.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == OwonOwh98xxPowerMeterSpec(port="/dev/ttyUSB0", baudrate=9600, channel="1")
+
+    ocr = test_client.put("/api/settings", json={"power_meter": "ocr", "ocr_source": "http://camera/stream"})
+    assert ocr.status_code == 200
+    settings = test_client.app.state.context.storage.load_settings()
+    assert _power_meter_spec(settings) == OcrPowerMeterSpec(source="http://camera/stream")
+
+
+def test_new_single_meter_types_report_missing_address_errors(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    for meter_type, message in [
+        ("mystrom", "Enter the myStrom IP address first"),
+        ("tasmota", "Enter the Tasmota IP address first"),
+        ("tuya", "Enter the Tuya device ID and IP address first"),
+        ("owh98xx", "Configure the Owon serial port, baud rate, and channel first"),
+    ]:
+        response = test_client.post("/api/settings/test-power-meter", json={"power_meter": meter_type})
+        assert response.json()["success"] is False, meter_type
+        assert response.json()["message"] == message, meter_type
+
+
+def test_witnesses_wrap_the_primary_into_a_composite_spec(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    updated = test_client.put(
+        "/api/settings",
+        json={
+            "power_meter": "hass",
+            "default_power_entity_id": "sensor.test_power",
+            "witnesses": [
+                {
+                    "meter": {"type": "shelly", "device_ip": "192.0.2.50"},
+                    "offset_w": 2.5,
+                    "tolerance_w": 0.5,
+                    "tolerance_pct": 3.0,
+                    "required": True,
+                },
+                {
+                    "meter": {"type": "shelly", "device_ip": "192.0.2.51"},
+                    "required": False,
+                },
+            ],
+        },
+    )
+    assert updated.status_code == 200
+    assert len(updated.json()["witnesses"]) == 2
+
+    settings = test_client.app.state.context.storage.load_settings()
+    spec = _power_meter_spec(settings)
+    assert spec == CompositePowerMeterSpec(
+        primary=HassPowerMeterSpec(entity_id="sensor.test_power"),
+        witnesses=[
+            WitnessSpec(
+                meter=ShellyPowerMeterSpec(device_ip="192.0.2.50"),
+                offset_w=2.5,
+                tolerance_w=0.5,
+                tolerance_pct=3.0,
+                required=True,
+            ),
+            WitnessSpec(meter=ShellyPowerMeterSpec(device_ip="192.0.2.51"), required=False),
+        ],
+    )
+
+
+def test_no_witnesses_returns_the_bare_primary_spec_unchanged(tmp_path: Path) -> None:
+    """A settings.json saved before witness support existed has no ``witnesses`` key,
+    which validates as an empty list; behavior must stay exactly what it was before."""
+    test_client = client(tmp_path)
+
+    test_client.put("/api/settings", json={"power_meter": "kasa", "kasa_ip": "192.0.2.30"})
+    settings = test_client.app.state.context.storage.load_settings()
+
+    assert settings.witnesses == []
     assert _power_meter_spec(settings) == KasaPowerMeterSpec(device_ip="192.0.2.30")
 
 
@@ -791,6 +1029,24 @@ def test_measure_definitions_and_average_request(tmp_path: Path) -> None:
         ("vacuum_robot", "Vacuum robot", "vacuum"),
         ("lawn_mower_robot", "Lawn mower robot", "lawn_mower"),
     ]
+    # Regression: a NUMBER field with no explicit step used to render no `step` attribute
+    # at all, which every browser defaults to 1 -- rejecting a genuinely fractional value
+    # like "4.9 W" of rated power outright. Every NUMBER field here must say explicitly
+    # whether it wants integer-only ("1") or fractional ("0.1", "any", ...) input.
+    light = next(item for item in definitions.json() if item["measure_type"] == MeasureType.LIGHT)
+    light_fields = {field["name"]: field for field in light["fields"]}
+    assert light_fields["rated_power_w"]["step"] == "0.1"
+    assert light_fields["multiple_light_count"]["step"] == "1"
+    light_parameters = {parameter["name"]: parameter for parameter in light["parameters"]}
+    assert light_parameters["sleep_time"]["step"] == "0.1"
+    assert light_parameters["sleep_time_sample"]["step"] == "0.1"
+    assert light_parameters["sleep_initial"]["step"] == "0.1"
+    assert light_parameters["settle_tolerance_w"]["step"] == "0.01"
+    assert light_parameters["settle_min_wait"]["step"] == "0.1"
+    average = next(item for item in definitions.json() if item["measure_type"] == MeasureType.AVERAGE)
+    average_fields = {field["name"]: field for field in average["fields"]}
+    assert average_fields["duration"]["step"] == "1"
+
     recorder = next(item for item in definitions.json() if item["measure_type"] == MeasureType.RECORDER)
     recorder_fields = {field["name"]: field for field in recorder["fields"]}
     assert recorder_fields["recorder_purpose"]["options"][0]["value"] == "playbook"
@@ -809,25 +1065,20 @@ def test_measure_definitions_and_average_request(tmp_path: Path) -> None:
 
 def test_preflight_exposes_quality_warnings_and_start_reuses_diagnostics(tmp_path: Path) -> None:
     test_client = client(tmp_path)
-    home_assistant = test_client.app.state.context.home_assistant
 
     response = test_client.post("/api/preflight", json=payload())
 
     assert response.status_code == 200
     assert response.json()["power_meter_diagnostic"]["precision_status"] == "good"
     assert response.json()["power_meter_diagnostic"]["update_interval_status"] == "poor"
-    assert response.json()["light_load_probe"] == {
-        "checked_variations": 1,
-        "minimum_aggregate_power_w": 1.25,
-        "points": [{"label": "Brightness 1", "mode": "brightness", "power_w": 1.25}],
-    }
+    assert response.json()["light_load_probe"] is None
     assert "did not report often enough" in response.json()["warnings"][0]
-    assert home_assistant.state_calls == 2
+    test_client.app.state.context.light_load_probe.evaluate.assert_not_called()
     assert test_client.post("/api/sessions", json=payload()).status_code == 201
-    assert home_assistant.state_calls == 2
+    test_client.app.state.context.light_load_probe.evaluate.assert_not_called()
 
 
-def test_preflight_maps_low_load_probe_failure_to_actionable_error(tmp_path: Path) -> None:
+def test_preflight_does_not_run_the_light_load_probe(tmp_path: Path) -> None:
     test_client = client(tmp_path)
     test_client.app.state.context.light_load_probe.evaluate.side_effect = LightLoadProbeError(
         "The power meter repeatedly returned 0 W while checking the selected light",
@@ -837,14 +1088,156 @@ def test_preflight_maps_low_load_probe_failure_to_actionable_error(tmp_path: Pat
 
     response = test_client.post("/api/preflight", json=payload())
 
+    assert response.status_code == 200
+    assert response.json()["light_load_probe"] is None
+    test_client.app.state.context.light_load_probe.evaluate.assert_not_called()
+
+
+def test_preflight_does_not_plan_or_measure_light_load_watts(tmp_path: Path) -> None:
+    """Standby and low-load ons are recorded once when the run starts, not here."""
+
+    test_client = client(tmp_path)
+    context = test_client.app.state.context
+    request = parse_measurement_request(payload())
+
+    response = _preflight(context, request)
+
+    context.light_load_probe.evaluate.assert_not_called()
+    context.light_load_probe.plan.assert_not_called()
+    context.light_load_probe.measure_step.assert_not_called()
+    assert response.probe_steps is None
+    assert response.light_load_probe is None
+
+
+def test_preflight_probe_measures_one_step(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    response = test_client.post("/api/preflight/probe?step=standby", json=payload())
+
+    assert response.status_code == 200
+    assert response.json()["kind"] == "standby"
+    assert response.json()["power_w"] == 0.2
+    test_client.app.state.context.light_load_probe.measure_step.assert_called_once()
+
+
+def test_preflight_probe_complete_rejects_a_floor_that_cannot_tell_on_from_off(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    response = test_client.post(
+        "/api/preflight/probe/complete",
+        json={
+            "standby_aggregate_power_w": 1.016,
+            "points": [{"label": "Brightness 1", "mode": "brightness", "power_w": 1.02}],
+        },
+    )
+
     assert response.status_code == 422
-    assert response.json() == {
-        "code": "preflight_failed",
-        "message": "The power meter repeatedly returned 0 W while checking the selected light",
-        "field": None,
-        "help_url": "https://docs.powercalc.nl/contributing/measure/low-power-measurements/",
-        "help_label": "Low-power measurement guide",
-    }
+
+
+def test_auto_resume_relaunches_a_session_left_resumable_by_a_prior_interrupted_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain process restart (add-on update, a Supervisor cold backup stopping every
+    add-on, an OOM kill, ...) must not need a human to notice a RESUMABLE session and
+    click Resume -- that fails the "runs unattended for hours" requirement outright. The
+    app's own startup hook (`_lifespan`) calls this for exactly that reason.
+    """
+    test_client = client(tmp_path)
+    context = test_client.app.state.context
+    snapshot = SessionSnapshot(id="resumable-1", state=SessionState.RESUMABLE, created_at="now", updated_at="now")
+    resumed = MagicMock()
+    # `current` is a read-only property on the real coordinator, so swap in a stand-in for
+    # this orchestration-only test rather than fighting the descriptor.
+    monkeypatch.setattr(context, "coordinator", MagicMock(current=snapshot, resume=resumed))
+    monkeypatch.setattr(context.storage, "load_request", MagicMock(return_value=parse_measurement_request(payload())))
+    preflight_calls: list[bool] = []
+    monkeypatch.setattr(
+        api_module,
+        "_preflight",
+        lambda ctx, req, *, skip_light_load_probe=False, skip_power_meter_diagnostic=False: preflight_calls.append(
+            (skip_light_load_probe, skip_power_meter_diagnostic)
+        ),
+    )
+
+    _auto_resume_interrupted_session(context)
+
+    assert preflight_calls == [(True, True)]  # Resume must not re-probe the light or wait on OCR.
+    resumed.assert_called_once_with("resumable-1")
+
+
+@pytest.mark.parametrize("state", [SessionState.FAILED, SessionState.COMPLETED, SessionState.CANCELLED])
+def test_auto_resume_leaves_non_resumable_states_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: SessionState,
+) -> None:
+    """FAILED has no compatible resumption point to build on (see `SessionStorage.can_resume`);
+    COMPLETED/CANCELLED are simply not what this hook is for. None should trigger a relaunch.
+    """
+    test_client = client(tmp_path)
+    context = test_client.app.state.context
+    snapshot = SessionSnapshot(id="s-1", state=state, created_at="now", updated_at="now")
+    resumed = MagicMock()
+    monkeypatch.setattr(context, "coordinator", MagicMock(current=snapshot, resume=resumed))
+
+    _auto_resume_interrupted_session(context)
+
+    resumed.assert_not_called()
+
+
+def test_auto_resume_is_a_no_op_without_a_retained_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    test_client = client(tmp_path)
+    context = test_client.app.state.context
+    resumed = MagicMock()
+    monkeypatch.setattr(context, "coordinator", MagicMock(current=None, resume=resumed))
+
+    _auto_resume_interrupted_session(context)  # Must not raise.
+
+    resumed.assert_not_called()
+
+
+def test_auto_resume_reraises_so_startup_can_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OCR having no frame yet, or HA still coming up, must not be a one-shot failure."""
+    test_client = client(tmp_path)
+    context = test_client.app.state.context
+    snapshot = SessionSnapshot(id="resumable-1", state=SessionState.RESUMABLE, created_at="now", updated_at="now")
+    monkeypatch.setattr(context, "coordinator", MagicMock(current=snapshot))
+    monkeypatch.setattr(context.storage, "load_request", MagicMock(return_value=parse_measurement_request(payload())))
+    monkeypatch.setattr(
+        api_module,
+        "_preflight",
+        MagicMock(side_effect=RuntimeError("OCR: no frame processed yet")),
+    )
+
+    with pytest.raises(RuntimeError, match="no frame processed yet"):
+        _auto_resume_interrupted_session(context)
+
+
+def test_auto_resume_retries_until_the_meter_is_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_client = client(tmp_path)
+    context = test_client.app.state.context
+    snapshot = SessionSnapshot(id="resumable-1", state=SessionState.RESUMABLE, created_at="now", updated_at="now")
+    monkeypatch.setattr(context, "coordinator", MagicMock(current=snapshot))
+    attempts = {"n": 0}
+
+    def fail_twice_then_ok(_context: object) -> None:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise RuntimeError("OCR: no frame processed yet")
+
+    monkeypatch.setattr(api_module, "_auto_resume_interrupted_session", fail_twice_then_ok)
+    monkeypatch.setattr(api_module.asyncio, "sleep", AsyncMock())
+
+    asyncio.run(_auto_resume_until_running(context))
+
+    assert attempts["n"] == 3
 
 
 def test_preflight_does_not_attribute_probe_adapter_failures_to_low_power(tmp_path: Path) -> None:
@@ -855,12 +1248,9 @@ def test_preflight_does_not_attribute_probe_adapter_failures_to_low_power(tmp_pa
 
     response = test_client.post("/api/preflight", json=payload())
 
-    assert response.status_code == 422
-    assert response.json() == {
-        "code": "preflight_failed",
-        "message": "Could not complete the active light check: connection refused",
-        "field": None,
-    }
+    assert response.status_code == 200
+    assert response.json()["light_load_probe"] is None
+    test_client.app.state.context.light_load_probe.evaluate.assert_not_called()
 
 
 def test_preflight_rejects_unavailable_entity(tmp_path: Path) -> None:
@@ -876,17 +1266,87 @@ def test_preflight_rejects_unavailable_entity(tmp_path: Path) -> None:
 
 
 def test_preflight_rejects_cli_only_power_meter_adapter(tmp_path: Path) -> None:
+    # Manual blocks on a console prompt the app has no console to answer -- the one power
+    # meter type genuinely excluded from the app, checked in ha_app/api.py's own builder
+    # dispatch as well as here. Every other single-meter type below is app-supported.
     response = client(tmp_path).post(
         "/api/preflight",
         json={
             "measure_type": "average",
-            "power_meter": {"type": "tasmota", "device_ip": "192.0.2.1"},
+            "power_meter": {"type": "manual"},
             "duration": 60,
         },
     )
 
     assert response.status_code == 422
-    assert response.json()["message"] == "Tasmota power meters are not supported by the Home Assistant app"
+    assert response.json()["message"] == "Manual power meters are not supported by the Home Assistant app"
+
+
+def _stub_diagnostics(test_client: TestClient) -> None:
+    """Swap in a diagnostics stub that reads successfully without touching the network,
+    so a preflight response depends only on the adapter-support check under test."""
+    context = test_client.app.state.context
+    meter = MagicMock(spec=PowerMeter)
+    meter.has_voltage_support.return_value = None
+    meter.diagnostic_sample.return_value = PowerMeterDiagnosticSample(power=4.2, raw_value="4.2", reported_at=100)
+    context.power_meter_diagnostics = PowerMeterDiagnostics(MagicMock(return_value=meter), duration=0)
+
+
+@pytest.mark.parametrize(
+    "power_meter",
+    [
+        {"type": "tasmota", "device_ip": "192.0.2.1"},
+        {"type": "mystrom", "device_ip": "192.0.2.1"},
+        {"type": "tuya", "device_id": "abc123", "device_ip": "192.0.2.1"},
+        {"type": "owh98xx", "port": "/dev/ttyUSB0", "baudrate": 9600, "channel": "1"},
+        {"type": "ocr", "source": "http://camera.local:8080/", "layout": "pr10"},
+    ],
+)
+def test_preflight_accepts_every_single_meter_type_the_app_ui_offers(
+    tmp_path: Path,
+    power_meter: dict[str, object],
+) -> None:
+    """Regression guard: each of these was added to the settings UI (witness/composite work)
+    but preflight's adapter allowlist was never updated to match, so every one of them
+    failed at measurement start with a misleading 'not supported' error despite being
+    fully configurable and buildable."""
+    test_client = client(tmp_path)
+    _stub_diagnostics(test_client)
+
+    response = test_client.post(
+        "/api/preflight",
+        json={"measure_type": "average", "power_meter": power_meter, "duration": 60},
+    )
+
+    assert response.status_code == 200, response.json()
+
+
+def test_preflight_accepts_a_composite_power_meter_via_the_api(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+    _stub_diagnostics(test_client)
+
+    response = test_client.post(
+        "/api/preflight",
+        json={
+            "measure_type": "average",
+            "power_meter": {
+                "type": "composite",
+                "primary": {"type": "shelly", "device_ip": "192.0.2.1"},
+                "witnesses": [
+                    {
+                        "meter": {"type": "tasmota", "device_ip": "192.0.2.2"},
+                        "offset_w": 0.0,
+                        "tolerance_w": 0.5,
+                        "tolerance_pct": 2.0,
+                        "required": True,
+                    },
+                ],
+            },
+            "duration": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.json()
 
 
 def test_preflight_rejects_cli_only_controller_adapter(tmp_path: Path) -> None:
@@ -964,9 +1424,28 @@ def test_session_lifecycle_and_file_download(tmp_path: Path) -> None:
     assert plots.json()["partial"] is False
     assert plots.json()["warnings"] == []
     assert plots.json()["plots"][0]["id"] == "brightness"
+    assert plots.json()["editable"] is True
     assert plots.json()["plots"][0]["series"][0]["points"] == [
-        {"x": 1.0, "y": 1.0, "color": None},
+        {
+            "x": pytest.approx(1 / 255 * 100),
+            "y": 1.0,
+            "color": None,
+            "inherited": False,
+            "id": "brightness:1",
+            "rail": "brightness",
+            "stats": [{"label": "Power", "value": "1.000 W"}, {"label": "Brightness", "value": "0% (1)"}],
+            "ignored": False,
+            "editable": True,
+            "interest": None,
+            "z": None,
+        },
     ]
+    ignored = test_client.post(
+        f"/api/sessions/{session_id}/plots/points",
+        json={"point_id": "brightness:1", "action": "ignore"},
+    )
+    assert ignored.status_code == 200
+    assert ignored.json()["plots"][0]["series"][0]["points"][0]["ignored"] is True
     download = test_client.get(f"/api/sessions/{session_id}/files/LCT010/brightness.csv")
     assert download.status_code == 200
     diagnostics = test_client.get(f"/api/sessions/{session_id}/diagnostics")
@@ -978,6 +1457,16 @@ def test_session_lifecycle_and_file_download(tmp_path: Path) -> None:
     assert report["request"]["controller"]["entity_id"] == "light.test"
     assert report["request"]["power_meter"]["entity_id"] == "sensor.test_power"
     assert report["logs"][0]["data"]["message"] == "Reading light.test with sensor.test_power"
+    logs = test_client.get(f"/api/sessions/{session_id}/logs")
+    assert logs.status_code == 200
+    assert logs.json()[0] == {
+        "time": report["logs"][0]["created_at"],
+        "message": "Reading light.test with sensor.test_power",
+        "sequence": report["logs"][0]["sequence"],
+    }
+    later = test_client.get(f"/api/sessions/{session_id}/logs", params={"after": report["logs"][0]["sequence"]})
+    assert later.status_code == 200
+    assert all(item["sequence"] > report["logs"][0]["sequence"] for item in later.json())
     assert report["events"][-1]["data"]["state"] == "completed"
     assert report["files"][0]["name"] == "LCT010/brightness.csv"
     assert "test-token" not in diagnostics.text
@@ -1040,6 +1529,83 @@ def test_session_summary_is_exposed(tmp_path: Path) -> None:
     assert current["state"] == "completed"
     assert current["summary"] == {"Average power": "42.3 W", "Duration": "30 s"}
 
+
+def test_session_list_does_not_scan_raw_logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    test_client = client(tmp_path)
+    started = test_client.post("/api/sessions", json=payload())
+    assert started.status_code == 201
+    session_id = started.json()["session_id"]
+    context = test_client.app.state.context
+    assert context.coordinator._worker is not None  # noqa: SLF001
+    context.coordinator._worker.join(timeout=5)  # noqa: SLF001
+
+    calls: list[str] = []
+
+    def forbidden(*_args: object, **_kwargs: object) -> int:
+        calls.append("raw")
+        return 0
+
+    monkeypatch.setattr("measure.ha_app.api._recorded_points_this_run", forbidden)
+    monkeypatch.setattr(
+        "measure.ha_app.api.load_session_measured_variations",
+        lambda *_args, **_kwargs: calls.append("csv") or {},
+    )
+
+    listed = test_client.get("/api/sessions").json()
+    assert listed[0]["session_id"] == session_id
+    assert listed[0]["seed_session_id"] is None
+    assert calls == []
+
+
+def test_ocr_preview_routes_404_for_an_unknown_session(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    assert test_client.get("/api/sessions/does-not-exist/ocr").status_code == 404
+    assert test_client.get("/api/sessions/does-not-exist/ocr/primary/state").status_code == 404
+    assert test_client.get("/api/sessions/does-not-exist/ocr/primary/frame.jpg").status_code == 404
+
+
+def test_ocr_preview_routes_report_no_previews_for_a_session_with_no_ocr_meter(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+    started = test_client.post("/api/sessions", json=payload())
+    assert started.status_code == 201
+    session_id = started.json()["session_id"]
+
+    assert test_client.get(f"/api/sessions/{session_id}/ocr").json() == []
+    assert test_client.get(f"/api/sessions/{session_id}/ocr/primary/state").status_code == 404
+    assert test_client.get(f"/api/sessions/{session_id}/ocr/primary/frame.jpg").status_code == 404
+
+
+def test_meter_preview_reports_nothing_to_preview_for_a_meter_with_no_ocr_component(tmp_path: Path) -> None:
+    """The whole point is to preview a camera before a session exists -- a meter with no
+    OCR component simply has nothing to show, which is a normal 200, not an error."""
+    test_client = client(tmp_path)
+
+    started = test_client.post("/api/power-meters/ocr-preview", json={"power_meter": "dummy"})
+
+    assert started.status_code == 200
+    assert started.json() == {"preview_id": None, "labels": []}
+
+
+def test_meter_preview_reports_nothing_to_preview_for_an_unaddressed_meter(tmp_path: Path) -> None:
+    """A meter that isn't addressed yet (e.g. the IP field is still empty) is the normal
+    state while the settings form is being filled in, not a failure to report."""
+    test_client = client(tmp_path)
+
+    started = test_client.post("/api/power-meters/ocr-preview", json={"power_meter": "shelly", "shelly_ip": None})
+
+    assert started.status_code == 200
+    assert started.json() == {"preview_id": None, "labels": []}
+
+
+def test_meter_preview_routes_404_for_an_unknown_preview_id(tmp_path: Path) -> None:
+    test_client = client(tmp_path)
+
+    assert test_client.get("/api/power-meters/ocr-preview/does-not-exist/primary/state").status_code == 404
+    assert test_client.get("/api/power-meters/ocr-preview/does-not-exist/primary/frame.jpg").status_code == 404
+    # Stopping an id that was never started (or already stopped) is a no-op, not an error --
+    # a second cleanup call racing the first (e.g. a page unload firing twice) must not 404.
+    assert test_client.delete("/api/power-meters/ocr-preview/does-not-exist").status_code == 204
 
 def test_completed_recording_can_be_analysed_again(tmp_path: Path) -> None:
     test_client = client(tmp_path)
@@ -1269,11 +1835,22 @@ def test_openapi_contract_contains_the_supported_app_endpoints(tmp_path: Path) -
     assert set(paths["/api/sessions/{session_id}/resume"]) == {"post"}
     assert set(paths["/api/sessions/{session_id}/analyse"]) == {"post"}
     assert set(paths["/api/sessions/{session_id}/diagnostics"]) == {"get"}
+    assert set(paths["/api/sessions/{session_id}/logs"]) == {"get"}
     assert set(paths["/api/sessions/{session_id}/plots"]) == {"get"}
+    assert set(paths["/api/sessions/{session_id}/plots/points"]) == {"post"}
     assert set(paths["/api/sessions/{session_id}/files/{name}"]) == {"get"}
     assert set(paths["/api/sessions/{session_id}/contribution"]) == {"get", "post"}
     assert set(paths["/api/sessions/{session_id}/contribution/preview"]) == {"post"}
     assert set(paths["/api/sessions/{session_id}/contribution/{job_id}/profile.zip"]) == {"get"}
+    assert set(paths["/api/sessions/{session_id}/ocr"]) == {"get"}
+    assert set(paths["/api/sessions/{session_id}/ocr/{label}/state"]) == {"get"}
+    assert set(paths["/api/sessions/{session_id}/ocr/{label}/frame.jpg"]) == {"get"}
+    assert set(paths["/api/sessions/{session_id}/ocr/{label}/events"]) == {"get"}
+    assert set(paths["/api/power-meters/ocr-preview"]) == {"post"}
+    assert set(paths["/api/power-meters/ocr-preview/{preview_id}"]) == {"delete"}
+    assert set(paths["/api/power-meters/ocr-preview/{preview_id}/{label}/state"]) == {"get"}
+    assert set(paths["/api/power-meters/ocr-preview/{preview_id}/{label}/frame.jpg"]) == {"get"}
+    assert set(paths["/api/power-meters/ocr-preview/{preview_id}/{label}/events"]) == {"get"}
     assert set(paths["/api/dummy-load/calibration"]) == {"get"}
     assert set(paths["/api/contribution/auth"]) == {"get", "put", "delete"}
     assert set(paths["/api/contribution/auth/device"]) == {"post"}
@@ -1291,11 +1868,22 @@ def test_openapi_contract_contains_the_supported_app_endpoints(tmp_path: Path) -
         assert paths[path][method]["responses"][status]["content"]["application/json"]["schema"] == snapshot_ref
 
     snapshot_schema = contract["components"]["schemas"]["SessionSnapshotResponse"]
-    assert set(snapshot_schema["required"]) == set(snapshot_schema["properties"])
+    assert {"session_id", "state", "can_analyse", "request", "progress"}.issubset(snapshot_schema["required"])
+    assert set(snapshot_schema["required"]).issubset(snapshot_schema["properties"])
     assert snapshot_schema["properties"]["operating_point"] == {
         "anyOf": [{"$ref": "#/components/schemas/OperatingPoint"}, {"type": "null"}],
     }
-    assert contract["components"]["schemas"]["AppPowerMeterType"]["enum"] == ["hass", "shelly", "kasa", "dummy"]
+    assert set(contract["components"]["schemas"]["AppPowerMeterType"]["enum"]) == {
+        "hass",
+        "shelly",
+        "kasa",
+        "dummy",
+        "mystrom",
+        "tasmota",
+        "tuya",
+        "owh98xx",
+        "ocr",
+    }
 
 
 def test_contribution_device_flow_reports_configuration_and_uses_injected_service(tmp_path: Path) -> None:
@@ -1450,7 +2038,9 @@ def test_measurement_can_complete_without_product_identity(tmp_path: Path) -> No
     assert context.storage.load_snapshot(session_id).state == SessionState.COMPLETED
     assert (context.storage.artifact_directory(session_id, "") / "brightness.csv").is_file()
     sessions = test_client.get("/api/sessions").json()
-    assert sessions[0]["product_name"] == "Desk lamp"
+    assert sessions[0]["product_name"] == "Hue White Ambiance"
+    assert sessions[0]["family_key"] == "light|hue white ambiance|test meter"
+    assert sessions[0]["modes"] == ["brightness"]
     draft = test_client.get(f"/api/sessions/{session_id}/contribution")
     assert draft.status_code == 200
     assert draft.json()["model_id"] == "Hue White Ambiance"
@@ -1615,15 +2205,18 @@ def test_contribution_preview_rejects_unsupported_generated_session(tmp_path: Pa
     assert service.preview_calls == 0
 
 
-def test_plot_endpoint_rejects_active_session(tmp_path: Path) -> None:
+def test_plot_endpoint_rejects_a_session_with_no_data_yet(tmp_path: Path) -> None:
+    # Before the light/controller loop starts taking readings there is nothing to plot,
+    # unlike RUNNING and CANCELLING, which can already have real (if partial) data.
     test_client = client(tmp_path)
     coordinator = test_client.app.state.context.coordinator
     now = "2026-07-12T12:00:00Z"
-    coordinator._snapshot = SessionSnapshot(id="active", state=SessionState.RUNNING, created_at=now, updated_at=now)  # noqa: SLF001
+    coordinator._snapshot = SessionSnapshot(id="active", state=SessionState.VALIDATING, created_at=now, updated_at=now)  # noqa: SLF001
 
     response = test_client.get("/api/sessions/active/plots")
 
     assert response.status_code == 409
+    assert "starts taking readings" in response.json()["message"]
 
 
 def test_plot_endpoint_marks_terminal_incomplete_session_as_partial(tmp_path: Path) -> None:
@@ -1750,6 +2343,25 @@ def test_settings_default_and_update(tmp_path: Path) -> None:
         "shelly_username": "admin",
         "shelly_password_configured": False,
         "kasa_ip": None,
+        "hass_max_age_seconds": None,
+        "mystrom_ip": None,
+        "tasmota_ip": None,
+        "tuya_device_id": None,
+        "tuya_device_ip": None,
+        "tuya_version": "3.3",
+        "owon_port": None,
+        "owon_baudrate": None,
+        "owon_timeout": 5.0,
+        "owon_channel": None,
+        "ocr_source": "0",
+        "ocr_layout": "pr10",
+        "ocr_preview_host": "127.0.0.1",
+        "ocr_preview_port": 8765,
+        "ocr_window_seconds": 1.5,
+        "ocr_stale_after_seconds": 5.0,
+        "ocr_crosscheck_tolerance_pct": 3.0,
+        "ocr_min_current_for_crosscheck": 0.02,
+        "witnesses": [],
         "fast_test_mode": False,
         "measurement_defaults": {
             "sleep_time": 2.0,
@@ -1881,3 +2493,99 @@ def test_settings_rejects_invalid_measurement_defaults(tmp_path: Path) -> None:
 
     assert response.status_code == 400
     assert response.json()["code"] == "validation_error"
+
+
+def _plant_completed_light(storage: SessionStorage, session_id: str, rows: str, updated_at: str) -> None:
+    snapshot = SessionSnapshot(
+        id=session_id,
+        state=SessionState.COMPLETED,
+        created_at="2026-09-01T12:00:00Z",
+        updated_at=updated_at,
+    )
+    storage.create(
+        snapshot,
+        parse_measurement_request(payload() | {"controller": {"type": "dummy"}, "power_meter": {"type": "dummy"}}),
+        set_current=False,
+    )
+    output = storage.artifact_directory(session_id, "LCT010")
+    output.mkdir()
+    (output / "brightness.csv").write_text(rows, encoding="utf-8")
+    (output / "model.json").write_text('{"name":"Test light","standby_power":0.2}', encoding="utf-8")
+
+
+def test_merge_preview_and_create_do_not_write_current(tmp_path: Path) -> None:
+    test_client = client(tmp_path, developer_mode=True)
+    storage = test_client.app.state.context.storage
+    _plant_completed_light(storage, "left-session", "bri,watt\n1,1.0\n", "2026-09-01T12:00:00Z")
+    _plant_completed_light(storage, "right-session", "bri,watt\n1,1.0\n2,2.0\n", "2026-09-01T12:00:00Z")
+
+    preview = test_client.post(
+        "/api/sessions/merge/preview",
+        json={"left": "left-session", "right": "right-session"},
+    )
+    created = test_client.post(
+        "/api/sessions/merge",
+        json={"left": "left-session", "right": "right-session"},
+    )
+
+    assert preview.status_code == 200
+    assert preview.json()["modes"]["brightness"]["added"] == 1
+    assert preview.json()["modes"]["brightness"]["kept"] == 1
+    assert created.status_code == 201
+    assert created.json()["state"] == "completed"
+    assert created.json()["request"]["derived_from"] == ["left-session", "right-session"]
+    assert not (tmp_path / "current.json").exists()
+
+
+def test_session_summary_and_snapshot_expose_refine_merge_and_coverage(tmp_path: Path) -> None:
+    test_client = client(tmp_path, developer_mode=True)
+    storage = test_client.app.state.context.storage
+    _plant_completed_light(storage, "bright-session", "bri,watt\n1,1.0\n", "2026-09-01T12:00:00Z")
+
+    listing = test_client.get("/api/sessions")
+    snapshot = test_client.get("/api/sessions/bright-session")
+
+    assert listing.status_code == 200
+    summary = next(item for item in listing.json() if item["session_id"] == "bright-session")
+    assert summary["can_refine"] is True
+    assert summary["can_merge"] is True
+    assert snapshot.status_code == 200
+    assert snapshot.json()["sweep_coverage"] == {}
+
+
+def test_extend_session_start_copies_the_seed(tmp_path: Path) -> None:
+    test_client = client(tmp_path, developer_mode=True)
+    storage = test_client.app.state.context.storage
+    _plant_completed_light(storage, "seed-session", "bri,watt\n1,1.0\n", "2026-09-01T12:00:00Z")
+
+    class CopySafeService(SessionMeasurementService):
+        def run(
+            self,
+            request: MeasurementRequest,
+            control: SessionControl,
+            context: SessionExecutionContext,
+        ) -> RunnerResult:
+            context.artifact_directory.mkdir(parents=True, exist_ok=True)
+            (context.artifact_directory / "brightness.csv").write_text("bri,watt\n1,1.0\n", encoding="utf-8")
+            control.progress(completed=1, total=1, mode="brightness", estimated_remaining="0s")
+            return RunnerResult(model_json_data={})
+
+    test_client.app.state.context.coordinator = MeasurementCoordinator(storage, CopySafeService)
+    started = test_client.post(
+        "/api/sessions",
+        json=payload()
+        | {
+            "controller": {"type": "dummy"},
+            "power_meter": {"type": "dummy"},
+            "resume_policy": "extend",
+            "seed_session_id": "seed-session",
+        },
+    )
+
+    assert started.status_code == 201
+    session_id = started.json()["session_id"]
+    worker = test_client.app.state.context.coordinator._worker  # noqa: SLF001
+    assert worker is not None
+    worker.join(timeout=5)
+    assert (tmp_path / "current.json").exists()
+    assert session_id in (tmp_path / "current.json").read_text(encoding="utf-8")

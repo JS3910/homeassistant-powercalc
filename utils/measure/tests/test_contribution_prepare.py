@@ -155,11 +155,29 @@ def test_preparer_applies_delivery_independent_profile_metadata(tmp_path: Path) 
 
     assert model["aliases"] == ["Hue test"]
     assert model["gtin"] == ["12345678", "1234567890123"]
+    assert "ean" not in model
     assert model["product_url"] == "https://example.com/hue-test"
     assert model["device_specs"] == {"rated_power": 9.5}
     assert model["measure_device"] == "Shelly PM Mini Gen3"
     assert model["measure_device_firmware"] == "1.7.0"
     assert model["measure_description"] == "Measured at 230 V"
+
+
+def test_preparer_renames_leftover_ean_to_gtin(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    write_profile_artifacts(artifacts)
+    artifact_model = json.loads((artifacts / "model.json").read_text(encoding="utf-8"))
+    artifact_model["ean"] = ["12345678"]
+    (artifacts / "model.json").write_text(json.dumps(artifact_model), encoding="utf-8")
+
+    contribution_metadata = metadata().model_copy(update={"gtins": None})
+    preview = make_preparer(tmp_path).prepare(artifacts, contribution_metadata)
+    model = json.loads(
+        dict(make_preparer(tmp_path).render_contents(artifacts, contribution_metadata, preview))[preview.files[0].path],
+    )
+
+    assert model["gtin"] == ["12345678"]
+    assert "ean" not in model
 
 
 def test_preparer_derives_mains_voltage_from_measured_voltage_range(tmp_path: Path) -> None:
@@ -197,6 +215,7 @@ def test_preparer_omits_empty_optional_profile_metadata(tmp_path: Path) -> None:
     artifact_model.update(
         {
             "aliases": [],
+            "ean": [],
             "gtin": [],
             "product_url": "",
             "device_specs": {},
@@ -215,6 +234,7 @@ def test_preparer_omits_empty_optional_profile_metadata(tmp_path: Path) -> None:
 
     assert not {
         "aliases",
+        "ean",
         "gtin",
         "product_url",
         "device_specs",
@@ -262,6 +282,7 @@ def test_preparer_clears_explicitly_blank_optional_text_but_preserves_omitted_fi
     "instance,schema,field",
     [
         ({"name": 123}, {"properties": {"name": {"type": "string"}}}, "product_name"),
+        ({"ean": [123]}, {"properties": {"ean": {"items": {"type": "string"}}}}, "gtins"),
         ({"gtin": [123]}, {"properties": {"gtin": {"items": {"type": "string"}}}}, "gtins"),
         (
             {"device_specs": {"rated_power": -1}},
@@ -281,6 +302,16 @@ def test_schema_errors_identify_editable_fields(instance: dict, schema: dict, fi
     with pytest.raises(ProfilePreparationError) as info:
         _jsonschema_validate(instance, schema)
     assert info.value.field == field
+
+
+def test_preparer_ignores_raw_jsonl_diagnostic_files(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    write_profile_artifacts(artifacts)
+    (artifacts / "brightness.raw.jsonl").write_text("{}\n", encoding="utf-8")
+
+    preview = make_preparer(tmp_path).prepare(artifacts, metadata("Acme"))
+
+    assert any(file.path.endswith("brightness.csv.gz") for file in preview.files)
 
 
 def test_preparer_generates_new_manufacturer_manifest_without_adding_aliases(tmp_path: Path) -> None:
@@ -446,6 +477,20 @@ def test_preparer_accepts_raw_csv_alongside_gzip_and_rejects_unrelated_artifacts
     profile_metadata = metadata()
     with pytest.raises(ProfilePreparationError, match="Unexpected artifact"):
         preparer.prepare(artifacts, profile_metadata)
+
+
+def test_preparer_ignores_session_on_off_bounds_and_raw_jsonl(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    write_library(tmp_path)
+    write_profile_artifacts(artifacts)
+    (artifacts / "on_off_bounds.json").write_text('{"standby": 0.14, "minimum_on": 0.30}', encoding="utf-8")
+    (artifacts / "color_temp.raw.jsonl").write_text("{}\n", encoding="utf-8")
+    preparer = make_preparer(tmp_path)
+
+    preview = preparer.prepare(artifacts, metadata())
+
+    paths = {file.path for file in preview.files}
+    assert not any("on_off_bounds" in path or path.endswith(".raw.jsonl") for path in paths)
 
 
 def test_preparer_compresses_raw_csv_for_profile_library(tmp_path: Path) -> None:

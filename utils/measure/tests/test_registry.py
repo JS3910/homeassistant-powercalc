@@ -1,5 +1,5 @@
 from measure.const import MEASURE_TYPE_LABELS, MeasureType, parse_measure_type
-from measure.ha_app.registry import MEASUREMENT_REGISTRY
+from measure.ha_app.registry import MEASUREMENT_REGISTRY, ParameterControl
 
 
 def test_registry_contains_every_stable_measurement_kind() -> None:
@@ -36,6 +36,36 @@ def test_light_definition_allows_multiple_entities_and_explains_the_physical_cou
 
     assert fields["light_entity_id"].multiple is True
     assert "physical lights" in fields["multiple_light_count"].hint
+
+
+def test_light_resolution_parameters_expose_bisection_and_all() -> None:
+    parameters = {parameter.name: parameter for parameter in MEASUREMENT_REGISTRY[MeasureType.LIGHT].parameters}
+
+    assert parameters["hs_bri_steps"].bisection == "hs_bri_bisection"
+    assert parameters["hs_bri_steps"].all_values == "hs_bri_all"
+    assert parameters["ct_mired_divisions"].all_values == "ct_mired_all"
+    assert parameters["min_kelvin"].axis.value == "kelvin"
+    assert parameters["max_kelvin"].axis.value == "kelvin"
+    color_temp = next(
+        option
+        for field in MEASUREMENT_REGISTRY[MeasureType.LIGHT].fields
+        if field.name == "modes"
+        for option in field.options
+        if option.value == "color_temp"
+    )
+    assert {
+        "min_kelvin",
+        "max_kelvin",
+        "smart_sampling",
+        "smart_delta",
+        "smart_border_delta",
+    } <= set(color_temp.enables)
+    assert parameters["smart_sampling"].control == ParameterControl.BOOLEAN
+    assert parameters["smart_delta"].hint
+    assert parameters["smart_border_delta"].hint
+    assert parameters["hs_hue_divisions"].all_values == "hs_hue_all"
+    assert parameters["hs_sat_divisions"].all_values == "hs_sat_all"
+    assert parameters["brightness_descending"].control == ParameterControl.BOOLEAN
 
 
 def test_light_product_name_example_does_not_repeat_the_manufacturer() -> None:

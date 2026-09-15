@@ -2,7 +2,7 @@ from unittest.mock import MagicMock
 
 from homeassistant_api import State
 from homeassistant_api.errors import HomeassistantAPIError
-from measure.controller.errors import ApiConnectionError
+from measure.controller.errors import ApiConnectionError, ControllerError
 from measure.controller.light.const import MAX_MIRED, MIN_MIRED, LutMode
 from measure.controller.light.hass import HassLightController
 from measure.home_assistant import HomeAssistantManager
@@ -96,10 +96,216 @@ def test_change_light_state(mode: LutMode, call_kwargs: dict, trigger_service_bo
     client.trigger_service.assert_called_once_with("light", "turn_on", entity_id="light.test", **trigger_service_body)
 
 
+def test_group_is_expanded_and_commands_go_to_members() -> None:
+    client = _mock_client()
+    states = {
+        "light.measure": State(
+            entity_id="light.measure",
+            state="on",
+            attributes={"entity_id": ["light.one", "light.two", "light.three"]},
+        ),
+        "light.one": State(entity_id="light.one", state="off", attributes={}),
+        "light.two": State(entity_id="light.two", state="off", attributes={}),
+        "light.three": State(entity_id="light.three", state="off", attributes={}),
+    }
+
+    def get_state(*, entity_id: str) -> State:
+        return states[entity_id]
+
+    client.get_state.side_effect = get_state
+    controller = HassLightController(
+        client,
+        0,
+        entity_ids=["light.measure"],
+        wait=lambda _seconds: None,
+        state_confirm_timeout=0,
+    )
+    controller.change_light_state(LutMode.BRIGHTNESS, on=True, bri=100)
+    client.trigger_service.assert_called_once_with(
+        "light",
+        "turn_on",
+        entity_id=["light.one", "light.two", "light.three"],
+        brightness=100,
+        transition=0,
+    )
+
+
+def test_confirms_members_are_on_before_returning() -> None:
+    client = _mock_client()
+    polls = {"light.slow": 0}
+    states = {
+        "light.measure": State(
+            entity_id="light.measure",
+            state="on",
+            attributes={"entity_id": ["light.fast", "light.slow"]},
+        ),
+        "light.fast": State(entity_id="light.fast", state="on", attributes={"brightness": 80}),
+        "light.slow": State(entity_id="light.slow", state="off", attributes={}),
+    }
+
+    def get_state(*, entity_id: str) -> State:
+        if entity_id == "light.slow":
+            polls["light.slow"] += 1
+            if polls["light.slow"] >= 3:
+                return State(entity_id="light.slow", state="on", attributes={"brightness": 80})
+        return states[entity_id]
+
+    client.get_state.side_effect = get_state
+    waited: list[float] = []
+    controller = HassLightController(
+        client,
+        0,
+        entity_ids=["light.measure"],
+        wait=waited.append,
+        state_confirm_timeout=5,
+    )
+    controller.change_light_state(LutMode.COLOR_TEMP, on=True, bri=80, ct=200)
+    assert polls["light.slow"] >= 3
+    assert waited
+
+
+def test_confirms_a_single_light_before_returning() -> None:
+    polls = {"n": 0}
+
+    def get_state(*, entity_id: str) -> State:
+        polls["n"] += 1
+        if polls["n"] < 3:
+            return State(entity_id=entity_id, state="off", attributes={})
+        return State(entity_id=entity_id, state="on", attributes={"brightness": 100})
+
+    client = _mock_client()
+    client.get_state.side_effect = get_state
+    waited: list[float] = []
+    controller = HassLightController(
+        client,
+        0,
+        entity_ids=["light.only"],
+        wait=waited.append,
+        state_confirm_timeout=5,
+    )
+    controller.change_light_state(LutMode.BRIGHTNESS, on=True, bri=100)
+    assert polls["n"] >= 3
+    assert waited
+
+
+def test_confirm_does_not_advertise_the_timeout_as_a_scheduled_wait() -> None:
+    polls = {"n": 0}
+
+    def get_state(*, entity_id: str) -> State:
+        polls["n"] += 1
+        if polls["n"] < 2:
+            return State(entity_id=entity_id, state="off", attributes={})
+        return State(entity_id=entity_id, state="on", attributes={"brightness": 100})
+
+    client = _mock_client()
+    client.get_state.side_effect = get_state
+    controller = HassLightController(
+        client,
+        0,
+        entity_ids=["light.only"],
+        wait=lambda _seconds: None,
+        state_confirm_timeout=5,
+    )
+    controller.change_light_state(LutMode.BRIGHTNESS, on=True, bri=100)
+    assert polls["n"] >= 2
+
+
+def test_confirm_timeout_is_a_hard_error() -> None:
+    client = _mock_client()
+    states = {
+        "light.measure": State(
+            entity_id="light.measure",
+            state="on",
+            attributes={"entity_id": ["light.fast", "light.slow"]},
+        ),
+        "light.fast": State(entity_id="light.fast", state="on", attributes={"brightness": 80}),
+        "light.slow": State(entity_id="light.slow", state="off", attributes={}),
+    }
+    client.get_state.side_effect = lambda *, entity_id: states[entity_id]
+    controller = HassLightController(
+        client,
+        0,
+        entity_ids=["light.measure"],
+        wait=lambda _seconds: None,
+        state_confirm_timeout=0.01,
+    )
+    with pytest.raises(ControllerError, match="light.slow") as error:
+        controller.change_light_state(LutMode.BRIGHTNESS, on=True, bri=80)
+    assert "poison" in str(error.value)
+    assert "off, brightness=None" in str(error.value)
+
+
+def test_confirm_waits_until_reported_brightness_matches_the_command() -> None:
+    polls = {"n": 0}
+
+    def get_state(*, entity_id: str) -> State:
+        polls["n"] += 1
+        # Home Assistant often reports on at the previous brightness (or while the
+        # LED is still off) before the commanded level arrives.
+        brightness = 1 if polls["n"] < 3 else 255
+        return State(entity_id=entity_id, state="on", attributes={"brightness": brightness})
+
+    client = _mock_client()
+    client.get_state.side_effect = get_state
+    waited: list[float] = []
+    controller = HassLightController(
+        client,
+        0,
+        entity_ids=["light.only"],
+        wait=waited.append,
+        state_confirm_timeout=5,
+    )
+    controller.change_light_state(LutMode.BRIGHTNESS, on=True, bri=255)
+    assert polls["n"] >= 3
+    assert waited
+
+
+def test_confirm_accepts_brightness_within_two_steps() -> None:
+    client = _mock_client()
+    client.get_state.side_effect = lambda *, entity_id: State(
+        entity_id=entity_id,
+        state="on",
+        attributes={"brightness": 254},
+    )
+    controller = HassLightController(
+        client,
+        0,
+        entity_ids=["light.only"],
+        wait=lambda _seconds: None,
+        state_confirm_timeout=5,
+    )
+    controller.change_light_state(LutMode.BRIGHTNESS, on=True, bri=255)
+
+
+def test_confirm_timeout_is_a_hard_error_when_brightness_never_matches() -> None:
+    client = _mock_client()
+    client.get_state.side_effect = lambda *, entity_id: State(
+        entity_id=entity_id,
+        state="on",
+        attributes={"brightness": 1},
+    )
+    controller = HassLightController(
+        client,
+        0,
+        entity_ids=["light.only"],
+        wait=lambda _seconds: None,
+        state_confirm_timeout=0.01,
+    )
+    with pytest.raises(ControllerError, match="light.only") as error:
+        controller.change_light_state(LutMode.BRIGHTNESS, on=True, bri=255)
+    assert "poison" in str(error.value)
+    assert "want 255" in str(error.value)
+
+
 def test_turn_off() -> None:
     client = _mock_client()
     _get_instance(client).change_light_state(LutMode.BRIGHTNESS, on=False)
-    client.trigger_service.assert_called_once_with("light", "turn_off", entity_id="light.test")
+    client.trigger_service.assert_called_once_with(
+        "light",
+        "turn_off",
+        entity_id="light.test",
+        isolated=True,
+    )
 
 
 @pytest.mark.parametrize("connection_error", [HomeassistantAPIError("Error"), BrokenPipeError(32, "Broken pipe")])
@@ -127,21 +333,30 @@ def test_controller_requires_an_entity() -> None:
 
 def test_multiple_entities_are_targeted_together_with_their_common_capabilities() -> None:
     client = _mock_client()
-    client.get_state.side_effect = [
-        State(
+    states = {
+        "light.one": State(
             entity_id="light.one",
             state="on",
-            attributes={"min_color_temp_kelvin": 2000, "max_color_temp_kelvin": 5000},
+            attributes={
+                "min_color_temp_kelvin": 2000,
+                "max_color_temp_kelvin": 5000,
+                "effect_list": ["one", "shared"],
+                "brightness": 100,
+            },
         ),
-        State(
+        "light.two": State(
             entity_id="light.two",
             state="on",
-            attributes={"min_color_temp_kelvin": 2500, "max_color_temp_kelvin": 6500},
+            attributes={
+                "min_color_temp_kelvin": 2500,
+                "max_color_temp_kelvin": 6500,
+                "effect_list": ["shared", "two"],
+                "brightness": 100,
+            },
         ),
-        State(entity_id="light.one", state="on", attributes={"effect_list": ["one", "shared"]}),
-        State(entity_id="light.two", state="on", attributes={"effect_list": ["shared", "two"]}),
-    ]
-    controller = HassLightController(client, 0, entity_ids=["light.one", "light.two"])
+    }
+    client.get_state.side_effect = lambda *, entity_id: states[entity_id]
+    controller = HassLightController(client, 0, entity_ids=["light.one", "light.two"], state_confirm_timeout=0)
 
     controller.change_light_state(LutMode.BRIGHTNESS, bri=100)
     client.trigger_service.assert_called_once_with(
@@ -161,6 +376,7 @@ def _get_instance(client: MagicMock | None = None) -> HassLightController:
         client or _mock_client(),
         0,
         entity_ids=["light.test"],
+        state_confirm_timeout=0,
     )
 
 

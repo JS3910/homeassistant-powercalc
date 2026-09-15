@@ -15,12 +15,55 @@ from measure.powermeter.errors import (
     OutdatedMeasurementError,
     PowerMeterError,
     UnsupportedFeatureError,
+    WaitingForMeterError,
+    WitnessDisagreementError,
     ZeroReadingError,
 )
 from measure.powermeter.powermeter import PowerMeasurementResult, PowerMeter
 from measure.tuning import MeasurementParameters
 
 _LOGGER = logging.getLogger("measure")
+
+
+#: Independent polls needed in the trailing window before a track can settle.
+#: 3 is one second of 0.25–0.35 s polls (interval + a Shelly RTT) without asking
+#: for a sample exactly 0.9–1.0 s old — that sliver is what used to deadlock.
+SETTLE_MIN_SAMPLES = 3
+
+
+def _trim_to_window(readings: list[tuple[float, float]], now: float, window_seconds: float) -> None:
+    while len(readings) > 1 and now - readings[0][0] > window_seconds:
+        readings.pop(0)
+
+
+def _track_has_settled(
+    readings: list[tuple[float, float]],
+    now: float,
+    started_at: float,
+    window_seconds: float,
+    tolerance_pct: float,
+    tolerance_w: float,
+    min_samples: int = SETTLE_MIN_SAMPLES,
+) -> bool:
+    """True when this track has been watched for ``window_seconds``, has enough
+    samples in that trailing window, and those samples sit within the band.
+
+    Time is wall-clock from ``started_at``, not the span of the kept samples.
+    Requiring the oldest kept sample to sit in a 100 ms sliver (0.9–1.0 s) was
+    how a perfectly flat 22 W reading still waited 7–20 s.
+    """
+    if now - started_at < window_seconds:
+        return False
+    window = [value for timestamp, value in readings if now - timestamp <= window_seconds]
+    return len(window) >= min_samples and MeasureUtil._is_flat(window, tolerance_pct, tolerance_w)  # noqa: SLF001
+
+
+def _should_reconnect_meter(error: PowerMeterError) -> bool:
+    """Reconnecting the camera does not fix a timestamp race, a wait, or a witness mismatch."""
+
+    if isinstance(error, (WitnessDisagreementError, WaitingForMeterError)):
+        return False
+    return "from before this point started" not in str(error)
 
 
 class MeasurementError(PowerMeterError):
@@ -66,6 +109,8 @@ class AverageMeasurementState:
 
 
 class MeasureUtil:
+    on_accepted_reading: Callable[[MeasurementResult], None] | None = None
+
     def __init__(
         self,
         power_meter: PowerMeter,
@@ -74,6 +119,7 @@ class MeasureUtil:
         wait: Callable[[float], None] = time.sleep,
         on_sample: Callable[[float], None] | None = None,
         on_calibration_sample: Callable[[float, float, float], None] | None = None,
+        on_accepted_reading: Callable[[MeasurementResult], None] | None = None,
     ) -> None:
         self.power_meter = power_meter
         self.dummy_load_value: float | None = None
@@ -82,6 +128,7 @@ class MeasureUtil:
         self._wait = wait
         self._on_sample = on_sample
         self._on_calibration_sample = on_calibration_sample
+        self.on_accepted_reading = on_accepted_reading
 
     def take_average_measurement(
         self,
@@ -157,9 +204,15 @@ class MeasureUtil:
             on_progress(time.time() - state.start_time, duration)
         try:
             result = self._take_average_measurement_reading(measure_resistance)
+        except WaitingForMeterError as error:
+            _LOGGER.info("%s", error)
+            self._wait(0.25)
+            return False
         except PowerMeterError as error:
             if self._average_measurement_retry_limit_reached(state, error):
                 raise
+            if _should_reconnect_meter(error):
+                self._recover_power_meter(error)
             return False
         return self._record_average_measurement_result(state, result, convergence)
 
@@ -186,6 +239,8 @@ class MeasureUtil:
         state.readings.append(result.power)
         state.voltages.extend(result.voltages)
         self._append_average_snapshot(state.start_time, state.readings, state.snapshots)
+        if self.on_accepted_reading is not None:
+            self.on_accepted_reading(result)
         return bool(convergence and self.average_has_converged(state.snapshots, convergence))
 
     @staticmethod
@@ -275,6 +330,99 @@ class MeasureUtil:
         self._emit_calibration_sample(power, resistance, voltage)
         return MeasurementResult(power=resistance, voltages=[voltage])
 
+    def wait_for_plateau(
+        self,
+        max_wait: float,
+        *,
+        tolerance_pct: float,
+        tolerance_w: float = 0.0,
+        window_seconds: float = 1.0,
+        poll_interval: float = 0.25,
+        min_power: float = 0.0,
+    ) -> float:
+        """Poll until the reading has stopped moving, or `max_wait` elapses.
+
+        Settled means: watched for at least `window_seconds`, at least
+        `SETTLE_MIN_SAMPLES` values in that trailing window, and those values
+        sit within `tolerance_pct` / `tolerance_w`. A read error is "not yet
+        stable" — the meter often has no fresh sample right after a light
+        change. Only the trailing window is checked for spread, so an early
+        climb does not have to re-settle from scratch once it holds.
+        """
+        # Purely a logging label (see CompositePowerMeter.log_context) so these throwaway
+        # polls read as "settling" in the log instead of looking identical to an accepted
+        # sample -- restored afterward since the same meter instance is reused for the
+        # samples that follow.
+        had_log_context = hasattr(self.power_meter, "log_context")
+        if had_log_context:
+            self.power_meter.log_context = "settling"  # type: ignore[attr-defined]
+        try:
+            start = time.time()
+            readings: list[tuple[float, float]] = []
+            # Keyed by witness name, populated only when `self.power_meter` is a
+            # `CompositePowerMeter` -- see the flatness check below for why these matter.
+            witness_readings: dict[str, list[tuple[float, float]]] = {}
+            while True:
+                try:
+                    power = self.power_meter.get_power().power
+                except PowerMeterError:
+                    # A witness disagreement raises here too, but `_record_witness_readings`
+                    # below still sees this poll's witness values -- recorded on the meter
+                    # before that check ran, so they're valid flatness evidence even when
+                    # the poll as a whole gets treated as "no primary reading yet".
+                    power = None
+                # Stamp after the read so a slow meter (Shelly RTT, OCR) does not
+                # push consecutive samples more than a window apart on paper.
+                now = time.time()
+                elapsed = now - start
+                if power is not None and power + 1e-9 >= min_power:
+                    readings.append((now, power))
+                self._record_witness_readings(witness_readings, now)
+                _trim_to_window(readings, now, window_seconds)
+                for track in witness_readings.values():
+                    _trim_to_window(track, now, window_seconds)
+                # A composite meter's primary alone plateauing isn't enough: the primary
+                # can sit on a stale or slow-to-update value while an independent witness
+                # is still visibly trending toward it, which looks identical to "settled"
+                # from the primary's own readings alone (confirmed against a real run's
+                # raw samples 2026-09-06). Requiring every witness's own track to be
+                # settled too catches that.
+                if _track_has_settled(
+                    readings, now, start, window_seconds, tolerance_pct, tolerance_w
+                ) and all(
+                    _track_has_settled(track, now, start, window_seconds, tolerance_pct, tolerance_w)
+                    for track in witness_readings.values()
+                ):
+                    return elapsed
+                if elapsed >= max_wait:
+                    return elapsed
+                self._wait(min(poll_interval, max(0.0, max_wait - elapsed)))
+        finally:
+            if had_log_context:
+                self.power_meter.log_context = "reading"  # type: ignore[attr-defined]
+
+    def _record_witness_readings(self, witness_readings: dict[str, list[tuple[float, float]]], now: float) -> None:
+        """Append this poll's corrected witness values, if `self.power_meter` is composite."""
+
+        last_reading = getattr(self.power_meter, "last_reading", None)
+        if last_reading is None:
+            return
+        for witness in last_reading.witnesses:
+            if witness.corrected is not None:
+                witness_readings.setdefault(witness.name, []).append((now, witness.corrected))
+
+    @staticmethod
+    def _is_flat(values: list[float], tolerance_pct: float, tolerance_w: float = 0.0) -> bool:
+        if len(values) < 2:
+            return False
+        spread = max(values) - min(values)
+        scale = max((abs(value) for value in values), default=0.0) or 1.0
+        # Same shape as witness agreement: relative band *or* an absolute floor. The
+        # floor is what lets a 0.1 W meter (Shelly) settle at low load, where one LSB
+        # is already several percent of the reading.
+        allowed = max(scale * tolerance_pct / 100.0, tolerance_w)
+        return spread <= allowed + 1e-9
+
     def take_measurement(
         self,
         start_timestamp: float | None = None,
@@ -284,16 +432,55 @@ class MeasureUtil:
 
         measurements: list[float] = []
         voltages: list[float] = []
+        accepted: list[MeasurementResult] = []
+        has_log_context = hasattr(self.power_meter, "log_context")
+        # Whether this measurement was already labeled "settled"/"settle cap hit" by
+        # LightRunner._settle() just before this call -- that label says *why* this
+        # reading is being accepted (it held flat vs. we gave up waiting) and is strictly
+        # more informative than a generic "accepted", so it's left alone rather than
+        # overwritten below. Callers with no settle step of their own (charging/fan/
+        # recorder/speaker runners, the light-load preflight probe) never set it, so
+        # their accepted samples fall back to the previous generic labeling unchanged.
+        settle_outcome_labeled = has_log_context and getattr(self.power_meter, "log_context", None) in {
+            "settled",
+            "settle cap hit",
+        }
         # Take multiple samples to reduce noise
         for i in range(1, self.config.sample_count + 1):
             _LOGGER.debug("Taking sample %d", i)
-            try:
-                result = self._read_power(start_timestamp=start_timestamp)
-            except PowerMeterError as error:
-                return self._retry_measurement_or_raise(error, start_timestamp, retry_count)
+            if has_log_context and not settle_outcome_labeled:
+                # Distinguishes an accepted sample from the "settling" polls that preceded
+                # it in the log -- both otherwise emit an identical-looking Meters line.
+                sample_count = self.config.sample_count
+                label = "accepted" if sample_count == 1 else f"accepted, sample {i}/{sample_count}"
+                self.power_meter.log_context = label  # type: ignore[attr-defined]
+            stale_waits = 0
+            while True:
+                try:
+                    result = self._read_power(start_timestamp=start_timestamp)
+                    break
+                except WaitingForMeterError as error:
+                    _LOGGER.info("%s", error)
+                    self._wait(0.25)
+                except OutdatedMeasurementError as error:
+                    # A silent camera or a reading from before this point can clear
+                    # itself. Do not burn the session's max_retries on that.
+                    stale_waits += 1
+                    if stale_waits == 1 or stale_waits % 20 == 0:
+                        _LOGGER.warning(
+                            "%s; waiting for a fresh reading (attempt %d)",
+                            error,
+                            stale_waits,
+                        )
+                    if _should_reconnect_meter(error):
+                        self._recover_power_meter(error)
+                    self._wait(max(0.25, self.config.sleep_time))
+                except PowerMeterError as error:
+                    return self._retry_measurement_or_raise(error, start_timestamp, retry_count)
             assert result is not None
             measurements.append(result.power)
             voltages.extend(result.voltages)
+            accepted.append(result)
 
             if self.config.sample_count > 1:
                 self._wait(self.config.sleep_time_sample)
@@ -303,7 +490,13 @@ class MeasureUtil:
             raise NoValidReadingsError("No valid readings were recorded")
 
         average = mean(measurements)
-        _LOGGER.info("Average measurement: %.3f W", average)
+        if self.config.sample_count > 1:
+            _LOGGER.info("Average measurement: %.3f W", average)
+        else:
+            _LOGGER.info("Measurement: %.3f W", average)
+        if self.on_accepted_reading is not None:
+            for result in accepted:
+                self.on_accepted_reading(result)
         return MeasurementResult(power=average, voltages=voltages)
 
     def _read_power(
@@ -318,8 +511,9 @@ class MeasureUtil:
         updated_at = dt.fromtimestamp(measurement.updated).strftime("%d-%m-%Y, %H:%M:%S")
         _LOGGER.debug("Measurement received (update_time=%s)", updated_at)
         if start_timestamp and measurement.updated < start_timestamp:
+            started_at = dt.fromtimestamp(start_timestamp).strftime("%d-%m-%Y, %H:%M:%S")
             raise OutdatedMeasurementError(
-                f"Power measurement is outdated. Aborting after {self.config.max_retries} successive retries",
+                f"Power reading is from before this point started (reading {updated_at}, point started {started_at})",
             )
 
         power = measurement.power
@@ -359,8 +553,20 @@ class MeasureUtil:
                 self.config.max_retries,
             )
             raise error
+        if _should_reconnect_meter(error):
+            self._recover_power_meter(error)
+        else:
+            _LOGGER.info("Retrying power reading without reconnecting the meter: %s", error)
         self._wait(self.config.sleep_time)
         return self.take_measurement(start_timestamp, retry_count + 1)
+
+    def _recover_power_meter(self, error: PowerMeterError) -> None:
+        """Reconnect a stuck meter/OCR source before the next retry, not the light."""
+        _LOGGER.warning("Recovering power meter after: %s", error)
+        try:
+            self.power_meter.recover()
+        except Exception:
+            _LOGGER.debug("Power meter recover failed", exc_info=True)
 
     @staticmethod
     def dummy_load_trend(averages: list[float]) -> Trend | None:

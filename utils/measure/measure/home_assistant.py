@@ -2,12 +2,15 @@ import asyncio
 from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass
+import json
 import logging
 from threading import Event, RLock, Thread
 import time
 from types import TracebackType
 from typing import Any, Protocol, Self, runtime_checkable
+import urllib.error
 import urllib.parse
+import urllib.request
 
 from homeassistant_api import AsyncWebsocketClient, Entity, EntityRegistryEntry, Group, State, WebsocketClient
 from homeassistant_api.errors import WebsocketError
@@ -29,6 +32,11 @@ _LOGGER = logging.getLogger("measure")
 # Pinging well inside that window keeps the socket alive across long measurements.
 KEEPALIVE_INTERVAL = 20.0
 KEEPALIVE_JOIN_TIMEOUT = 1.0
+# A Supervisor proxy read that never returns used to block the only socket — and
+# cleanup's turn_off — for as long as urllib3 was willing to wait. Bound that.
+CALL_TIMEOUT = 15.0
+REST_TIMEOUT = 10.0
+ISOLATED_LOCK_WAIT = 1.0
 
 
 @runtime_checkable
@@ -56,6 +64,32 @@ def normalize_hass_url(url: str) -> str:
     if not path.endswith("/websocket"):
         path += "/websocket"
     return urllib.parse.urlunparse(parsed._replace(scheme=scheme, path=path))
+
+
+def rest_api_url(websocket_url: str) -> str:
+    """Derive the Home Assistant REST API root from a WebSocket URL."""
+
+    parsed = urllib.parse.urlparse(normalize_hass_url(websocket_url))
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    path = parsed.path.rstrip("/").removesuffix("/websocket")
+    if not path.endswith("/api"):
+        path = f"{path}/api" if path else "/api"
+    return urllib.parse.urlunparse(parsed._replace(scheme=scheme, path=path))
+
+
+def explain_home_assistant_error(error: BaseException) -> str:
+    """Say whether a failure is the Supervisor proxy, Core, or something else."""
+
+    text = str(error)
+    lowered = text.casefold()
+    if "supervisor" in lowered and ("timed out" in lowered or "timeout" in lowered):
+        return (
+            f"{text} This is the Supervisor HTTP proxy in front of Home Assistant Core, "
+            "not the light refusing the command. The proxy did not return a WebSocket frame."
+        )
+    if "timed out" in lowered or "timeout" in lowered:
+        return f"{text} Home Assistant did not answer before the call was abandoned."
+    return text
 
 
 def _validate_subscription_response(response: dict[str, Any], subscription_id: object) -> None:
@@ -178,14 +212,21 @@ class HomeAssistantManager:
         client_factory: Callable[[str, str], HomeAssistantWebsocketClient] | None = None,
         discovery_client_factory: Callable[[str, str], HomeAssistantDiscoveryClient] | None = None,
         keepalive_interval: float = KEEPALIVE_INTERVAL,
+        call_timeout: float = CALL_TIMEOUT,
+        rest_timeout: float = REST_TIMEOUT,
+        urlopen: Callable[..., Any] | None = None,
     ) -> None:
         self.api_url = normalize_hass_url(api_url)
+        self.rest_url = rest_api_url(self.api_url)
         self.token = token
         self._client_factory = client_factory or HomeAssistantWebsocketClient
         self._discovery_client_factory = discovery_client_factory or HomeAssistantDiscoveryClient
         self._client: HomeAssistantWebsocketClient | None = None
         self._lock = RLock()
         self._keepalive_interval = keepalive_interval
+        self._call_timeout = call_timeout
+        self._rest_timeout = rest_timeout
+        self._urlopen = urlopen or urllib.request.urlopen
         self._keepalive_stop = Event()
         self._keepalive_thread: Thread | None = None
         self._last_activity = time.monotonic()
@@ -282,6 +323,41 @@ class HomeAssistantManager:
             with contextlib.suppress(Exception):
                 client.close()
 
+    def _call_with_timeout[T](
+        self,
+        client: HomeAssistantWebsocketClient,
+        operation: Callable[[HomeAssistantWebsocketClient], T],
+    ) -> T:
+        """Run a blocking WebSocket call, closing the socket if Supervisor never answers."""
+
+        if self._call_timeout <= 0:
+            return operation(client)
+        box: dict[str, Any] = {}
+        done = Event()
+
+        def work() -> None:
+            try:
+                box["result"] = operation(client)
+            except Exception as error:  # noqa: BLE001 - re-raised on the caller thread
+                box["error"] = error
+            finally:
+                done.set()
+
+        Thread(target=work, name="measure-hass-call", daemon=True).start()
+        if done.wait(self._call_timeout):
+            error = box.get("error")
+            if isinstance(error, BaseException):
+                raise error
+            return box["result"]
+        _LOGGER.warning(
+            "Home Assistant WebSocket call blocked for %.1fs; closing the socket",
+            self._call_timeout,
+        )
+        with contextlib.suppress(Exception):
+            client.close()
+        done.wait(1.0)
+        raise WebsocketError(f"Home Assistant WebSocket call timed out after {self._call_timeout:.1f}s")
+
     def _execute[T](
         self,
         operation: Callable[[HomeAssistantWebsocketClient], T],
@@ -291,20 +367,24 @@ class HomeAssistantManager:
         with self._lock:
             client = self._connected_client()
             try:
-                return self._record_activity(operation(client))
+                return self._record_activity(self._call_with_timeout(client, operation))
             except Exception as error:
                 if not self._is_connection_error(error):
                     raise
                 self._discard_client()
                 if not retry_on_disconnect:
-                    raise WebsocketError(f"Home Assistant WebSocket connection failed: {error}") from error
+                    raise WebsocketError(
+                        f"Home Assistant WebSocket connection failed: {explain_home_assistant_error(error)}"
+                    ) from error
 
             try:
-                return self._record_activity(operation(self._connected_client()))
+                return self._record_activity(self._call_with_timeout(self._connected_client(), operation))
             except Exception as error:
                 if self._is_connection_error(error):
                     self._discard_client()
-                    raise WebsocketError(f"Home Assistant WebSocket connection failed: {error}") from error
+                    raise WebsocketError(
+                        f"Home Assistant WebSocket connection failed: {explain_home_assistant_error(error)}"
+                    ) from error
                 raise
 
     def _record_activity[T](self, result: T) -> T:
@@ -329,6 +409,12 @@ class HomeAssistantManager:
         group_id: str | None = None,
         slug: str | None = None,
     ) -> State:
+        resolved = entity_id or (f"{group_id}.{slug}" if group_id and slug else None)
+        if resolved:
+            try:
+                return self._record_activity(self._rest_get_state(resolved))
+            except Exception as error:  # noqa: BLE001 - WebSocket dump is the fallback
+                _LOGGER.debug("REST state read failed for %s, falling back to WebSocket: %s", resolved, error)
         return self._execute(lambda client: client.get_state(entity_id=entity_id, group_id=group_id, slug=slug))
 
     def get_entity(
@@ -345,13 +431,19 @@ class HomeAssistantManager:
         service: str,
         *,
         retry_on_disconnect: bool = True,
+        isolated: bool = False,
         **service_data: Any,  # noqa: ANN401
     ) -> None:
         """Call a Home Assistant service, reconnecting once when the socket died while idle.
 
         Callers must disable retries for actions whose effect cannot safely be replayed.
+        ``isolated`` uses a separate REST request so cleanup is not stuck behind a
+        wedged WebSocket read on the shared Supervisor connection.
         """
 
+        if isolated:
+            self._isolated_service(domain, service, **service_data)
+            return
         self._execute(
             lambda client: client.trigger_service(domain, service, **service_data),
             retry_on_disconnect=retry_on_disconnect,
@@ -377,6 +469,58 @@ class HomeAssistantManager:
                 device_registry=client.get_device_registry(),
             ),
         )
+
+    def _rest_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+
+    def _rest_get_state(self, entity_id: str) -> State:
+        request = urllib.request.Request(  # noqa: S310 - rest_url is derived from the configured HA endpoint
+            f"{self.rest_url}/states/{entity_id}",
+            headers=self._rest_headers(),
+            method="GET",
+        )
+        try:
+            with self._urlopen(request, timeout=self._rest_timeout) as response:
+                payload = json.loads(response.read().decode())
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError) as error:
+            raise WebsocketError(f"Home Assistant REST state read failed for {entity_id}: {error}") from error
+        if not isinstance(payload, dict):
+            raise WebsocketError(f"Home Assistant REST state read for {entity_id} returned {type(payload).__name__}")
+        return State.from_json(payload)
+
+    def _rest_call_service(self, domain: str, service: str, **service_data: Any) -> None:  # noqa: ANN401
+        request = urllib.request.Request(  # noqa: S310 - rest_url is derived from the configured HA endpoint
+            f"{self.rest_url}/services/{domain}/{service}",
+            data=json.dumps(service_data).encode(),
+            headers=self._rest_headers(),
+            method="POST",
+        )
+        try:
+            with self._urlopen(request, timeout=self._rest_timeout) as response:
+                response.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise WebsocketError(
+                f"Home Assistant REST {domain}.{service} failed: {explain_home_assistant_error(error)}"
+            ) from error
+
+    def _isolated_service(self, domain: str, service: str, **service_data: Any) -> None:  # noqa: ANN401
+        """Call a service on a connection that is not the possibly-wedged WebSocket."""
+
+        acquired = self._lock.acquire(timeout=ISOLATED_LOCK_WAIT)
+        if acquired:
+            try:
+                self._discard_client()
+            finally:
+                self._lock.release()
+        elif self._client is not None:
+            _LOGGER.warning(
+                "Home Assistant WebSocket is busy; closing it so %s.%s can use a fresh connection",
+                domain,
+                service,
+            )
+            with contextlib.suppress(Exception):
+                self._client.close()
+        self._rest_call_service(domain, service, **service_data)
 
     async def discover_zeroconf(self, collection_window: float = 2.0) -> list[dict[str, object]]:
         """Collect the current Home Assistant Zeroconf discovery results."""

@@ -7,6 +7,7 @@ from measure.controller.light.spec import DummyLightControllerSpec
 from measure.execution import LightOperatingPoint
 from measure.ha_app.coordinator import (
     MeasurementCoordinator,
+    MergeEligibilityError,
     SessionConflictError,
     SessionExecutionContext,
     SessionMeasurementService,
@@ -23,6 +24,7 @@ from measure.request import (
     RecorderMeasurementRequest,
     RecorderProfileRecipe,
     RecorderPurpose,
+    ResumePolicy,
 )
 from measure.runner.average import AverageRunner
 from measure.runner.recorder import RecorderRunner
@@ -169,6 +171,114 @@ class CheckpointService(SessionMeasurementService):
         return RunnerResult(model_json_data={})
 
 
+class ReasonThenProgressService(SessionMeasurementService):
+    def run(
+        self,
+        request: MeasurementRequest,
+        control: SessionControl,
+        context: SessionExecutionContext,
+    ) -> RunnerResult:
+        del request, context
+        control.phase(
+            "Discovering envelope",
+            reason="Hardcoded 100% HS outline: hue ring, white, and primary saturations.",
+        )
+        control.progress(completed=1, total=10, mode="hs", estimated_remaining="9s")
+        control.phase("Full-brightness warm-up (1 of 2): sending command")
+        return RunnerResult(model_json_data={})
+
+
+class RepeatedWarningService(SessionMeasurementService):
+    def run(
+        self,
+        request: MeasurementRequest,
+        control: SessionControl,
+        context: SessionExecutionContext,
+    ) -> RunnerResult:
+        del request, context
+        control.log("Repeated warning", warning=True)
+        control.log("Repeated warning", warning=True)
+        control.log("Repeated warning", warning=True)
+        return RunnerResult(model_json_data={})
+
+
+class WarningThenProgressService(SessionMeasurementService):
+    def run(
+        self,
+        request: MeasurementRequest,
+        control: SessionControl,
+        context: SessionExecutionContext,
+    ) -> RunnerResult:
+        del request, context
+        control.log("Failed to change light state: boom. Retrying...", warning=True)
+        control.progress(completed=1, total=2, mode="color_temp", estimated_remaining="10s")
+        return RunnerResult(model_json_data={})
+
+
+def test_progress_and_later_phases_keep_activity_reason(tmp_path: Path) -> None:
+    coordinator = MeasurementCoordinator(SessionStorage(tmp_path), ReasonThenProgressService)
+
+    coordinator.start(light_request())
+    wait_for_state(coordinator, SessionState.COMPLETED)
+
+    assert coordinator.current is not None
+    assert coordinator.current.activity_reason == (
+        "Hardcoded 100% HS outline: hue ring, white, and primary saturations."
+    )
+
+
+def test_coordinator_deduplicates_repeated_warnings(tmp_path: Path) -> None:
+    coordinator = MeasurementCoordinator(SessionStorage(tmp_path), RepeatedWarningService)
+
+    session = coordinator.start(light_request())
+    wait_for_state(coordinator, SessionState.COMPLETED)
+
+    assert coordinator.current is not None
+    assert coordinator.current.warnings == ("Repeated warning",)
+    warning_events = [
+        event for event in coordinator.events_since(0, session.id) if event.type == SessionEventType.WARNING
+    ]
+    assert [event.data["message"] for event in warning_events] == [
+        "Repeated warning",
+        "Repeated warning",
+        "Repeated warning",
+    ]
+
+
+def test_coordinator_collapses_persisted_warning_duplicates_when_resuming(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    snapshot = SessionSnapshot(
+        id="resumable-session",
+        state=SessionState.CANCELLED,
+        created_at="2026-07-12T12:00:00Z",
+        updated_at="2026-07-12T12:05:00Z",
+        warnings=("Repeated warning", "Repeated warning", "Repeated warning"),
+    )
+    storage.create(snapshot, light_request())
+    output = storage.artifact_directory(snapshot.id, "LCT010")
+    output.mkdir()
+    (output / "brightness.csv").write_text("bri,watt\n1,1.0\n", encoding="utf-8")
+    coordinator = MeasurementCoordinator(storage, RepeatedWarningService)
+
+    coordinator.resume(snapshot.id)
+    wait_for_state(coordinator, SessionState.COMPLETED)
+
+    assert coordinator.get(snapshot.id).warnings == ("Repeated warning",)
+
+
+def test_a_warning_banner_clears_once_the_run_continues(tmp_path: Path) -> None:
+    """A recovered-from warning must not stay up as a persistent banner. Progress
+    after the warning is the signal that the run continued without needing input.
+    """
+    coordinator = MeasurementCoordinator(SessionStorage(tmp_path), WarningThenProgressService)
+
+    coordinator.start(light_request())
+    wait_for_state(coordinator, SessionState.COMPLETED)
+
+    assert coordinator.current is not None
+    assert coordinator.current.warnings == ()
+
+
 def test_coordinator_completes_and_persists_files(tmp_path: Path) -> None:
     coordinator = MeasurementCoordinator(SessionStorage(tmp_path), CompletingService)
 
@@ -177,6 +287,7 @@ def test_coordinator_completes_and_persists_files(tmp_path: Path) -> None:
 
     assert coordinator.current is not None
     assert coordinator.current.progress == 100
+    assert coordinator.current.run_started_at is not None
     assert coordinator.current.files == ("LCT010/brightness.csv",)
     assert [(event.sequence, event.data["state"]) for event in coordinator.events_since(1, session.id)] == [
         (2, SessionState.COMPLETED),
@@ -219,6 +330,31 @@ def test_coordinator_notifies_session_state_listeners(tmp_path: Path) -> None:
     coordinator.delete(session.id)
 
     assert notifications == [SessionState.RUNNING, SessionState.CANCELLING, SessionState.CANCELLED]
+
+
+def test_request_shutdown_stop_cooperatively_cancels_and_waits_for_the_worker(tmp_path: Path) -> None:
+    """The app's own shutdown hook calls this before the process actually exits, so a
+    container stop (add-on update, Supervisor cold backup, ...) lands the worker on the
+    CANCELLED checkpoint -- always resumable -- rather than abandoning it mid-write.
+    """
+    started = Event()
+    coordinator = MeasurementCoordinator(SessionStorage(tmp_path), lambda: BlockingService(started))
+    session = coordinator.start(light_request())
+    assert started.wait(1)
+
+    coordinator.request_shutdown_stop(timeout=2.0)
+
+    assert coordinator.current is not None
+    assert coordinator.current.state == SessionState.CANCELLED
+    coordinator.delete(session.id)
+
+
+def test_request_shutdown_stop_is_a_no_op_without_an_active_session(tmp_path: Path) -> None:
+    coordinator = MeasurementCoordinator(SessionStorage(tmp_path), lambda: CompletingService())
+
+    coordinator.request_shutdown_stop(timeout=2.0)  # Must not raise with nothing running.
+
+    assert coordinator.current is None
 
 
 def test_stopping_recorder_marks_session_completed(tmp_path: Path) -> None:
@@ -313,6 +449,18 @@ def test_coordinator_rejects_concurrent_start_and_cancels(tmp_path: Path) -> Non
     assert coordinator.cancel(session.id).state == SessionState.CANCELLED
 
 
+def test_session_phase_includes_a_wait_deadline() -> None:
+    events: list = []
+    control = SessionControl()
+    control.subscribe(events.append)
+
+    control.phase("Stabilizing light before the first reading", wait_seconds=10)
+
+    assert events[-1].data["message"] == "Stabilizing light before the first reading"
+    assert events[-1].data["wait_seconds"] == 10
+    assert events[-1].data["wait_ends_at"]
+
+
 def test_coordinator_serializes_recording_analysis_with_other_session_actions(tmp_path: Path) -> None:
     storage = SessionStorage(tmp_path)
     request = RecorderMeasurementRequest(
@@ -374,8 +522,7 @@ def test_coordinator_rejects_analysis_for_unknown_session(tmp_path: Path) -> Non
     with pytest.raises(SessionConflictError, match="requested session does not exist"):
         coordinator.analyse("missing-session")
 
-
-def test_coordinator_rejects_resume_without_compatible_output(tmp_path: Path) -> None:
+def test_coordinator_relaunches_a_failed_session_without_output(tmp_path: Path) -> None:
     storage = SessionStorage(tmp_path)
     current = SessionSnapshot(
         id="failed",
@@ -384,10 +531,79 @@ def test_coordinator_rejects_resume_without_compatible_output(tmp_path: Path) ->
         updated_at="2026-07-12T12:00:00Z",
     )
     storage.create(current, light_request())
-    coordinator = MeasurementCoordinator(storage, CompletingService)
+    started = Event()
+    coordinator = MeasurementCoordinator(storage, lambda: BlockingService(started))
 
-    with pytest.raises(SessionConflictError, match="no compatible complete row"):
-        coordinator.resume(current.id)
+    resumed = coordinator.resume(current.id)
+
+    assert started.wait(1)
+    assert resumed.id == current.id
+    assert resumed.state == SessionState.RUNNING
+
+
+def test_coordinator_resume_clears_prior_error_and_warnings(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    current = SessionSnapshot(
+        id="failed",
+        state=SessionState.FAILED,
+        created_at="2026-07-12T12:00:00Z",
+        updated_at="2026-07-12T12:00:00Z",
+        error="The meter went silent",
+        warnings=("Discarding measurement: 0 watt was read from the power meter",),
+    )
+    storage.create(current, light_request())
+    started = Event()
+    coordinator = MeasurementCoordinator(storage, lambda: BlockingService(started))
+
+    resumed = coordinator.resume(current.id)
+
+    assert started.wait(1)
+    assert resumed.error is None
+    assert resumed.warnings == ()
+
+
+class CapturingService(SessionMeasurementService):
+    def __init__(self, started: Event) -> None:
+        self.started = started
+        self.request: MeasurementRequest | None = None
+
+    def run(
+        self,
+        request: MeasurementRequest,
+        control: SessionControl,
+        context: SessionExecutionContext,
+    ) -> RunnerResult:
+        self.request = request
+        self.started.set()
+        control.wait(60)
+        raise AssertionError("Cancelled wait returned")
+
+
+def test_coordinator_resume_keeps_extend_policy(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    current = SessionSnapshot(
+        id="refine",
+        state=SessionState.FAILED,
+        created_at="2026-07-12T12:00:00Z",
+        updated_at="2026-07-12T12:00:00Z",
+        error="The existing measurement CSV does not match the configured measurement grid",
+    )
+    storage.create(
+        current,
+        light_request().model_copy(
+            update={"resume_policy": ResumePolicy.EXTEND, "seed_session_id": "seed-session"},
+        ),
+    )
+    started = Event()
+    service = CapturingService(started)
+    coordinator = MeasurementCoordinator(storage, lambda: service)
+
+    coordinator.resume(current.id)
+
+    assert started.wait(1)
+    assert service.request is not None
+    assert service.request.resume_policy == ResumePolicy.EXTEND
+    assert service.request.seed_session_id == "seed-session"
 
 
 def test_starting_a_session_retains_the_previous_one(tmp_path: Path) -> None:
@@ -535,3 +751,123 @@ def test_coordinator_projects_phase_and_confirmation_message(tmp_path: Path) -> 
     assert confirmed.confirmation_action is None
     assert continued.wait(1)
     wait_for_state(coordinator, SessionState.COMPLETED)
+
+
+def _completed_light_session(
+    storage: SessionStorage,
+    session_id: str,
+    *,
+    updated_at: str,
+    rows: str = "bri,watt\n1,1.0\n",
+    model_json: bool = True,
+) -> None:
+    snapshot = SessionSnapshot(
+        id=session_id,
+        state=SessionState.COMPLETED,
+        created_at="2026-09-01T12:00:00Z",
+        updated_at=updated_at,
+    )
+    storage.create(snapshot, light_request(), set_current=False)
+    output = storage.artifact_directory(session_id, "LCT010")
+    output.mkdir()
+    (output / "brightness.csv").write_text(rows, encoding="utf-8")
+    if model_json:
+        (output / "model.json").write_text(
+            '{"name":"Test light","standby_power":0.2,"measure_settings":{"VERSION":"test"}}',
+            encoding="utf-8",
+        )
+
+
+def test_merge_creates_a_completed_session_without_taking_current(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    _completed_light_session(storage, "left-session", updated_at="2026-09-01T12:00:00Z")
+    _completed_light_session(
+        storage,
+        "right-session",
+        updated_at="2026-09-02T12:00:00Z",
+        rows="bri,watt\n1,9.0\n2,2.0\n",
+    )
+    running = MeasurementCoordinator(storage, CompletingService)
+    live = running.start(light_request())
+    wait_for_state(running, SessionState.COMPLETED)
+
+    merged = running.merge("left-session", "right-session")
+
+    assert merged.state == SessionState.COMPLETED
+    assert merged.id not in {live.id, "left-session", "right-session"}
+    assert running.current is not None
+    assert running.current.id == live.id
+    assert "id" in (tmp_path / "current.json").read_text(encoding="utf-8")
+    assert live.id in (tmp_path / "current.json").read_text(encoding="utf-8")
+    request = storage.load_request(merged.id)
+    assert request.derived_from == ("left-session", "right-session")
+    csv_text = (storage.artifact_directory(merged.id, "LCT010") / "brightness.csv").read_text(encoding="utf-8")
+    assert "2,2.0" in csv_text
+    model = (storage.artifact_directory(merged.id, "LCT010") / "model.json").read_text(encoding="utf-8")
+    assert "MERGED_FROM" in model
+
+
+def test_merge_preview_reports_added_and_kept(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    _completed_light_session(storage, "left-session", updated_at="2026-09-01T12:00:00Z")
+    _completed_light_session(
+        storage,
+        "right-session",
+        updated_at="2026-09-01T12:00:00Z",
+        rows="bri,watt\n1,1.0\n2,2.0\n",
+    )
+    coordinator = MeasurementCoordinator(storage, CompletingService)
+
+    preview = coordinator.preview_merge("left-session", "right-session")
+
+    assert preview["model_id_warning"] is False
+    assert preview["modes"]["brightness"]["kept"] == 1
+    assert preview["modes"]["brightness"]["added"] == 1
+
+
+def test_merge_rejects_a_session_without_lut_rows(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    _completed_light_session(storage, "left-session", updated_at="2026-09-01T12:00:00Z")
+    empty = SessionSnapshot(
+        id="empty-session",
+        state=SessionState.COMPLETED,
+        created_at="2026-09-01T12:00:00Z",
+        updated_at="2026-09-01T12:00:00Z",
+    )
+    storage.create(empty, light_request(), set_current=False)
+    coordinator = MeasurementCoordinator(storage, CompletingService)
+
+    with pytest.raises(MergeEligibilityError, match="complete LUT row"):
+        coordinator.merge("left-session", "empty-session")
+
+
+class ExistingDirService(SessionMeasurementService):
+    def run(
+        self,
+        request: MeasurementRequest,
+        control: SessionControl,
+        context: SessionExecutionContext,
+    ) -> RunnerResult:
+        context.artifact_directory.mkdir(parents=True, exist_ok=True)
+        (context.artifact_directory / "brightness.csv").write_text("bri,watt\n1,1.0\n2,2.0\n", encoding="utf-8")
+        control.progress(completed=1, total=1, mode="brightness", estimated_remaining="0s")
+        return RunnerResult(model_json_data={"device_type": "light"})
+
+
+def test_extend_start_copies_seed_artifacts_and_marks_current(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    _completed_light_session(storage, "seed-session", updated_at="2026-09-01T12:00:00Z")
+    coordinator = MeasurementCoordinator(storage, ExistingDirService)
+
+    session = coordinator.start(
+        light_request().model_copy(
+            update={"resume_policy": ResumePolicy.EXTEND, "seed_session_id": "seed-session"},
+        ),
+    )
+    wait_for_state(coordinator, SessionState.COMPLETED)
+
+    assert coordinator.current is not None
+    assert coordinator.current.id == session.id
+    assert session.id in (tmp_path / "current.json").read_text(encoding="utf-8")
+    copied = storage.artifact_directory(session.id, "LCT010") / "brightness.csv"
+    assert copied.is_file()

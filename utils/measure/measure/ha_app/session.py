@@ -4,7 +4,7 @@ from enum import StrEnum
 from threading import Event, Lock
 from typing import Any, TypedDict, cast
 
-from measure.clock import utc_now
+from measure.clock import elapsed_seconds, predicted_remaining_seconds, utc_after, utc_now
 from measure.execution import MeasurementCancelledError, OperatingPoint
 
 
@@ -35,6 +35,19 @@ ACTIVE_SESSION_STATES = frozenset(
         SessionState.AWAITING_CONFIRMATION,
         SessionState.RUNNING,
         SessionState.CANCELLING,
+    },
+)
+
+# The subset of ACTIVE_SESSION_STATES with no measurement CSV rows written yet -- before
+# the light/controller loop has started taking any readings at all, so there is nothing a
+# plot could show. RUNNING and CANCELLING are deliberately excluded: both can already have
+# real (if partial) data on disk.
+PRE_DATA_SESSION_STATES = frozenset(
+    {
+        SessionState.IDLE,
+        SessionState.VALIDATING,
+        SessionState.READY,
+        SessionState.AWAITING_CONFIRMATION,
     },
 )
 
@@ -84,11 +97,16 @@ class SessionSnapshot:
     completed: int = 0
     total: int = 0
     skipped: int = 0
+    already_measured: int = 0
     phase: str | None = None
+    activity_reason: str | None = None
     confirmation_message: str | None = None
     confirmation_action: str | None = None
     mode: str | None = None
     estimated_remaining: str | None = None
+    run_started_at: str | None = None
+    wait_ends_at: str | None = None
+    wait_seconds: float | None = None
     error: str | None = None
     files: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
@@ -108,6 +126,42 @@ class SessionSnapshot:
         data = asdict(self)
         data["progress"] = self.progress
         return data
+
+
+# Confirmation pauses the worker but not the clock: the operator is still in the
+# measurement, just waiting on a prompt. Terminal states freeze elapsed at updated_at
+# so a completed session does not keep ageing.
+_LIVE_TIMING_STATES = frozenset(
+    {
+        SessionState.RUNNING,
+        SessionState.CANCELLING,
+        SessionState.AWAITING_CONFIRMATION,
+    },
+)
+
+
+def snapshot_progress_timing(snapshot: SessionSnapshot) -> tuple[int | None, int | None]:
+    """Elapsed and remaining seconds for the running-view clock.
+
+    Remaining is ``elapsed * (points left / points taken this run)``. Seed rows from
+    resume do not count toward the rate. No configured settle times or per-mode extras
+    enter this — only wall time since the first progress report and the completed /
+    total / already_measured counts from that same report.
+    """
+    ended_at = None if snapshot.state in _LIVE_TIMING_STATES else snapshot.updated_at
+    elapsed = elapsed_seconds(snapshot.run_started_at, ended_at=ended_at)
+    if elapsed is None:
+        return None, None
+    if snapshot.state == SessionState.COMPLETED:
+        remaining: float | None = 0.0
+    else:
+        remaining = predicted_remaining_seconds(
+            elapsed,
+            snapshot.completed,
+            snapshot.total,
+            snapshot.already_measured,
+        )
+    return round(elapsed), None if remaining is None else round(remaining)
 
 
 @dataclass
@@ -178,20 +232,42 @@ class SessionControl:
             listener(event)
         return event
 
-    def progress(self, *, completed: int, total: int, mode: str, estimated_remaining: str, skipped: int = 0) -> None:
+    def progress(
+        self,
+        *,
+        completed: int,
+        total: int,
+        mode: str,
+        estimated_remaining: str,
+        skipped: int = 0,
+        already_measured: int = 0,
+    ) -> None:
         self.emit(
             SessionEventType.PROGRESS,
             {
                 "completed": completed,
                 "total": total,
                 "skipped": skipped,
+                "already_measured": already_measured,
                 "mode": mode,
                 "estimated_remaining": estimated_remaining,
             },
         )
 
-    def phase(self, message: str) -> None:
-        self.emit(SessionEventType.PHASE, {"message": message})
+    def phase(
+        self,
+        message: str,
+        *,
+        wait_seconds: float | None = None,
+        reason: str | None = None,
+    ) -> None:
+        data: dict[str, Any] = {"message": message}
+        if wait_seconds is not None and wait_seconds > 0:
+            data["wait_seconds"] = wait_seconds
+            data["wait_ends_at"] = utc_after(wait_seconds)
+        if reason is not None:
+            data["reason"] = reason
+        self.emit(SessionEventType.PHASE, data)
 
     def log(self, message: str, *, warning: bool = False) -> None:
         self.emit(SessionEventType.WARNING if warning else SessionEventType.LOG, {"message": message})

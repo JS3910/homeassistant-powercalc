@@ -18,6 +18,8 @@ def render_plot(plot: PlotSpec, output: Path | None = None) -> None:
     axes.set_title(plot.title)
     axes.set_xlabel(plot.x_label)
     axes.set_ylabel(plot.y_label)
+    if plot.x_min is not None and plot.x_max is not None:
+        axes.set_xlim(plot.x_min, plot.x_max)
     axes.grid(True, alpha=0.25)
     if any(series.label for series in plot.series):
         axes.legend(loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0)
@@ -179,7 +181,10 @@ def _draw_series(axes: Any, kind: PlotKind, series: PlotSeries) -> None:  # noqa
     """Draw one series as a connected line or as individually coloured points."""
 
     x_values = [point.x for point in series.points]
-    y_values = [point.y for point in series.points]
+    y_values = [
+        (point.z if point.z is not None else point.y) if kind is PlotKind.CYLINDER else point.y
+        for point in series.points
+    ]
     color = series.color or _DEFAULT_COLOR
     if kind is PlotKind.LINE:
         axes.plot(x_values, y_values, color=color, marker="o", linestyle="-", label=series.label)

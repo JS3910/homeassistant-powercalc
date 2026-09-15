@@ -3,14 +3,28 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from itertools import pairwise
+import logging
 import math
 from threading import RLock
 import time
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from measure.powermeter.errors import PowerMeterError
 from measure.powermeter.powermeter import PowerMeter, PowerMeterDiagnosticSample
-from measure.powermeter.spec import DummyPowerMeterSpec, HassPowerMeterSpec, PowerMeterSpec
+from measure.powermeter.spec import CompositePowerMeterSpec, DummyPowerMeterSpec, HassPowerMeterSpec, PowerMeterSpec
+
+# How long to tolerate a freshly built meter not having a reading yet before treating that
+# as a real failure. Most meters (Shelly, Kasa, ...) answer their very first poll
+# synchronously, so this warm-up is a no-op for them. OCR is the exception: `build_power_meter`
+# only starts its background capture thread, which still has to connect to the camera and
+# decode a first frame before `diagnostic_sample()` has anything to report -- with no
+# warm-up, that first sample below raced the capture thread and failed every single time,
+# confirmed 2026-09-07 as the "OCR: no frame processed yet" preflight failure.
+_WARMUP_SECONDS = 5.0
+_WARMUP_POLL_INTERVAL = 0.5
+
+_LOGGER = logging.getLogger("measure")
 
 
 class DiagnosticStatus(StrEnum):
@@ -95,6 +109,18 @@ class PowerMeterDiagnostics:
                 self._cache[cache_key] = (self._monotonic(), result)
             return result
 
+    def _first_sample(self, meter: PowerMeter, started: float) -> PowerMeterDiagnosticSample:
+        """`meter.diagnostic_sample()`, tolerating the warm-up gap a background capture
+        pipeline (OCR) needs before its first reading exists. See `_WARMUP_SECONDS`."""
+        deadline = started + _WARMUP_SECONDS
+        while True:
+            try:
+                return meter.diagnostic_sample()
+            except PowerMeterError:
+                if self._monotonic() >= deadline:
+                    raise
+                self._wait(min(_WARMUP_POLL_INTERVAL, max(0.0, deadline - self._monotonic())))
+
     def _evaluate_uncached(
         self,
         spec: PowerMeterSpec,
@@ -103,11 +129,15 @@ class PowerMeterDiagnostics:
         started = self._monotonic()
         samples: list[_ObservedSample] = []
         supports_voltage: bool | None = None
+        meter: PowerMeter | None = None
         try:
             meter = build_power_meter(spec)
             supports_voltage = meter.has_voltage_support()
-            samples.append(_ObservedSample(meter.diagnostic_sample(), self._monotonic() - started))
-            if not isinstance(spec, HassPowerMeterSpec):
+            samples.append(_ObservedSample(self._first_sample(meter, started), self._monotonic() - started))
+            # A composite's own reporting cadence follows its primary meter's: the polled
+            # meters it wraps have no HA update interval to fall behind on either way.
+            cadence_spec = spec.primary if isinstance(spec, CompositePowerMeterSpec) else spec
+            if not isinstance(cadence_spec, HassPowerMeterSpec):
                 return _summarize_direct(
                     samples[0],
                     supports_voltage=supports_voltage,
@@ -124,6 +154,20 @@ class PowerMeterDiagnostics:
             )
         except Exception as error:  # noqa: BLE001 - diagnostics must surface adapter and parsing failures
             message = str(error) or "Could not read from the power meter"
+            if _ocr_camera_is_live(message):
+                # Frames are arriving; the display just isn't accepted yet. That is an
+                # aiming/read-quality problem, not a dead camera -- warn and let the run
+                # start so OCR can keep retrying instead of aborting after the warm-up.
+                return PowerMeterDiagnostic(
+                    success=True,
+                    supports_voltage=supports_voltage,
+                    status=DiagnosticStatus.WARNING,
+                    precision_status=DiagnosticStatus.UNSUPPORTED,
+                    update_interval_status=DiagnosticStatus.UNSUPPORTED,
+                    duration_seconds=round(self._monotonic() - started, 1),
+                    messages=[message],
+                    message=message,
+                )
             return PowerMeterDiagnostic(
                 success=False,
                 supports_voltage=supports_voltage,
@@ -134,6 +178,17 @@ class PowerMeterDiagnostics:
                 messages=[message],
                 message=message,
             )
+        finally:
+            # Diagnostics is a throwaway probe. Close what *this* call built so a
+            # following construct (the light-load check in the same request, or a real
+            # run) does not inherit a leaked preview port. If the meter was borrowed
+            # from the setup-page aiming preview, close() is a no-op and that preview
+            # keeps the port.
+            if meter is not None:
+                try:
+                    meter.close()
+                except Exception as error:  # noqa: BLE001 - cleanup must not mask the diagnostic result
+                    _LOGGER.warning("Could not close the power meter after diagnostics: %s", error)
 
 
 @dataclass(frozen=True)
@@ -236,6 +291,11 @@ def _diagnostic_messages(
         else:
             messages.append(f"Power meter took up to {max_interval:.1f} s to update; 5 s or faster is required.")
     return messages
+
+
+def _ocr_camera_is_live(message: str) -> bool:
+    """True when OCR reached the display but has not accepted a reading yet."""
+    return message.startswith("OCR:") and "last frame:" in message
 
 
 def _decimal_places(raw_value: str) -> int:

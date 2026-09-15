@@ -20,7 +20,9 @@ from measure.request import (
     RecorderMeasurementRequest,
     RecorderProfileRecipe,
     RecorderPurpose,
+    ResumePolicy,
 )
+from measure.tuning import MeasurementParameters
 import pytest
 
 
@@ -53,6 +55,47 @@ def test_storage_round_trips_current_session(tmp_path: Path) -> None:
     persisted_state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
     assert persisted_request["measure_type"] == "light"
     assert persisted_state["state"] == loaded.state
+
+
+def test_storage_round_trips_run_started_at(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    storage.create(
+        SessionSnapshot(
+            id="a1b2-c3d4",
+            state=SessionState.RUNNING,
+            created_at="2026-09-07T20:00:00Z",
+            updated_at="2026-09-07T20:01:00Z",
+            completed=3,
+            total=10,
+            run_started_at="2026-09-07T20:00:10Z",
+        ),
+        light_request(),
+    )
+
+    loaded = storage.load_snapshot("a1b2-c3d4")
+
+    assert loaded.run_started_at == "2026-09-07T20:00:10Z"
+    assert loaded.completed == 3
+    assert loaded.total == 10
+
+
+def test_storage_round_trips_activity_reason(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    storage.create(
+        SessionSnapshot(
+            id="a1b2-c3d4",
+            state=SessionState.RUNNING,
+            created_at="2026-09-07T20:00:00Z",
+            updated_at="2026-09-07T20:01:00Z",
+            phase="Discovering envelope",
+            activity_reason="Hardcoded 100% HS outline.",
+        ),
+        light_request(),
+    )
+
+    loaded = storage.load_snapshot("a1b2-c3d4")
+
+    assert loaded.activity_reason == "Hardcoded 100% HS outline."
 
 
 def test_unknown_model_uses_a_session_scoped_artifact_directory(tmp_path: Path) -> None:
@@ -171,7 +214,7 @@ def test_every_orphaned_nonterminal_session_is_recovered(tmp_path: Path, state: 
 
     assert loaded is not None
     assert loaded.state == SessionState.FAILED
-    assert "App stopped" in str(loaded.error)
+    assert "app restarted" in str(loaded.error).lower()
 
 
 @pytest.mark.parametrize(
@@ -253,6 +296,78 @@ def test_effect_output_off_the_measurement_grid_is_not_resumable(tmp_path: Path)
 
     assert loaded is not None
     assert loaded.state == SessionState.FAILED
+
+
+def test_smart_invented_color_temp_row_is_resumable(tmp_path: Path) -> None:
+    """A rail point is not on the initial 100% sweep; resume still replays from it."""
+
+    storage = SessionStorage(tmp_path)
+    request = light_request().model_copy(
+        update={
+            "modes": {LutMode.COLOR_TEMP},
+            "parameters": MeasurementParameters(smart_sampling=True),
+        },
+    )
+    storage.create(snapshot(SessionState.RUNNING), request)
+    output = storage.artifact_directory("a1b2-c3d4", "LCT010")
+    output.mkdir()
+    (output / "color_temp.csv").write_text("bri,mired,watt\n164,555,2.86\n", encoding="utf-8")
+
+    loaded = SessionStorage(tmp_path).load_current()
+
+    assert loaded is not None
+    assert loaded.state == SessionState.RESUMABLE
+
+
+def test_color_temp_output_beyond_the_generic_mired_placeholder_is_still_resumable(tmp_path: Path) -> None:
+    """A real light's mired range is unknown offline, so a generic placeholder range is used
+    to rebuild its plan (see `_variation_matches_request`). A warm-white bulb reaching down to
+    1808K (553 mired) legitimately exceeds that placeholder's 500-mired ceiling; the fix removed
+    the bound on `ct` entirely rather than tightening it, since the placeholder is not a real
+    device range and any fixed bound risks rejecting some real light's legitimate value the
+    same way. Only `bri` (validated against the plan) needs to hold.
+    """
+    storage = SessionStorage(tmp_path)
+    request = light_request().model_copy(update={"modes": {LutMode.COLOR_TEMP}})
+    storage.create(snapshot(SessionState.RUNNING), request)
+    output = storage.artifact_directory("a1b2-c3d4", "LCT010")
+    output.mkdir()
+    (output / "color_temp.csv").write_text("bri,mired,watt\n1,553,0.30\n", encoding="utf-8")
+
+    loaded = SessionStorage(tmp_path).load_current()
+
+    assert loaded is not None
+    assert loaded.state == SessionState.RESUMABLE
+
+
+def test_interrupted_extend_session_is_resumable_with_off_grid_seed_row(tmp_path: Path) -> None:
+    """A refine copies the seed LUT; the last seed row is usually not on the new grid."""
+
+    storage = SessionStorage(tmp_path)
+    request = light_request().model_copy(
+        update={
+            "modes": {LutMode.COLOR_TEMP},
+            "resume_policy": ResumePolicy.EXTEND,
+            "seed_session_id": "seed-session",
+            "parameters": MeasurementParameters(
+                min_kelvin=1801,
+                max_kelvin=2100,
+                ct_mired_divisions=2,
+                ct_bri_all=True,
+                max_brightness=199,
+            ),
+        },
+    )
+    storage.create(snapshot(SessionState.RUNNING), request)
+    output = storage.artifact_directory("a1b2-c3d4", "LCT010")
+    output.mkdir()
+    (output / "color_temp.csv").write_text("bri,mired,watt\n98,465,0.52\n", encoding="utf-8")
+
+    loaded = SessionStorage(tmp_path).load_current()
+
+    assert loaded is not None
+    assert loaded.state == SessionState.RESUMABLE
+    assert SessionStorage(tmp_path).can_resume(loaded.id)
 
 
 def test_settings_recover_from_corrupt_file(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -341,3 +456,94 @@ def test_storage_ignores_invalid_dummy_load_calibration(tmp_path: Path, caplog: 
 
     assert calibration is None
     assert "invalid dummy-load calibration" in caplog.text
+
+
+def test_create_can_skip_marking_the_session_current(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    storage.create(snapshot(SessionState.COMPLETED), light_request(), set_current=False)
+
+    assert storage.load_current() is None
+    assert storage.load_snapshot("a1b2-c3d4").state == SessionState.COMPLETED
+
+
+def test_has_complete_lut_row_accepts_an_off_grid_row(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    storage.create(snapshot(SessionState.COMPLETED), light_request(), set_current=False)
+    output = storage.artifact_directory("a1b2-c3d4", "LCT010")
+    output.mkdir()
+    (output / "brightness.csv").write_text("bri,watt\n999,1.0\n", encoding="utf-8")
+
+    assert storage.has_complete_lut_row("a1b2-c3d4") is True
+    assert storage.has_lut_csv("a1b2-c3d4") is True
+    assert storage.can_resume("a1b2-c3d4") is False
+
+
+def test_has_lut_csv_is_false_without_a_measurement_file(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    storage.create(snapshot(SessionState.COMPLETED), light_request(), set_current=False)
+    assert storage.has_lut_csv("a1b2-c3d4") is False
+
+
+def test_session_listing_stats_count_output_files_and_all_bytes(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    storage.create(snapshot(SessionState.COMPLETED), light_request(), set_current=False)
+    output = storage.artifact_directory("a1b2-c3d4", "LCT010")
+    output.mkdir(parents=True)
+    (output / "hs.csv").write_text("bri,hue,sat,watt\n255,1,255,1.0\n", encoding="utf-8")
+    (storage.session_directory("a1b2-c3d4") / "events.jsonl").write_text("{}\n", encoding="utf-8")
+
+    file_count, size = storage.session_listing_stats("a1b2-c3d4")
+    assert file_count == 1
+    assert size == storage.session_size("a1b2-c3d4")
+    assert size > 0
+
+
+def test_list_sessions_loads_legacy_native_increment_fields(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    storage = SessionStorage(tmp_path)
+    storage.create(snapshot(SessionState.COMPLETED), light_request(), set_current=False)
+    path = storage.session_directory("a1b2-c3d4") / "request.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["parameters"] = {
+        **payload.get("parameters", {}),
+        "ct_mired_steps": 10,
+        "hs_hue_steps": 2731,
+        "hs_sat_steps": 32,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="measure"):
+        sessions = SessionStorage(tmp_path).list_sessions()
+
+    assert [item.id for item in sessions] == ["a1b2-c3d4"]
+    assert "incompatible measurement session" not in caplog.text
+
+
+def test_copy_lut_artifacts_copies_csv_and_raw_into_a_new_model_directory(tmp_path: Path) -> None:
+    storage = SessionStorage(tmp_path)
+    seed = snapshot(SessionState.COMPLETED)
+    dest = SessionSnapshot(
+        id="dest-session",
+        state=SessionState.READY,
+        created_at=seed.created_at,
+        updated_at=seed.updated_at,
+    )
+    storage.create(seed, light_request(), set_current=False)
+    storage.create(dest, light_request().model_copy(update={"model_id": "OTHER"}), set_current=False)
+    source = storage.artifact_directory(seed.id, "LCT010")
+    source.mkdir()
+    (source / "brightness.csv").write_text("bri,watt\n1,1.0\n", encoding="utf-8")
+    (source / "brightness.raw.jsonl").write_text("{}\n", encoding="utf-8")
+    (source / "on_off_bounds.json").write_text(
+        '{"standby_w_per_lamp": 0.05, "minimum_on_w_per_lamp": 0.26}\n',
+        encoding="utf-8",
+    )
+
+    storage.copy_lut_artifacts(seed.id, dest.id, "OTHER")
+
+    copied = storage.artifact_directory(dest.id, "OTHER")
+    assert (copied / "brightness.csv").read_text(encoding="utf-8") == "bri,watt\n1,1.0\n"
+    assert (copied / "brightness.raw.jsonl").is_file()
+    assert (copied / "on_off_bounds.json").is_file()

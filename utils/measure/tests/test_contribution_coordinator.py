@@ -25,7 +25,11 @@ from measure.ha_app.contribution import (
     ContributionAuthStatus,
     ContributionPreviewRequest,
 )
-from measure.ha_app.contribution.service import _metadata_from_request, _validate_latest_preview
+from measure.ha_app.contribution.service import (
+    _metadata_from_request,
+    _profile_model_identity,
+    _validate_latest_preview,
+)
 from measure.powermeter.spec import DummyPowerMeterSpec
 from measure.request import LightMeasurementRequest
 from pydantic import ValidationError
@@ -428,3 +432,17 @@ def test_submit_preview_validation_rejects_base_or_content_drift() -> None:
     )
     with pytest.raises(ContributionApiError, match="files changed"):
         _validate_latest_preview(job, changed_preview, "base-one")
+
+
+def test_numeric_ha_model_id_becomes_an_alias() -> None:
+    model_id, aliases = _profile_model_identity("36867", ["KAJPLATS"])
+
+    assert model_id == ""
+    assert aliases == ["36867", "KAJPLATS"]
+
+
+def test_manufacturer_model_id_is_kept() -> None:
+    model_id, aliases = _profile_model_identity("LED2408G10", ["36867"])
+
+    assert model_id == "LED2408G10"
+    assert aliases == ["36867"]

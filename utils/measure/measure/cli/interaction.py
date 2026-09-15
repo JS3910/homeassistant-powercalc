@@ -11,7 +11,8 @@ class ConsoleInteraction(RunInteraction):
         del action
         input(f"{message}\nPress enter to continue...")
 
-    def notify(self, message: str) -> None:
+    def notify(self, message: str, *, warning: bool = False) -> None:
+        del warning
         print(message)
 
     def choose(self, message: str, *, default: bool) -> bool:
@@ -21,7 +22,13 @@ class ConsoleInteraction(RunInteraction):
             return default
         return answer in {"y", "yes"}
 
-    def phase(self, message: str) -> None:
+    def phase(
+        self,
+        message: str,
+        *,
+        wait_seconds: float | None = None,
+        reason: str | None = None,
+    ) -> None:
         return
 
     def progress(
@@ -32,6 +39,7 @@ class ConsoleInteraction(RunInteraction):
         phase: str,
         remaining_seconds: float | None = None,
         skipped: int = 0,
+        already_measured: int = 0,
     ) -> None:
         return
 
