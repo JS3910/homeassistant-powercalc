@@ -16,6 +16,7 @@ import type {
   ManufacturerCatalog,
   MeasureDefinition,
   MeasureDeviceCatalog,
+  MeasureParameterName,
   MeasurementRequest,
   OperatingPoint,
   PlotCollection,
@@ -135,15 +136,72 @@ const isDummyLoadSpec: Guard<DummyLoadSpec> = (value): value is DummyLoadSpec =>
   return value.mode === "reuse" && isNumber(value.resistance) && value.resistance > 0;
 };
 
-const parameterNames = [
+const requiredParameterNames = [
   "sleep_time", "sample_count", "sleep_time_sample", "max_retries", "max_nudges", "bri_bri_steps",
   "ct_bri_steps", "hs_bri_steps", "min_brightness",
   "sleep_initial", "sleep_standby", "effect_bri_steps", "measure_time_effect", "measure_time_effect_min",
-] as const;
+] as const satisfies readonly MeasureParameterName[];
+
+/** Every `MeasurementParameters` key. Adding a field there without listing it here is a type error. */
+const MEASURE_PARAMETER_NAME: Record<MeasureParameterName, true> = {
+  sleep_time: true,
+  sample_count: true,
+  sleep_time_sample: true,
+  max_retries: true,
+  max_nudges: true,
+  bri_bri_steps: true,
+  ct_bri_steps: true,
+  ct_mired_divisions: true,
+  ct_mired_steps: true,
+  hs_bri_steps: true,
+  hs_hue_divisions: true,
+  hs_hue_steps: true,
+  hs_sat_divisions: true,
+  hs_sat_steps: true,
+  min_brightness: true,
+  max_brightness: true,
+  min_kelvin: true,
+  max_kelvin: true,
+  min_sat: true,
+  max_sat: true,
+  min_hue: true,
+  max_hue: true,
+  sleep_initial: true,
+  sleep_standby: true,
+  settle_tolerance_pct: true,
+  settle_tolerance_w: true,
+  settle_window_seconds: true,
+  settle_poll_interval_seconds: true,
+  settle_min_wait: true,
+  effect_bri_steps: true,
+  measure_time_effect: true,
+  measure_time_effect_min: true,
+  bri_bri_bisection: true,
+  ct_bri_bisection: true,
+  hs_bri_bisection: true,
+  effect_bri_bisection: true,
+  bri_bri_all: true,
+  ct_bri_all: true,
+  hs_bri_all: true,
+  effect_bri_all: true,
+  ct_mired_all: true,
+  hs_hue_all: true,
+  hs_sat_all: true,
+  brightness_descending: true,
+  smart_sampling: true,
+  smart_delta: true,
+  smart_border_delta: true,
+  smart_dart: true,
+  smart_dart_min_delta: true,
+};
+
+function isMeasureParameterName(value: unknown): value is MeasureParameterName {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(MEASURE_PARAMETER_NAME, value);
+}
 
 const isMeasurementParameters: Guard<Capabilities["defaults"]> = (value): value is Capabilities["defaults"] => {
   if (!recordOf((entry): entry is number | boolean => isNumber(entry) || isBoolean(entry))(value)) return false;
-  if (!parameterNames.every((name) => isNumber(value[name]))) return false;
+  if (!requiredParameterNames.every((name) => isNumber(value[name]))) return false;
   const hasDivisions = isNumber(value.ct_mired_divisions) && isNumber(value.hs_hue_divisions) && isNumber(value.hs_sat_divisions);
   const hasSteps = isNumber(value.ct_mired_steps) && isNumber(value.hs_hue_steps) && isNumber(value.hs_sat_steps);
   return hasDivisions || hasSteps;
@@ -235,17 +293,12 @@ const isFormField = objectOf({
   review: optional(isBoolean),
   step: optionalNullable(isString),
 });
-const measureParameterNames = [
-  ...parameterNames,
-  "ct_mired_divisions", "hs_hue_divisions", "hs_sat_divisions",
-  "ct_mired_steps", "hs_hue_steps", "hs_sat_steps",
-] as const;
 const isMeasureParameter = objectOf({
-  name: oneOf(...measureParameterNames), label: isString, hint: optional(isString), step: optional(isString),
-  group: optional(isString), requires_multiple: optionalNullable(oneOf(...measureParameterNames)),
+  name: isMeasureParameterName, label: isString, hint: optional(isString), step: optional(isString),
+  group: optional(isString), requires_multiple: optionalNullable(isMeasureParameterName),
   control: optional(oneOf("number", "boolean")),
-  bisection: optionalNullable(oneOf(...measureParameterNames)),
-  all_values: optionalNullable(oneOf(...measureParameterNames)),
+  bisection: optionalNullable(isMeasureParameterName),
+  all_values: optionalNullable(isMeasureParameterName),
   sweep_label: optionalNullable(isString),
   axis: optionalNullable(oneOf("brightness", "sat", "hue", "mired", "kelvin")),
 });

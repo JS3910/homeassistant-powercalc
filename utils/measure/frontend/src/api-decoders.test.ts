@@ -1,4 +1,4 @@
-import { decodePreflight, decodeSessionSnapshot, isMeasurementRequest } from "./api-decoders";
+import { decodeMeasureDefinitions, decodePreflight, decodeSessionSnapshot, isMeasurementRequest } from "./api-decoders";
 import { capabilities } from "./components/testing/fixtures";
 
 const averageRequest = {
@@ -51,6 +51,65 @@ describe("measurement request boundary", () => {
 });
 
 describe("response boundary", () => {
+  it("accepts settle, smart-envelope, and bisection parameter names from the app API", () => {
+    const definitions = [{
+      measure_type: "light",
+      label: "Light",
+      description: "Build a lookup-table power profile for a light.",
+      icon: "💡",
+      confirmation_action: null,
+      confirmation_is_warning: false,
+      model_id_example: "LWA017",
+      product_name_example: "Hue",
+      fields: [],
+      parameters: [
+        {
+          name: "settle_tolerance_pct",
+          label: "Settle detection tolerance (%)",
+          hint: "",
+          step: "0.01",
+          group: "Sampling",
+          requires_multiple: null,
+          control: "number",
+          bisection: null,
+          all_values: null,
+          sweep_label: null,
+          axis: null,
+        },
+        {
+          name: "smart_sampling",
+          label: "Smart envelope sampling",
+          hint: "",
+          step: "1",
+          group: "Profile resolution",
+          requires_multiple: null,
+          control: "boolean",
+          bisection: null,
+          all_values: null,
+          sweep_label: null,
+          axis: null,
+        },
+        {
+          name: "bri_bri_steps",
+          label: "Brightness mode step",
+          hint: "",
+          step: "1",
+          group: "Profile resolution",
+          requires_multiple: null,
+          control: "number",
+          bisection: "bri_bri_bisection",
+          all_values: "bri_bri_all",
+          sweep_label: "Brightness mode sweeps",
+          axis: "brightness",
+        },
+      ],
+      supports_profile: true,
+      supports_resume: true,
+    }];
+
+    expect(decodeMeasureDefinitions(definitions)).toBe(definitions);
+  });
+
   it("accepts nullable estimates emitted by an incomplete preflight", () => {
     const response = {
       valid: true,
